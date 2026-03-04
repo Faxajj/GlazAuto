@@ -272,3 +272,53 @@ def delete_account(account_id: int) -> bool:
         cur = conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         conn.commit()
         return cur.rowcount > 0
+
+import sqlite3
+
+DB_PATH = "accounts.db"
+
+def create_session(token, user_id, username, exp):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO sessions (token, user_id, username, exp) VALUES (?, ?, ?, ?)",
+        (token, user_id, username, exp),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_session(token):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, username, exp FROM sessions WHERE token=?",
+        (token,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    return {
+        "user_id": row[0],
+        "username": row[1],
+        "exp": row[2],
+    }
+
+
+def delete_session(token):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE token=?", (token,))
+    conn.commit()
+    conn.close()
+
+
+def cleanup_sessions():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM sessions WHERE exp <= strftime('%s','now')")
+    conn.commit()
+    conn.close()
