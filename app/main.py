@@ -73,27 +73,24 @@ CONCEPTS_UC = [
 
 SESSION_COOKIE = "dashboard_session"
 SESSION_TTL = 60 * 60 * 12
-SESSIONS: dict[str, dict] = {}
 
-
-def _cleanup_sessions() -> None:
-    now = time.time()
-    expired = [k for k, v in SESSIONS.items() if v.get("exp", 0) <= now]
-    for key in expired:
-        SESSIONS.pop(key, None)
 
 
 def _current_user(request: Request) -> Optional[dict]:
-    _cleanup_sessions()
+    cleanup_sessions()
+
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return None
-    data = SESSIONS.get(token)
+
+    data = get_session(token)
     if not data:
         return None
+
     if data.get("exp", 0) <= time.time():
-        SESSIONS.pop(token, None)
+        delete_session(token)
         return None
+
     return data
 
 
@@ -426,11 +423,13 @@ async def login_post(request: Request, username: str = Form(""), password: str =
             status_code=400,
         )
     token = secrets.token_urlsafe(32)
-    SESSIONS[token] = {
-        "user_id": user["id"],
-        "username": user["username"],
-        "exp": time.time() + SESSION_TTL,
-    }
+
+create_session(
+    token,
+    user["id"],
+    user["username"],
+    int(time.time() + SESSION_TTL),
+)
     response = RedirectResponse(url="/", status_code=302)
     response.set_cookie(
         key=SESSION_COOKIE,
@@ -446,7 +445,7 @@ async def login_post(request: Request, username: str = Form(""), password: str =
 async def logout(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if token:
-        SESSIONS.pop(token, None)
+        delete_session(token)
     response = RedirectResponse(url="/login", status_code=302)
     response.delete_cookie(SESSION_COOKIE)
     return response
