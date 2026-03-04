@@ -411,30 +411,33 @@ async def login_page(request: Request, error: str = ""):
 @app.post("/login", response_class=HTMLResponse)
 async def login_post(request: Request, username: str = Form(""), password: str = Form("")):
     user = get_user_by_username(username)
+
     if not user or not user.get("is_active") or not verify_password(password, user.get("password_hash", "")):
         return templates.TemplateResponse(
             "login.html",
             {"request": request, "error": "Неверный логин или пароль."},
             status_code=400,
         )
+
     token = secrets.token_urlsafe(32)
 
-create_session(
-    token,
-    user["id"],
-    user["username"],
-    int(time.time() + SESSION_TTL),
-)
+    create_session(
+        token,
+        user["id"],
+        user["username"],
+        int(time.time() + SESSION_TTL),
+    )
 
-response = RedirectResponse(url="/", status_code=302)
-response.set_cookie(
-    key=SESSION_COOKIE,
-    value=token,
-    httponly=True,
-    samesite="lax",
-    max_age=SESSION_TTL,
-)
-return response
+    response = RedirectResponse(url="/", status_code=302)
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=SESSION_TTL,
+    )
+
+    return response
 
 
 @app.post("/logout", response_class=RedirectResponse)
