@@ -425,15 +425,16 @@ create_session(
     user["username"],
     int(time.time() + SESSION_TTL),
 )
-    response = RedirectResponse(url="/", status_code=302)
-    response.set_cookie(
-        key=SESSION_COOKIE,
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=SESSION_TTL,
-    )
-    return response
+
+response = RedirectResponse(url="/", status_code=302)
+response.set_cookie(
+    key=SESSION_COOKIE,
+    value=token,
+    httponly=True,
+    samesite="lax",
+    max_age=SESSION_TTL,
+)
+return response
 
 
 @app.post("/logout", response_class=RedirectResponse)
