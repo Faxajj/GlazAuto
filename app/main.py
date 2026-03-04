@@ -116,11 +116,17 @@ app.add_middleware(AuthMiddleware)
 
 
 def _ensure_admin_user() -> None:
-    username = ("admin").strip().lower()
+    username = "admin"
     password = "admin123"
-    if get_user_by_username(username):
+
+    user = get_user_by_username(username)
+    if user:
         return
-    create_user(username, password, is_active=True)
+
+    try:
+        create_user(username, password, is_active=True)
+    except Exception:
+        pass
 
 
 _ensure_admin_user()
