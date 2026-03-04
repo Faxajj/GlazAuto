@@ -276,7 +276,6 @@ def delete_account(account_id: int) -> bool:
 import sqlite3
 import time
 
-DB_PATH = "accounts.db"
 
 
 def create_session(token, user_id, username, exp):
