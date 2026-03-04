@@ -9,7 +9,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any, List, Optional
 
-DB_PATH = Path(__file__).resolve().parent.parent / "accounts.db"
+DB_PATH = "/var/www/app/accounts.db"
 
 # Окна (дерево): slug -> отображаемое имя
 WINDOWS = [
