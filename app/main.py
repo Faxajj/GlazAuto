@@ -71,22 +71,21 @@ CONCEPTS_UC = [
 ]
 
 
-def _current_user(request: Request) -> Optional[dict]:
-    cleanup_sessions()
-
+def _current_user(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return None
 
-    data = get_session(token)
-    if not data:
+    session = get_session(token)
+
+    if not session:
         return None
 
-    if data.get("exp", 0) <= time.time():
+    if session["exp"] < int(time.time()):
         delete_session(token)
         return None
 
-    return data
+    return session
 
 
 def _format_ars(value, decimals: int = 2) -> str:
