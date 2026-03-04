@@ -48,6 +48,8 @@ from app.drivers.personalpay import (
     get_transference_details as pp_transference_details,
 )
 
+SESSION_COOKIE = "session_token"
+
 app = FastAPI(title="Banks Dashboard — несколько аккаунтов")
 
 init_db()
