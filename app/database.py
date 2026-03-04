@@ -274,8 +274,10 @@ def delete_account(account_id: int) -> bool:
         return cur.rowcount > 0
 
 import sqlite3
+import time
 
 DB_PATH = "accounts.db"
+
 
 def create_session(token, user_id, username, exp):
     conn = sqlite3.connect(DB_PATH)
@@ -319,6 +321,9 @@ def delete_session(token):
 def cleanup_sessions():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("DELETE FROM sessions WHERE exp <= strftime('%s','now')")
+    cur.execute(
+        "DELETE FROM sessions WHERE exp <= ?",
+        (int(time.time()),),
+    )
     conn.commit()
     conn.close()
