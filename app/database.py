@@ -29,15 +29,14 @@ def _get_conn() -> sqlite3.Connection:
 
 def init_db() -> None:
     with _get_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bank_type TEXT NOT NULL,
-                label TEXT NOT NULL,
-                credentials TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now'))
-            )
-        """)
+       conn.execute("""
+CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER,
+    username TEXT,
+    exp INTEGER
+)
+""")
         conn.commit()
         # Миграция: добавить колонку window если её нет
         try:
