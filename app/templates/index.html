@@ -252,20 +252,35 @@
           <label for="auto-chunk">Сумма одной выплаты (ARS)</label>
           <input id="auto-chunk" name="chunk_amount" type="text" required placeholder="400.000" />
         </div>
+        <div class="form-row">
+          <label for="auto-min-balance">Минимальный баланс для запуска (ARS)</label>
+          <input id="auto-min-balance" name="min_balance" type="text" placeholder="400.000" />
+          <span class="form-hint" style="margin-top:4px">Вывод произойдёт только если баланс ≥ этой суммы. Оставьте пустым — выводить всегда.</span>
+        </div>
         <button type="submit" class="btn-primary">Добавить автоправило</button>
       </form>
       {% if auto_rules %}
       <ul class="activities-list" style="margin-top: 1rem;">
         {% for rule in auto_rules %}
-        <li>
-          CVU {{ rule.cvu }} — {{ rule.paid_amount|ars }} / {{ rule.total_limit|ars }} ARS (шаг {{ rule.chunk_amount|ars }} ARS)
+        <li style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+          <span>
+            CVU {{ rule.cvu }} — {{ rule.paid_amount|ars }} / {{ rule.total_limit|ars }} ARS
+            (шаг {{ rule.chunk_amount|ars }} ARS
+            {%- if rule.min_balance %}, порог {{ rule.min_balance|ars }} ARS{% endif %})
+          </span>
+          {% if rule.last_error %}
+          <span style="color:#f87171;font-size:0.8em">⚠ {{ rule.last_error }}</span>
+          {% endif %}
           {% if rule.is_active %}
-          <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/run" class="form-inline">
-            <button type="submit" class="btn-table btn-open">Выполнить шаг</button>
+          <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/run" class="form-inline" style="display:inline;margin:0">
+            <button type="submit" class="btn-table btn-open">▶ Выполнить шаг</button>
           </form>
           {% else %}
-          <span class="tx-badge tx-incoming">Завершено</span>
+          <span class="tx-badge tx-incoming">✓ Завершено</span>
           {% endif %}
+          <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/delete" class="form-inline" style="display:inline;margin:0">
+            <button type="submit" class="btn-table" style="background:#ef4444;color:#fff;" onclick="return confirm('Удалить это автоправило?')">✕ Удалить</button>
+          </form>
         </li>
         {% endfor %}
       </ul>
