@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>{% block title %}Banks Dashboard{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css?v=5" />
+</head>
+<body>
+  <header class="header">
+    <h1>Banks Dashboard</h1>
+    <p class="header-sub">Несколько аккаунтов — переключение в один клик</p>
+  </header>
+  <div class="layout">
+    {% block sidebar %}
+    <aside class="sidebar">
+      <p class="sidebar-hint">Группы можно сворачивать — нажми на название.</p>
+      <nav class="nav-accounts">
+        <a href="/" class="nav-item nav-item-all {% if not account_id and not (window_slug|default(none)) %}active{% endif %}">Все аккаунты</a>
+        {% for w_slug, w_name in (window_list|default([])) %}
+        <section class="nav-window {% if (window_slug|default(none)) == w_slug %}nav-window--current{% endif %}" data-window="{{ w_slug }}">
+          <div class="nav-window-title">
+            <a href="/?window={{ w_slug }}" class="nav-window-title-link">{{ w_name }}</a>
+            <button type="button" class="nav-window-toggle-btn" aria-expanded="true" aria-controls="window-{{ w_slug }}" aria-label="Свернуть или развернуть">▼</button>
+          </div>
+          <div class="nav-window-body" id="window-{{ w_slug }}">
+            {% for acc in groups.get(w_slug, []) %}
+            <a href="/?account_id={{ acc.id }}" class="profile-card {% if selected and selected.id == acc.id %}profile-card--active{% endif %}" data-account-id="{{ acc.id }}">
+              <span class="profile-card-label">{{ acc.label }}</span>
+              <span class="profile-card-balance sidebar-balance" data-account-id="{{ acc.id }}">—</span>
+            </a>
+            {% endfor %}
+            <a href="/add?window={{ w_slug }}" class="btn-add-in-window">+ Добавить в {{ w_name }}</a>
+          </div>
+        </section>
+        {% endfor %}
+      </nav>
+      <a href="/add" class="btn-add">+ Добавить аккаунт</a>
+      <script>
+        (function() {
+          var balanceEls = document.querySelectorAll('.sidebar-balance[data-account-id]');
+          function fetchOne(id, el) {
+            fetch('/account/' + id + '/balance')
+              .then(function(r) { return r.json(); })
+              .then(function(d) {
+                if (d.error) el.textContent = '—'; else el.textContent = (typeof d.balance === 'number' ? d.balance.toFixed(2) : d.balance) + ' ARS';
+              })
+              .catch(function() { el.textContent = '—'; });
+          }
+          balanceEls.forEach(function(el) {
+            var id = el.getAttribute('data-account-id');
+            if (id) fetchOne(id, el);
+          });
+          setInterval(function() {
+            balanceEls.forEach(function(el) {
+              var id = el.getAttribute('data-account-id');
+              if (id) fetchOne(id, el);
+            });
+          }, 45000);
+        })();
+        (function() {
+          var key = 'banks-dashboard-windows-collapsed';
+          function loadState() {
+            try {
+              var s = localStorage.getItem(key);
+              return s ? JSON.parse(s) : {};
+            } catch (e) { return {}; }
+          }
+          function saveState(state) {
+            try { localStorage.setItem(key, JSON.stringify(state)); } catch (e) {}
+          }
+          document.querySelectorAll('.nav-window').forEach(function(w) {
+            var slug = w.getAttribute('data-window');
+            var body = w.querySelector('.nav-window-body');
+            var toggle = w.querySelector('.nav-window-toggle-btn');
+            if (!toggle) return;
+            var state = loadState();
+            if (state[slug]) {
+              w.classList.add('nav-window--collapsed');
+              toggle.textContent = '▶';
+              toggle.setAttribute('aria-expanded', 'false');
+            }
+            toggle.addEventListener('click', function(e) {
+              e.preventDefault();
+              w.classList.toggle('nav-window--collapsed');
+              var collapsed = w.classList.contains('nav-window--collapsed');
+              toggle.textContent = collapsed ? '▶' : '▼';
+              toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+              state[slug] = collapsed;
+              saveState(state);
+            });
+          });
+        })();
+      </script>
+    </aside>
+    {% endblock %}
+    <main class="main">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block title %}Добавить аккаунт — Banks Dashboard{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h2>Добавить аккаунт</h2>
+  {% if request.query_params.get('error') == 'invalid_bank' %}
+  <div class="alert alert-error">Выберите банк.</div>
+  {% endif %}
+  {% if request.query_params.get('error') == 'invalid_json' %}
+  <div class="alert alert-error">Credentials должны быть валидным JSON.</div>
+  {% endif %}
+
+  <form method="post" action="/add" class="form">
+    <div class="form-row">
+      <label for="window">Окно (группа) *</label>
+      <select id="window" name="window">
+        {% for slug, name in (window_list|default([])) %}
+        <option value="{{ slug }}" {% if slug == preselect_window %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="bank_type">Банк *</label>
+      <select id="bank_type" name="bank_type" required>
+        <option value="">— выбрать —</option>
+        {% for slug, info in bank_types.items() %}
+        <option value="{{ slug }}">{{ info.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="label">Название (как показывать в списке) *</label>
+      <input id="label" name="label" type="text" placeholder="Например: UniversalCoins — основной" required />
+    </div>
+    <div class="form-row">
+      <label for="proxy_type">Прокси (опционально, для Personal Pay)</label>
+      <select id="proxy_type" name="proxy_type">
+        <option value="socks5h" selected>SOCKS5h (рекомендовано)</option>
+        <option value="socks5">SOCKS5</option>
+        <option value="http">HTTP</option>
+        <option value="https">HTTPS</option>
+      </select>
+      <p class="form-hint">Отдельные поля: IP/Host, Port, Login, Password.</p>
+    </div>
+    <div class="form-row">
+      <label for="proxy_host">Proxy Host/IP</label>
+      <input id="proxy_host" name="proxy_host" type="text" placeholder="135.106.40.29" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_port">Proxy Port</label>
+      <input id="proxy_port" name="proxy_port" type="text" placeholder="63137" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_user">Proxy Login</label>
+      <input id="proxy_user" name="proxy_user" type="text" placeholder="smY9hX1m" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_password">Proxy Password</label>
+      <input id="proxy_password" name="proxy_password" type="text" placeholder="6vrTNk8q" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_raw">Или одной строкой (fallback)</label>
+      <input id="proxy_raw" name="proxy_raw" type="text" placeholder="135.106.40.29:63137:smY9hX1m:6vrTNk8q" />
+      <p class="form-hint">Поддержка fallback форматов: <code>IP:PORT:USER:PASS</code>, <code>USER:PASS@IP:PORT</code>, <code>socks5h://...</code>. Сохраняется в credentials как <code>proxy/http_proxy/https_proxy</code>.</p>
+    </div>
+    <div class="form-row">
+      <label for="credentials_json">Credentials (JSON) *</label>
+      <textarea id="credentials_json" name="credentials_json" rows="18" class="textarea-json" placeholder='UniversalCoins — нужны логин, пароль и PIN:
+{
+  "username": "email@example.com",
+  "password": "пароль",
+  "pin": "123456"
+}
+
+Personal Pay — два варианта:
+
+1) Токен из ОТВЕТА на POST /authority/v4/login:
+   В перехватчике открой этот запрос → вкладка Response/Body → в JSON найди tokens.idToken (или id_token). Скопируй значение (eyJ...) и вставь сюда просто токен или:
+   { "auth_token": "eyJ..." }
+
+2) Данные из ТЕЛА ЗАПРОСА (логина) — тогда дашборд сам будет логиниться:
+   deviceId, username, password, pushNotifications.deviceToken из запроса:
+{
+  "device_id": "178DC6C7-C43C-4DCC-B3BC-DBFAAA0F8FD2",
+  "username": "5f5f6a02-ecf4-4666-8940-25d17927da4f",
+  "password": "69d625f0569f43ab4aea21",
+  "push_device_token": "d-sZXA9CQ06RiJVpsWr03c:APA91b..."
+}'></textarea>
+      <p class="form-hint"><strong>Токен</strong> лежит в заголовке Authorization любого запроса к personalpay.dev после входа. Если получаешь <strong>403 Forbidden</strong>, добавь в JSON <strong>device_id</strong> (можно вставить даже полный <code>x-fraud-paygilant-session-id</code> — дашборд сам выделит device_id). Прокси теперь заполняй отдельными полями выше (тип/host/port/login/password).</p>
+    </div>
+    <button type="submit" class="btn-primary">Добавить</button>
+    <a href="/" class="btn-secondary">Отмена</a>
+  </form>
+</section>
+{% endblock %}

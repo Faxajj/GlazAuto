@@ -1,0 +1,33 @@
+# Все файлы для загрузки на сервер (структура папок сохранять)
+# Копируй эти файлы в ту же структуру на сервере.
+
+requirements.txt
+run_server.sh
+FILES_FOR_DEPLOY.txt
+README.md
+
+app/__init__.py
+app/main.py
+app/database.py
+app/static/style.css
+app/templates/base.html
+app/templates/index.html
+app/templates/add_account.html
+app/templates/edit_account.html
+app/templates/receipt.html
+app/drivers/__init__.py
+app/drivers/personalpay.py
+app/drivers/universalcoins.py
+
+docs/PERSONALPAY_403_FIX.md
+
+# Папку scripts можно не заливать, если не нужны утилиты:
+scripts/reset_and_add_pp.py
+
+VPS_SETUP_glazauto.md
+СЕРВЕР_И_ДОМЕН.md
+
+# НЕ заливать (создаются на сервере или содержат секреты):
+# accounts.db  — создастся при первом запуске
+# __pycache__/ — кэш Python, не нужен
+# .env         — если появится, не выкладывать

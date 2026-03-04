@@ -1,0 +1,11 @@
+# Проксирование glazauto.pro на дашборд (порт 8015)
+# Работает только если хостинг разрешает mod_proxy в .htaccess
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{REQUEST_URI} !^/\.well-known/
+    # Корень "/" — без двойного слэша
+    RewriteRule ^/?$ http://127.0.0.1:8015/ [P,L]
+    # Остальные пути
+    RewriteRule ^/(.*)$ http://127.0.0.1:8015/$1 [P,L]
+</IfModule>

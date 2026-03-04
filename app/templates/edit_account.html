@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}Изменить профиль — {{ account.label }}{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h2>Изменить профиль</h2>
+  <p class="meta">Банк: <strong>{{ account.bank_type }}</strong></p>
+  {% if request.query_params.get('error') == 'invalid_json' %}
+  <div class="alert alert-error">Credentials должны быть валидным JSON.</div>
+  {% endif %}
+
+  <form method="post" action="/account/{{ account.id }}/edit" class="form">
+    <div class="form-row">
+      <label for="window">Окно (группа)</label>
+      <select id="window" name="window">
+        {% for slug, name in (window_list|default([])) %}
+        <option value="{{ slug }}" {% if (account.window or 'glazars') == slug %}selected{% endif %}>{{ name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="label">Название (как показывать в списке) *</label>
+      <input id="label" name="label" type="text" required value="{{ account.label }}" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_type">Прокси (опционально, для Personal Pay)</label>
+      <select id="proxy_type" name="proxy_type">
+        <option value="socks5h" {% if proxy_type == 'socks5h' %}selected{% endif %}>SOCKS5h (рекомендовано)</option>
+        <option value="socks5" {% if proxy_type == 'socks5' %}selected{% endif %}>SOCKS5</option>
+        <option value="http" {% if proxy_type == 'http' %}selected{% endif %}>HTTP</option>
+        <option value="https" {% if proxy_type == 'https' %}selected{% endif %}>HTTPS</option>
+      </select>
+      <p class="form-hint">Заполни отдельные поля (IP/Port/Login/Password). При необходимости можно вставить всё одной строкой ниже.</p>
+    </div>
+    <div class="form-row">
+      <label for="proxy_host">Proxy Host/IP</label>
+      <input id="proxy_host" name="proxy_host" type="text" value="{{ proxy_host }}" placeholder="135.106.40.29" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_port">Proxy Port</label>
+      <input id="proxy_port" name="proxy_port" type="text" value="{{ proxy_port }}" placeholder="63137" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_user">Proxy Login</label>
+      <input id="proxy_user" name="proxy_user" type="text" value="{{ proxy_user }}" placeholder="smY9hX1m" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_password">Proxy Password</label>
+      <input id="proxy_password" name="proxy_password" type="text" value="{{ proxy_password }}" placeholder="6vrTNk8q" />
+    </div>
+    <div class="form-row">
+      <label for="proxy_raw">Или одной строкой (fallback)</label>
+      <input id="proxy_raw" name="proxy_raw" type="text" value="{{ proxy_raw }}" placeholder="135.106.40.29:63137:smY9hX1m:6vrTNk8q" />
+      <p class="form-hint">Текущее значение из credentials показано здесь.</p>
+    </div>
+    <div class="form-row">
+      <label for="credentials_json">Credentials (JSON) *</label>
+      <textarea id="credentials_json" name="credentials_json" rows="14" class="textarea-json">{{ account.credentials | tojson(indent=2) }}</textarea>
+      <p class="form-hint">Измените <strong>auth_token</strong> или <strong>device_id</strong>, если токен истёк. Сохраните валидный JSON.</p>
+    </div>
+    <button type="submit" class="btn-primary">Сохранить</button>
+    <a href="/?account_id={{ account.id }}" class="btn-secondary">Отмена</a>
+  </form>
+</section>
+{% endblock %}
