@@ -71,8 +71,7 @@ CONCEPTS_UC = [
 ]
 
 
-SESSION_COOKIE = "dashboard_session"
-SESSION_TTL = 60 * 60 * 12
+
 
 
 
