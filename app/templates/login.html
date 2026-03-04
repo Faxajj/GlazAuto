@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Вход — Banks Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css?v=6" />
+</head>
+<body>
+  <main class="login-wrap">
+    <section class="card login-card">
+      <h2>Авторизация</h2>
+      <p class="form-hint">Регистрация отключена. Доступ выдается администратором.</p>
+      {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+      <form method="post" action="/login" class="form">
+        <div class="form-row">
+          <label for="username">Логин</label>
+          <input id="username" name="username" type="text" autocomplete="username" required />
+        </div>
+        <div class="form-row">
+          <label for="password">Пароль</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required />
+        </div>
+        <button type="submit" class="btn-primary">Войти</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>

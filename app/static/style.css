@@ -808,3 +808,38 @@ textarea:focus {
   margin-left: auto;
   cursor: help;
 }
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+body {
+  background: radial-gradient(circle at top, #111f3f 0%, #0b1229 42%, #0a1022 100%);
+}
+
+.card {
+  box-shadow: 0 12px 26px rgba(3, 7, 18, 0.38);
+}
+
+.login-wrap {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+
+.login-card {
+  width: min(460px, 100%);
+}
+
+.balance,
+.tx-amount,
+.col-balance,
+.profile-card-balance,
+.sidebar-balance,
+.list-balance {
+  font-variant-numeric: tabular-nums;
+}

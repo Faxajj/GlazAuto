@@ -22,7 +22,7 @@
   {% elif transference %}
   <div class="receipt-box receipt-card">
     <h3 class="receipt-card-title">{{ receipt_title|default(transference.get('title', 'Чек перевода')) }}</h3>
-    <p class="receipt-amount">Сумма: {{ amount_display if amount_display != '' else transference.get('amount', '') }} ARS</p>
+    <p class="receipt-amount">Сумма: {{ amount_display|ars if amount_display != '' else transference.get('amount', '')|ars }} ARS</p>
     <dl class="receipt-dl">
       {% for row in receipt_lines %}
       <dt>{{ row.label }}</dt>
