@@ -44,7 +44,7 @@
           var els = document.querySelectorAll('.list-balance[data-account-id]');
           function fetchOne(id, el) {
             fetch('/account/' + id + '/balance').then(function(r) { return r.json(); }).then(function(d) {
-              if (d.error) el.textContent = '—'; else el.textContent = (typeof d.balance === 'number' ? d.balance.toFixed(2) : d.balance) + ' ARS';
+              if (d.error) el.textContent = '—'; else el.textContent = (typeof d.balance === 'number' ? d.balance.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : d.balance) + ' ARS';
             }).catch(function() { el.textContent = '—'; });
           }
           els.forEach(function(el) { var id = el.getAttribute('data-account-id'); if (id) fetchOne(id, el); });
@@ -65,11 +65,15 @@
     {% endif %}
     {% if request.query_params.get('success') %}
     <div class="alert alert-success">
-      {% if request.query_params.get('success') == 'updated' %}Профиль обновлён.{% else %}Успешно отправлено. Чек в приложении.{% endif %}
+      {% if request.query_params.get('success') == 'updated' %}Профиль обновлён.{% else %}Успешно отправлено.{% endif %}
       {% if selected.bank_type == 'personalpay' and request.query_params.get('transaction_id') %}
       <span class="ml"><a href="/account/{{ selected.id }}/receipt?transaction_id={{ request.query_params.get('transaction_id') }}" class="alert-link">Показать чек</a></span>
       {% endif %}
     </div>
+    {% endif %}
+
+    {% if auto_run_result %}
+    <div class="alert alert-warning">{{ auto_run_result }}</div>
     {% endif %}
 
     {% if token_expired %}
@@ -99,7 +103,7 @@
           <button type="button" id="btn-refresh-balance" class="btn-refresh" title="Обновить баланс">↻ Обновить</button>
         </div>
       </div>
-      <p class="balance" id="balance-value">{{ "%.2f"|format(balance_info.balance | default(0)) }} ARS</p>
+      <p class="balance" id="balance-value">{{ balance_info.balance | default(0)|ars }} ARS</p>
       <p class="meta" id="balance-meta">{% if balance_info.cvu_number %}CVU/счёт: {{ balance_info.cvu_number }}{% endif %}{% if balance_info.cvu_alias %} · Алиас: {{ balance_info.cvu_alias }}{% endif %}</p>
       <script>
         (function() {
@@ -115,7 +119,7 @@
                 if (d.error) {
                   balanceEl.textContent = 'Ошибка: ' + d.error;
                 } else {
-                  balanceEl.textContent = (typeof d.balance === 'number' ? d.balance.toFixed(2) : d.balance) + ' ARS';
+                  balanceEl.textContent = (typeof d.balance === 'number' ? d.balance.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : d.balance) + ' ARS';
                   if (metaEl) metaEl.textContent = [d.cvu_number ? 'CVU/счёт: ' + d.cvu_number : '', d.cvu_alias ? 'Алиас: ' + d.cvu_alias : ''].filter(Boolean).join(' · ');
                 }
               })
@@ -200,7 +204,7 @@
           <span class="tx-date">{{ act.date_str }}</span>
           {% endif %}
           {% if act.amount is not none %}
-          <span class="tx-amount">{% if act.is_outgoing %}-{% else %}+{% endif %}{{ "%.2f"|format(act.amount) }} ARS</span>
+          <span class="tx-amount">{% if act.is_outgoing %}-{% else %}+{% endif %}{{ act.amount|ars }} ARS</span>
           {% endif %}
           <span class="tx-counterparty">
             {% if act.is_outgoing %}
@@ -230,6 +234,43 @@
       </form>
     </section>
     {% endif %}
+
+
+    <section class="card">
+      <h3>Автоматический вывод</h3>
+      <p class="form-hint">Укажите CVU, общий лимит и сумму одной выплаты. При каждом обновлении страницы выполняется следующая выплата до достижения лимита.</p>
+      <form method="post" action="/account/{{ selected.id }}/auto-withdraw" class="form">
+        <div class="form-row">
+          <label for="auto-cvu">CVU</label>
+          <input id="auto-cvu" name="cvu" type="text" required />
+        </div>
+        <div class="form-row">
+          <label for="auto-total">Общий лимит (ARS)</label>
+          <input id="auto-total" name="total_limit" type="text" required placeholder="4.000.000" />
+        </div>
+        <div class="form-row">
+          <label for="auto-chunk">Сумма одной выплаты (ARS)</label>
+          <input id="auto-chunk" name="chunk_amount" type="text" required placeholder="400.000" />
+        </div>
+        <button type="submit" class="btn-primary">Добавить автоправило</button>
+      </form>
+      {% if auto_rules %}
+      <ul class="activities-list" style="margin-top: 1rem;">
+        {% for rule in auto_rules %}
+        <li>
+          CVU {{ rule.cvu }} — {{ rule.paid_amount|ars }} / {{ rule.total_limit|ars }} ARS (шаг {{ rule.chunk_amount|ars }} ARS)
+          {% if rule.is_active %}
+          <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/run" class="form-inline">
+            <button type="submit" class="btn-table btn-open">Выполнить шаг</button>
+          </form>
+          {% else %}
+          <span class="tx-badge tx-incoming">Завершено</span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
 
     <section class="card card-actions">
       <a href="/account/{{ selected.id }}/edit" class="btn-edit">Изменить профиль</a>

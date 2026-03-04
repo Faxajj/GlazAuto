@@ -3,12 +3,20 @@
 <head>
   <meta charset="UTF-8" />
   <title>{% block title %}Banks Dashboard{% endblock %}</title>
-  <link rel="stylesheet" href="/static/style.css?v=5" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/style.css?v=6" />
 </head>
 <body>
   <header class="header">
-    <h1>Banks Dashboard</h1>
-    <p class="header-sub">Несколько аккаунтов — переключение в один клик</p>
+    <div>
+      <h1>Banks Dashboard</h1>
+      <p class="header-sub">Несколько аккаунтов — переключение в один клик</p>
+    </div>
+    {% if current_user %}
+    <form method="post" action="/logout" class="form-inline">
+      <button type="submit" class="btn-table btn-edit">Выйти ({{ current_user.username }})</button>
+    </form>
+    {% endif %}
   </header>
   <div class="layout">
     {% block sidebar %}
@@ -38,11 +46,15 @@
       <script>
         (function() {
           var balanceEls = document.querySelectorAll('.sidebar-balance[data-account-id]');
+          var formatMoney = function(v){
+            if (typeof v !== "number") return v;
+            return v.toLocaleString("es-AR", {minimumFractionDigits:2, maximumFractionDigits:2});
+          };
           function fetchOne(id, el) {
             fetch('/account/' + id + '/balance')
               .then(function(r) { return r.json(); })
               .then(function(d) {
-                if (d.error) el.textContent = '—'; else el.textContent = (typeof d.balance === 'number' ? d.balance.toFixed(2) : d.balance) + ' ARS';
+                if (d.error) el.textContent = '—'; else el.textContent = formatMoney(d.balance) + ' ARS';
               })
               .catch(function() { el.textContent = '—'; });
           }
