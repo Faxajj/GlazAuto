@@ -10,6 +10,11 @@
   <main class="login-wrap">
     <section class="card login-card">
       <h2>Авторизация</h2>
+      <p class="form-hint">Регистрация отключена. Доступ выдаётся администратором.</p>
+      <div class="alert alert-warning">
+        Не знаете логин и пароль? Получите учётные данные у администратора проекта.
+        Самостоятельной регистрации на сайте нет.
+      </div>
       <p class="form-hint">Регистрация отключена. Доступ выдается администратором.</p>
       {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
       <form method="post" action="/login" class="form">
