@@ -1,0 +1,298 @@
+{% extends "base.html" %}
+
+{% block title %}{% if selected %}{{ selected.label }} — Banks Dashboard{% elif window_name %}Список аккаунтов — {{ window_name }}{% else %}Banks Dashboard{% endif %}{% endblock %}
+
+{% block content %}
+  {% if window_slug and window_name and not selected %}
+    <section class="card card-window-list">
+      <h2>Список аккаунтов — {{ window_name }}</h2>
+      <p class="window-list-hint">Выберите аккаунт, чтобы перейти к балансу и переводу средств.</p>
+      {% if not window_accounts %}
+        <p class="empty-window">В этой группе пока нет аккаунтов. <a href="/add?window={{ window_slug }}">Добавить в {{ window_name }}</a></p>
+      {% else %}
+        <div class="table-wrap">
+          <table class="accounts-table">
+            <thead>
+              <tr>
+                <th>Имя</th>
+                <th>Баланс</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for acc in window_accounts %}
+              <tr>
+                <td class="col-name">{{ acc.label }}</td>
+                <td class="col-balance"><span class="list-balance" data-account-id="{{ acc.id }}">—</span></td>
+                <td class="col-actions">
+                  <a href="/?account_id={{ acc.id }}" class="btn-table btn-open">Открыть</a>
+                  <a href="/account/{{ acc.id }}/edit" class="btn-table btn-edit">Изменить</a>
+                  <form method="post" action="/account/{{ acc.id }}/delete" class="form-inline form-delete" onsubmit="return confirm('Удалить этот аккаунт из дашборда?');">
+                    <input type="hidden" name="redirect_window" value="{{ window_slug or '' }}" />
+                    <button type="submit" class="btn-table btn-danger">Удалить</button>
+                  </form>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="window-list-add"><a href="/add?window={{ window_slug }}" class="btn-add-secondary">+ Добавить в {{ window_name }}</a></p>
+      {% endif %}
+      <script>
+        (function() {
+          var els = document.querySelectorAll('.list-balance[data-account-id]');
+          function fetchOne(id, el) {
+            fetch('/account/' + id + '/balance').then(function(r) { return r.json(); }).then(function(d) {
+              if (d.error) el.textContent = '—'; else el.textContent = (typeof d.balance === 'number' ? d.balance.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : d.balance) + ' ARS';
+            }).catch(function() { el.textContent = '—'; });
+          }
+          els.forEach(function(el) { var id = el.getAttribute('data-account-id'); if (id) fetchOne(id, el); });
+        })();
+      </script>
+    </section>
+  {% elif not selected %}
+    <section class="card empty-state">
+      <h2>Выберите группу или аккаунт</h2>
+      <p>Слева выберите группу (GLAZARS, GLAZ3, GLAZ6) — откроется список аккаунтов. Из списка откройте аккаунт, чтобы переводить деньги и смотреть баланс.</p>
+      <p>Либо нажмите на аккаунт в боковой панели или <strong>«+ Добавить аккаунт»</strong>.</p>
+    </section>
+  {% else %}
+    {% if request.query_params.get('error') %}
+    <div class="alert alert-error">
+      {% if request.query_params.get('error') == 'rejected_by_bank' %}Отклонено банком.{% else %}{{ request.query_params.get('error') }}{% endif %}
+    </div>
+    {% endif %}
+    {% if request.query_params.get('success') %}
+    <div class="alert alert-success">
+      {% if request.query_params.get('success') == 'updated' %}Профиль обновлён.{% else %}Успешно отправлено.{% endif %}
+      {% if selected.bank_type == 'personalpay' and request.query_params.get('transaction_id') %}
+      <span class="ml"><a href="/account/{{ selected.id }}/receipt?transaction_id={{ request.query_params.get('transaction_id') }}" class="alert-link">Показать чек</a></span>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    {% if auto_run_result %}
+    <div class="alert alert-warning">{{ auto_run_result }}</div>
+    {% endif %}
+
+    {% if token_expired %}
+    <div class="alert alert-error">
+      <strong>Токен истёк.</strong> Обновите его в разделе <a href="/account/{{ selected.id }}/edit" class="alert-link">«Изменить профиль»</a> (вставьте новый idToken из перехвата).
+    </div>
+    {% elif token_expires_in_hours is not none and token_expires_in_hours < 24 %}
+    <div class="alert alert-warning">
+      Токен истекает через <strong>{% if token_expires_in_hours < 1 %}{% set mins = (token_expires_in_hours * 60)|int %}{{ mins }} мин.{% else %}{{ "%.1f"|format(token_expires_in_hours) }} ч.{% endif %}</strong> — обновите в <a href="/account/{{ selected.id }}/edit" class="alert-link">«Изменить профиль»</a>.
+    </div>
+    {% endif %}
+
+    {% if balance_info and balance_info.get('error') %}
+    <section class="card">
+      <div class="alert alert-error">
+        <strong>Ошибка подключения:</strong> {{ balance_info.error }}
+        {% if '403' in (balance_info.error or '') and selected.bank_type == 'personalpay' %}
+        <p class="mt" style="margin-top: 0.75rem;">Для Personal Pay при 403: обнови токен в приложении и перехвати заново (токены живут недолго). Либо удали аккаунт и добавь снова, указав в Credentials кроме <code>auth_token</code> ещё <strong>device_id</strong> — скопируй из заголовка <code>x-fraud-paygilant-session-id</code> того же запроса часть до подчёркивания (например <code>178DC6C7-C43C-4DCC-B3BC-DBFAAA0F8FD2</code>).</p>
+        {% endif %}
+      </div>
+    </section>
+    {% else %}
+    <section class="card balance-card">
+      <div class="balance-header">
+        <h2>Баланс</h2>
+        <div class="balance-actions">
+          <button type="button" id="btn-refresh-balance" class="btn-refresh" title="Обновить баланс">↻ Обновить</button>
+        </div>
+      </div>
+      <p class="balance" id="balance-value">{{ balance_info.balance | default(0)|ars }} ARS</p>
+      <p class="meta" id="balance-meta">{% if balance_info.cvu_number %}CVU/счёт: {{ balance_info.cvu_number }}{% endif %}{% if balance_info.cvu_alias %} · Алиас: {{ balance_info.cvu_alias }}{% endif %}</p>
+      <script>
+        (function() {
+          var accountId = {{ selected.id }};
+          var balanceEl = document.getElementById('balance-value');
+          var metaEl = document.getElementById('balance-meta');
+          var btn = document.getElementById('btn-refresh-balance');
+          function refreshBalance() {
+            if (btn) btn.disabled = true;
+            fetch('/account/' + accountId + '/balance')
+              .then(function(r) { return r.json(); })
+              .then(function(d) {
+                if (d.error) {
+                  balanceEl.textContent = 'Ошибка: ' + d.error;
+                } else {
+                  balanceEl.textContent = (typeof d.balance === 'number' ? d.balance.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : d.balance) + ' ARS';
+                  if (metaEl) metaEl.textContent = [d.cvu_number ? 'CVU/счёт: ' + d.cvu_number : '', d.cvu_alias ? 'Алиас: ' + d.cvu_alias : ''].filter(Boolean).join(' · ');
+                }
+              })
+              .catch(function(e) { balanceEl.textContent = 'Ошибка: ' + e.message; })
+              .then(function() { if (btn) btn.disabled = false; });
+          }
+          if (btn) btn.addEventListener('click', refreshBalance);
+          setInterval(refreshBalance, 30000);
+        })();
+      </script>
+    </section>
+
+    {% if selected.bank_type == 'personalpay' and accounts_display %}
+    <section class="card card-accounts-json">
+      <h3>Счета (Personal Pay)</h3>
+      <pre class="code-block code-block--compact">{{ accounts_display | tojson(indent=2) }}</pre>
+    </section>
+    {% endif %}
+
+    <section class="card">
+      <h2>Создать вывод</h2>
+      {% if selected.bank_type == 'universalcoins' %}
+      <form method="post" action="/account/{{ selected.id }}/withdraw" class="form">
+        <div class="form-row">
+          <label for="cvu">CVU получателя (22 цифры) *</label>
+          <input id="cvu" name="cvu" type="text" inputmode="numeric" maxlength="24" placeholder="0000357301000001621038" required value="{{ prefill.cvu }}" />
+        </div>
+        <div class="form-row">
+          <label for="amount">Сумма (ARS) *</label>
+          <input id="amount" name="amount" type="text" inputmode="decimal" placeholder="100.00" required value="{{ prefill.amount }}" />
+        </div>
+        <div class="form-row">
+          <label for="concept">Причина перевода</label>
+          <select id="concept" name="concept">
+            {% for val, label in concepts_uc %}
+            <option value="{{ val }}" {% if prefill.concept == val %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-row">
+          <label for="name">Имя получателя (необязательно)</label>
+          <input id="name" name="name" type="text" value="{{ prefill.name }}" />
+        </div>
+        <div class="form-row">
+          <label for="document">Документ получателя (CUIT/CUIL) *</label>
+          <input id="document" name="document" type="text" placeholder="20402526700" required value="{{ prefill.document }}" />
+        </div>
+        <div class="form-row">
+          <label for="alias">Алиас получателя (необязательно)</label>
+          <input id="alias" name="alias" type="text" value="{{ prefill.alias }}" />
+        </div>
+        <div class="form-row">
+          <label for="bank">Банк получателя (необязательно)</label>
+          <input id="bank" name="bank" type="text" value="{{ prefill.bank }}" />
+        </div>
+        <button type="submit" class="btn-primary">Вывести</button>
+      </form>
+      {% else %}
+      <form method="post" action="/account/{{ selected.id }}/withdraw" class="form">
+        <div class="form-row">
+          <label for="destination">Получатель (CVU/alias) *</label>
+          <input id="destination" name="destination" type="text" required value="{{ prefill.destination }}" />
+        </div>
+        <div class="form-row">
+          <label for="amount">Сумма (ARS) *</label>
+          <input id="amount" name="amount" type="text" inputmode="decimal" required value="{{ prefill.amount }}" />
+        </div>
+        <button type="submit" class="btn-primary">Отправить</button>
+      </form>
+      {% endif %}
+    </section>
+
+    {% if selected.bank_type == 'personalpay' and activities_list %}
+    <section class="card">
+      <h3>История операций</h3>
+      <p class="form-hint">Приходы и выводы. Нажми «Чек» — откроются детали. Если появится ошибка 502, откройте чек в приложении Personal Pay, в перехватчике скопируйте <code>transactionId</code> из запроса к transference и вставьте его ниже в блоке «Просмотр чека по ID операции».</p>
+      <ul class="activities-list tx-history">
+        {% for act in activities_list %}
+        <li class="tx-item">
+          <span class="tx-badge tx-{{ 'outgoing' if act.is_outgoing else 'incoming' }}">{{ 'Вывод' if act.is_outgoing else 'Приход' }}</span>
+          {% if act.date_str %}
+          <span class="tx-date">{{ act.date_str }}</span>
+          {% endif %}
+          {% if act.amount is not none %}
+          <span class="tx-amount">{% if act.is_outgoing %}-{% else %}+{% endif %}{{ act.amount|ars }} ARS</span>
+          {% endif %}
+          <span class="tx-counterparty">
+            {% if act.is_outgoing %}
+              {% if act.recipient %}Кому: {{ act.recipient }}{% else %}{{ act.title }}{% endif %}
+            {% else %}
+              {% if act.sender %}От: {{ act.sender }}{% else %}{{ act.title }}{% endif %}
+            {% endif %}
+          </span>
+          {% set rid = act.receipt_id %}
+          {% if rid and (rid|length) == 32 %}
+          <a href="/account/{{ selected.id }}/receipt?transaction_id={{ rid }}" class="tx-cheque">Чек</a>
+          {% else %}
+          <span class="tx-cheque-hint" title="Для чека нужен 32-симв. ID из приложения — вставьте в форму ниже">Чек (32-симв. ID ↓)</span>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endif %}
+
+    {% if selected.bank_type == 'personalpay' %}
+    <section class="card card-receipt">
+      <h3>Просмотр чека по ID операции</h3>
+      <form method="get" action="/account/{{ selected.id }}/receipt" class="receipt-form">
+        <input id="tid" name="transaction_id" type="text" placeholder="Вставьте ID операции (32 символа)" class="receipt-input" />
+        <button type="submit" class="btn-primary">Показать чек</button>
+      </form>
+    </section>
+    {% endif %}
+
+
+    <section class="card">
+      <h3>Автоматический вывод</h3>
+      <p class="form-hint">Укажите CVU, общий лимит и сумму одной выплаты. При каждом обновлении страницы выполняется следующая выплата до достижения лимита.</p>
+      <form method="post" action="/account/{{ selected.id }}/auto-withdraw" class="form">
+        <div class="form-row">
+          <label for="auto-cvu">CVU</label>
+          <input id="auto-cvu" name="cvu" type="text" required />
+        </div>
+        <div class="form-row">
+          <label for="auto-total">Общий лимит (ARS)</label>
+          <input id="auto-total" name="total_limit" type="text" required placeholder="4.000.000" />
+        </div>
+        <div class="form-row">
+          <label for="auto-chunk">Сумма одной выплаты (ARS)</label>
+          <input id="auto-chunk" name="chunk_amount" type="text" required placeholder="400.000" />
+        </div>
+        <div class="form-row">
+          <label for="auto-min-balance">Минимальный баланс для запуска (ARS)</label>
+          <input id="auto-min-balance" name="min_balance" type="text" placeholder="400.000" />
+          <span class="form-hint" style="margin-top:4px">Вывод произойдёт только если баланс ≥ этой суммы. Оставьте пустым — выводить всегда.</span>
+        </div>
+        <button type="submit" class="btn-primary">Добавить автоправило</button>
+      </form>
+      {% if auto_rules %}
+      <ul class="activities-list" style="margin-top: 1rem;">
+        {% for rule in auto_rules %}
+        <li style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)">
+          <span>
+            CVU {{ rule.cvu }} — {{ rule.paid_amount|ars }} / {{ rule.total_limit|ars }} ARS
+            (шаг {{ rule.chunk_amount|ars }} ARS
+            {%- if rule.min_balance %}, порог {{ rule.min_balance|ars }} ARS{% endif %})
+          </span>
+          {% if rule.last_error %}
+          <span style="color:#f87171;font-size:0.8em">⚠ {{ rule.last_error }}</span>
+          {% endif %}
+          {% if rule.is_active %}
+          <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/run" class="form-inline" style="display:inline;margin:0">
+            <button type="submit" class="btn-table btn-open">▶ Выполнить шаг</button>
+          </form>
+          {% else %}
+          <span class="tx-badge tx-incoming">✓ Завершено</span>
+          {% endif %}
+          <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/delete" class="form-inline" style="display:inline;margin:0">
+            <button type="submit" class="btn-table" style="background:#ef4444;color:#fff;" onclick="return confirm('Удалить это автоправило?')">✕ Удалить</button>
+          </form>
+        </li>
+        {% endfor %}
+      </ul>
+      {% endif %}
+    </section>
+
+    <section class="card card-actions">
+      <a href="/account/{{ selected.id }}/edit" class="btn-edit">Изменить профиль</a>
+      <form method="post" action="/account/{{ selected.id }}/delete" class="form-inline" onsubmit="return confirm('Удалить этот аккаунт из дашборда? Данные входа будут удалены.');">
+        <button type="submit" class="btn-danger">Удалить аккаунт из дашборда</button>
+      </form>
+    </section>
+    {% endif %}
+  {% endif %}
+{% endblock %}
