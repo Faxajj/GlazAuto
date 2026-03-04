@@ -15,6 +15,7 @@
         Не знаете логин и пароль? Получите учётные данные у администратора проекта.
         Самостоятельной регистрации на сайте нет.
       </div>
+      <p class="form-hint">Регистрация отключена. Доступ выдается администратором.</p>
       {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
       <form method="post" action="/login" class="form">
         <div class="form-row">

@@ -26,6 +26,7 @@ from app.database import (
     update_account as db_update_account,
     WINDOWS,
     add_auto_withdraw_rule,
+    create_user,
     get_auto_withdraw_rule,
     get_user_by_username,
     list_auto_withdraw_rules,
@@ -116,6 +117,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(AuthMiddleware)
+
+
+def _ensure_admin_user() -> None:
+    username = ("admin").strip().lower()
+    password = "admin123"
+    if get_user_by_username(username):
+        return
+    create_user(username, password, is_active=True)
+
+
+_ensure_admin_user()
 
 
 templates.env.filters["ars"] = _format_ars
