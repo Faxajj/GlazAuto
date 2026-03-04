@@ -4,6 +4,7 @@
 import base64
 import html
 import json
+import secrets
 import time
 import traceback
 from typing import Optional, Tuple
@@ -11,6 +12,7 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -23,6 +25,13 @@ from app.database import (
     list_accounts,
     update_account as db_update_account,
     WINDOWS,
+    add_auto_withdraw_rule,
+    create_user,
+    get_auto_withdraw_rule,
+    get_user_by_username,
+    list_auto_withdraw_rules,
+    update_auto_withdraw_progress,
+    verify_password,
 )
 from app.drivers import (
     BANK_TYPES,
@@ -57,6 +66,71 @@ CONCEPTS_UC = [
     ("VENTA", "VENTA (продажа)"),
 ]
 
+
+SESSION_COOKIE = "dashboard_session"
+SESSION_TTL = 60 * 60 * 12
+SESSIONS: dict[str, dict] = {}
+
+
+def _cleanup_sessions() -> None:
+    now = time.time()
+    expired = [k for k, v in SESSIONS.items() if v.get("exp", 0) <= now]
+    for key in expired:
+        SESSIONS.pop(key, None)
+
+
+def _current_user(request: Request) -> Optional[dict]:
+    _cleanup_sessions()
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None
+    data = SESSIONS.get(token)
+    if not data:
+        return None
+    if data.get("exp", 0) <= time.time():
+        SESSIONS.pop(token, None)
+        return None
+    return data
+
+
+def _format_ars(value, decimals: int = 2) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "0"
+    if decimals == 0:
+        return f"{num:,.0f}".replace(",", ".")
+    return f"{num:,.{decimals}f}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        public_paths = {"/login", "/static"}
+        if any(path == p or path.startswith(f"{p}/") for p in public_paths):
+            return await call_next(request)
+        if path == "/health":
+            return await call_next(request)
+        if not _current_user(request):
+            return RedirectResponse(url="/login", status_code=302)
+        return await call_next(request)
+
+
+app.add_middleware(AuthMiddleware)
+
+
+def _ensure_admin_user() -> None:
+    username = ("admin").strip().lower()
+    password = "admin123"
+    if get_user_by_username(username):
+        return
+    create_user(username, password, is_active=True)
+
+
+_ensure_admin_user()
+
+
+templates.env.filters["ars"] = _format_ars
 
 def _extract_activities_raw(data) -> list:
     """Из ответа API activities-list извлекает список операций (разные форматы из логов)."""
@@ -328,6 +402,53 @@ def _window_name(slug: str) -> str:
     return slug
 
 
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, error: str = ""):
+    if _current_user(request):
+        return RedirectResponse(url="/", status_code=302)
+    return templates.TemplateResponse(
+        "login.html",
+        {"request": request, "error": error},
+    )
+
+
+@app.post("/login", response_class=HTMLResponse)
+async def login_post(request: Request, username: str = Form(""), password: str = Form("")):
+    user = get_user_by_username(username)
+    if not user or not user.get("is_active") or not verify_password(password, user.get("password_hash", "")):
+        return templates.TemplateResponse(
+            "login.html",
+            {"request": request, "error": "Неверный логин или пароль."},
+            status_code=400,
+        )
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {
+        "user_id": user["id"],
+        "username": user["username"],
+        "exp": time.time() + SESSION_TTL,
+    }
+    response = RedirectResponse(url="/", status_code=302)
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        max_age=SESSION_TTL,
+    )
+    return response
+
+
+@app.post("/logout", response_class=RedirectResponse)
+async def logout(request: Request):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        SESSIONS.pop(token, None)
+    response = RedirectResponse(url="/login", status_code=302)
+    response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request, account_id: Optional[int] = None, window: Optional[str] = None):
     try:
@@ -392,6 +513,16 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
         except Exception:
             token_expired, token_expires_in_hours = False, None
     activities_list = []
+    auto_rules = list_auto_withdraw_rules(selected["id"]) if selected else []
+    auto_run_result = None
+    if selected and auto_rules:
+        for rule in auto_rules:
+            if int(rule.get("is_active", 0)) != 1:
+                continue
+            ok, msg = _run_auto_withdraw_rule(selected, rule)
+            auto_run_result = "Автовывод выполнен." if ok else f"Автовывод: {msg}"
+            break
+        auto_rules = list_auto_withdraw_rules(selected["id"])
     if selected and selected["bank_type"] == "personalpay":
         try:
             data = pp_activities_list(selected["credentials"], offset=0, limit=15)
@@ -422,6 +553,9 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
             "window_slug": window_slug,
             "window_name": window_name,
             "window_accounts": window_accounts,
+            "current_user": _current_user(request),
+            "auto_rules": auto_rules,
+            "auto_run_result": auto_run_result,
             "prefill": {
                 "cvu": "",
                 "destination": "",
@@ -538,8 +672,70 @@ async def withdraw(
                 if "-" not in raw and len(raw) == 32 and all(c in "0123456789ABCDEFabcdef" for c in raw):
                     tid = raw
     if tid:
-        return RedirectResponse(url=f"/?account_id={account_id}&success=1&transaction_id={tid}", status_code=302)
+        return RedirectResponse(url=f"/account/{account_id}/receipt?transaction_id={tid}", status_code=302)
     return RedirectResponse(url=f"/?account_id={account_id}&success=1", status_code=302)
+
+
+def _run_auto_withdraw_rule(acc: dict, rule: dict) -> tuple[bool, str]:
+    remaining = max(0.0, float(rule.get("total_limit", 0)) - float(rule.get("paid_amount", 0)))
+    if remaining <= 0:
+        update_auto_withdraw_progress(rule["id"], is_active=False)
+        return False, "Лимит достигнут"
+    chunk = min(float(rule.get("chunk_amount", 0)), remaining)
+    if chunk <= 0:
+        update_auto_withdraw_progress(rule["id"], last_error="Некорректная сумма", is_active=False)
+        return False, "Некорректная сумма"
+    try:
+        if acc["bank_type"] == "universalcoins":
+            raise ValueError("Автовывод поддерживается только для Personal Pay")
+        result = driver_withdraw(
+            acc["bank_type"],
+            acc["credentials"],
+            destination=rule["cvu"],
+            amount=chunk,
+            comments="Auto withdraw",
+        )
+        update_auto_withdraw_progress(rule["id"], paid_delta=chunk, last_error="")
+    except Exception as e:
+        update_auto_withdraw_progress(rule["id"], last_error=str(e))
+        return False, str(e)
+
+    tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
+    return True, (tid or "")
+
+
+@app.post("/account/{account_id}/auto-withdraw", response_class=RedirectResponse)
+async def create_auto_withdraw(
+    account_id: int,
+    cvu: str = Form(""),
+    total_limit: str = Form(""),
+    chunk_amount: str = Form(""),
+):
+    acc = get_account(account_id)
+    if not acc:
+        return RedirectResponse(url="/", status_code=302)
+    try:
+        total = float((total_limit or "").replace(" ", "").replace(".", "").replace(",", "."))
+        chunk = float((chunk_amount or "").replace(" ", "").replace(".", "").replace(",", "."))
+    except ValueError:
+        return RedirectResponse(url=f"/?account_id={account_id}&error=invalid_amount", status_code=302)
+    if total <= 0 or chunk <= 0 or chunk > total or not cvu.strip():
+        return RedirectResponse(url=f"/?account_id={account_id}&error=invalid_auto_rule", status_code=302)
+    add_auto_withdraw_rule(account_id, cvu.strip(), total, chunk)
+    return RedirectResponse(url=f"/?account_id={account_id}&success=auto_rule_created", status_code=302)
+
+
+@app.post("/account/{account_id}/auto-withdraw/{rule_id}/run", response_class=RedirectResponse)
+async def run_auto_withdraw(account_id: int, rule_id: int):
+    acc = get_account(account_id)
+    rule = get_auto_withdraw_rule(rule_id)
+    if not acc or not rule or int(rule.get("account_id", 0)) != account_id:
+        return RedirectResponse(url=f"/?account_id={account_id}", status_code=302)
+    ok, message = _run_auto_withdraw_rule(acc, rule)
+    if ok:
+        return RedirectResponse(url=f"/?account_id={account_id}&success=auto_withdraw_done", status_code=302)
+    return RedirectResponse(url=f"/?account_id={account_id}&error={quote(message[:200], safe='')}", status_code=302)
+
 
 
 @app.get("/add", response_class=HTMLResponse)

@@ -2,7 +2,9 @@
 SQLite хранилище аккаунтов банков.
 Аккаунты: id, bank_type, label, credentials (JSON), window (GLAZARS | GLAZ3 | GLAZ6).
 """
+import hashlib
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any, List, Optional
@@ -20,6 +22,8 @@ WINDOWS = [
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -42,6 +46,149 @@ def init_db() -> None:
             conn.commit()
         except sqlite3.OperationalError:
             pass
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accounts_window_created ON accounts(window, created_at DESC)"
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_withdraw_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id INTEGER NOT NULL,
+                cvu TEXT NOT NULL,
+                total_limit REAL NOT NULL,
+                chunk_amount REAL NOT NULL,
+                paid_amount REAL NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT,
+                created_at TEXT DEFAULT (datetime('now')),
+                updated_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_auto_withdraw_active ON auto_withdraw_rules(is_active, account_id)"
+        )
+        conn.commit()
+
+
+def _hash_password(password: str, salt: Optional[str] = None) -> str:
+    raw_salt = salt or os.urandom(16).hex()
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), raw_salt.encode("utf-8"), 150000)
+    return f"pbkdf2_sha256${raw_salt}${derived.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algo, salt, digest = stored_hash.split("$", 2)
+    except ValueError:
+        return False
+    if algo != "pbkdf2_sha256":
+        return False
+    check = _hash_password(password, salt=salt)
+    return check == stored_hash
+
+
+def create_user(username: str, password: str, is_active: bool = True) -> int:
+    username = username.strip().lower()
+    if not username or not password:
+        raise ValueError("username and password are required")
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO users (username, password_hash, is_active) VALUES (?, ?, ?)",
+            (username, _hash_password(password), 1 if is_active else 0),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_user_by_username(username: str) -> Optional[dict]:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, username, password_hash, is_active FROM users WHERE username = ?",
+            (username.strip().lower(),),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "username": row["username"],
+        "password_hash": row["password_hash"],
+        "is_active": bool(row["is_active"]),
+    }
+
+
+def list_auto_withdraw_rules(account_id: Optional[int] = None) -> List[dict]:
+    where = ""
+    params: tuple = ()
+    if account_id is not None:
+        where = "WHERE account_id = ?"
+        params = (account_id,)
+    with _get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, account_id, cvu, total_limit, chunk_amount, paid_amount, is_active, COALESCE(last_error, '') AS last_error
+            FROM auto_withdraw_rules
+            {where}
+            ORDER BY created_at DESC
+            """,
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_auto_withdraw_rule(rule_id: int) -> Optional[dict]:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, account_id, cvu, total_limit, chunk_amount, paid_amount, is_active, COALESCE(last_error, '') AS last_error FROM auto_withdraw_rules WHERE id = ?",
+            (rule_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def add_auto_withdraw_rule(account_id: int, cvu: str, total_limit: float, chunk_amount: float) -> int:
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO auto_withdraw_rules (account_id, cvu, total_limit, chunk_amount) VALUES (?, ?, ?, ?)",
+            (account_id, cvu.strip(), float(total_limit), float(chunk_amount)),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def update_auto_withdraw_progress(rule_id: int, paid_delta: float = 0, last_error: str = "", is_active: Optional[bool] = None) -> None:
+    with _get_conn() as conn:
+        rule = conn.execute("SELECT paid_amount, total_limit FROM auto_withdraw_rules WHERE id = ?", (rule_id,)).fetchone()
+        if not rule:
+            return
+        paid = float(rule["paid_amount"] or 0) + float(paid_delta or 0)
+        total = float(rule["total_limit"] or 0)
+        active = int(paid < total)
+        if is_active is not None:
+            active = 1 if is_active else 0
+        conn.execute(
+            """
+            UPDATE auto_withdraw_rules
+            SET paid_amount = ?, is_active = ?, last_error = ?, updated_at = datetime('now')
+            WHERE id = ?
+            """,
+            (paid, active, (last_error or "")[:400], rule_id),
+        )
+        conn.commit()
 
 
 def list_accounts() -> List[dict]:
