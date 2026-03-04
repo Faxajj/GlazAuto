@@ -71,10 +71,6 @@ CONCEPTS_UC = [
 ]
 
 
-
-
-
-
 def _current_user(request: Request) -> Optional[dict]:
     cleanup_sessions()
 
