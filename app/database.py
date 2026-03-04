@@ -82,6 +82,7 @@ def init_db() -> None:
                 cvu TEXT NOT NULL,
                 total_limit REAL NOT NULL,
                 chunk_amount REAL NOT NULL,
+                min_balance REAL NOT NULL DEFAULT 0,
                 paid_amount REAL NOT NULL DEFAULT 0,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 last_error TEXT,
@@ -95,6 +96,13 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_auto_withdraw_active ON auto_withdraw_rules(is_active, account_id)"
         )
         conn.commit()
+
+        # Миграция: добавить колонку min_balance если её нет
+        try:
+            conn.execute("ALTER TABLE auto_withdraw_rules ADD COLUMN min_balance REAL NOT NULL DEFAULT 0")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
 
 def _hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -152,7 +160,9 @@ def list_auto_withdraw_rules(account_id: Optional[int] = None) -> List[dict]:
     with _get_conn() as conn:
         rows = conn.execute(
             f"""
-            SELECT id, account_id, cvu, total_limit, chunk_amount, paid_amount, is_active, COALESCE(last_error, '') AS last_error
+            SELECT id, account_id, cvu, total_limit, chunk_amount, paid_amount, is_active,
+                   COALESCE(last_error, '') AS last_error,
+                   COALESCE(min_balance, 0) AS min_balance
             FROM auto_withdraw_rules
             {where}
             ORDER BY created_at DESC
@@ -165,17 +175,17 @@ def list_auto_withdraw_rules(account_id: Optional[int] = None) -> List[dict]:
 def get_auto_withdraw_rule(rule_id: int) -> Optional[dict]:
     with _get_conn() as conn:
         row = conn.execute(
-            "SELECT id, account_id, cvu, total_limit, chunk_amount, paid_amount, is_active, COALESCE(last_error, '') AS last_error FROM auto_withdraw_rules WHERE id = ?",
+            "SELECT id, account_id, cvu, total_limit, chunk_amount, paid_amount, is_active, COALESCE(last_error, '') AS last_error, COALESCE(min_balance, 0) AS min_balance FROM auto_withdraw_rules WHERE id = ?",
             (rule_id,),
         ).fetchone()
     return dict(row) if row else None
 
 
-def add_auto_withdraw_rule(account_id: int, cvu: str, total_limit: float, chunk_amount: float) -> int:
+def add_auto_withdraw_rule(account_id: int, cvu: str, total_limit: float, chunk_amount: float, min_balance: float = 0) -> int:
     with _get_conn() as conn:
         cur = conn.execute(
-            "INSERT INTO auto_withdraw_rules (account_id, cvu, total_limit, chunk_amount) VALUES (?, ?, ?, ?)",
-            (account_id, cvu.strip(), float(total_limit), float(chunk_amount)),
+            "INSERT INTO auto_withdraw_rules (account_id, cvu, total_limit, chunk_amount, min_balance) VALUES (?, ?, ?, ?, ?)",
+            (account_id, cvu.strip(), float(total_limit), float(chunk_amount), float(min_balance)),
         )
         conn.commit()
         return cur.lastrowid

@@ -49,6 +49,7 @@ from app.drivers.personalpay import (
 )
 
 SESSION_COOKIE = "session_token"
+SESSION_TTL = 60 * 60 * 8  # 8 часов
 
 app = FastAPI(title="Banks Dashboard — несколько аккаунтов")
 
@@ -694,6 +695,21 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> tuple[bool, str]:
     if chunk <= 0:
         update_auto_withdraw_progress(rule["id"], last_error="Некорректная сумма", is_active=False)
         return False, "Некорректная сумма"
+
+    # Проверяем баланс — если задан минимальный порог, не выводим пока баланс ниже него
+    min_balance = float(rule.get("min_balance") or 0)
+    if min_balance > 0:
+        try:
+            balance_info = driver_balance(acc["bank_type"], acc["credentials"])
+            current_balance = float(balance_info.get("balance") or 0)
+        except Exception as e:
+            err = f"Не удалось получить баланс: {e}"
+            update_auto_withdraw_progress(rule["id"], last_error=err)
+            return False, err
+        if current_balance < min_balance:
+            # Молча пропускаем — не спамим ошибками, просто ждём
+            return False, f"Баланс {current_balance:,.0f} < порога {min_balance:,.0f} — ожидание пополнения"
+
     try:
         if acc["bank_type"] == "universalcoins":
             raise ValueError("Автовывод поддерживается только для Personal Pay")
@@ -719,6 +735,7 @@ async def create_auto_withdraw(
     cvu: str = Form(""),
     total_limit: str = Form(""),
     chunk_amount: str = Form(""),
+    min_balance: str = Form("0"),
 ):
     acc = get_account(account_id)
     if not acc:
@@ -726,12 +743,25 @@ async def create_auto_withdraw(
     try:
         total = float((total_limit or "").replace(" ", "").replace(".", "").replace(",", "."))
         chunk = float((chunk_amount or "").replace(" ", "").replace(".", "").replace(",", "."))
+        min_bal = float((min_balance or "0").replace(" ", "").replace(".", "").replace(",", "."))
     except ValueError:
         return RedirectResponse(url=f"/?account_id={account_id}&error=invalid_amount", status_code=302)
     if total <= 0 or chunk <= 0 or chunk > total or not cvu.strip():
         return RedirectResponse(url=f"/?account_id={account_id}&error=invalid_auto_rule", status_code=302)
-    add_auto_withdraw_rule(account_id, cvu.strip(), total, chunk)
+    add_auto_withdraw_rule(account_id, cvu.strip(), total, chunk, min_bal)
     return RedirectResponse(url=f"/?account_id={account_id}&success=auto_rule_created", status_code=302)
+
+
+@app.post("/account/{account_id}/auto-withdraw/{rule_id}/delete", response_class=RedirectResponse)
+async def delete_auto_withdraw(account_id: int, rule_id: int):
+    from app.database import _get_conn
+    with _get_conn() as conn:
+        conn.execute(
+            "DELETE FROM auto_withdraw_rules WHERE id = ? AND account_id = ?",
+            (rule_id, account_id),
+        )
+        conn.commit()
+    return RedirectResponse(url=f"/?account_id={account_id}", status_code=302)
 
 
 @app.post("/account/{account_id}/auto-withdraw/{rule_id}/run", response_class=RedirectResponse)
