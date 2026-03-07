@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>{% block title %}Banks Dashboard{% endblock %}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="/static/style.css?v=6" />
+  <link rel="stylesheet" href="/static/style.css?v=7" />
 </head>
 <body>
   <header class="header">
@@ -12,12 +12,16 @@
       <h1>Banks Dashboard</h1>
       <p class="header-sub">Несколько аккаунтов — переключение в один клик</p>
     </div>
-    {% if current_user %}
-    <form method="post" action="/logout" class="form-inline">
-      <button type="submit" class="btn-table btn-edit">Выйти ({{ current_user.username }})</button>
-    </form>
-    {% endif %}
+    <div style="display:flex;align-items:center;gap:0.75rem">
+      <a href="/dashboard" class="btn-table btn-open" style="text-decoration:none">📊 Обзор</a>
+      {% if current_user %}
+      <form method="post" action="/logout" class="form-inline">
+        <button type="submit" class="btn-table btn-edit">Выйти ({{ current_user.username }})</button>
+      </form>
+      {% endif %}
+    </div>
   </header>
+
   <div class="layout">
     {% block sidebar %}
     <aside class="sidebar">
@@ -28,7 +32,7 @@
         <section class="nav-window {% if (window_slug|default(none)) == w_slug %}nav-window--current{% endif %}" data-window="{{ w_slug }}">
           <div class="nav-window-title">
             <a href="/?window={{ w_slug }}" class="nav-window-title-link">{{ w_name }}</a>
-            <button type="button" class="nav-window-toggle-btn" aria-expanded="true" aria-controls="window-{{ w_slug }}" aria-label="Свернуть или развернуть">▼</button>
+            <button type="button" class="nav-window-toggle-btn" aria-expanded="true" aria-label="Свернуть">▼</button>
           </div>
           <div class="nav-window-body" id="window-{{ w_slug }}">
             {% for acc in groups.get(w_slug, []) %}
@@ -43,71 +47,87 @@
         {% endfor %}
       </nav>
       <a href="/add" class="btn-add">+ Добавить аккаунт</a>
+
       <script>
-        (function() {
-          var balanceEls = document.querySelectorAll('.sidebar-balance[data-account-id]');
-          var formatMoney = function(v){
-            if (typeof v !== "number") return v;
-            return v.toLocaleString("es-AR", {minimumFractionDigits:2, maximumFractionDigits:2});
-          };
-          function fetchOne(id, el) {
-            fetch('/account/' + id + '/balance')
-              .then(function(r) { return r.json(); })
-              .then(function(d) {
-                if (d.error) el.textContent = '—'; else el.textContent = formatMoney(d.balance) + ' ARS';
-              })
-              .catch(function() { el.textContent = '—'; });
-          }
-          balanceEls.forEach(function(el) {
-            var id = el.getAttribute('data-account-id');
-            if (id) fetchOne(id, el);
+      (function() {
+        // Балансы в сайдбаре
+        var balEls = document.querySelectorAll('.sidebar-balance[data-account-id]');
+        function fmt(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : v; }
+        function fetchBal(id, el) {
+          fetch('/account/'+id+'/balance').then(r=>r.json()).then(d=>{
+            el.textContent = d.error ? '—' : fmt(d.balance)+' ARS';
+          }).catch(()=>{ el.textContent='—'; });
+        }
+        balEls.forEach(el=>{ var id=el.getAttribute('data-account-id'); if(id) fetchBal(id,el); });
+        setInterval(()=>{ balEls.forEach(el=>{ var id=el.getAttribute('data-account-id'); if(id) fetchBal(id,el); }); }, 45000);
+
+        // Сворачивание групп
+        var key='banks-dashboard-windows-collapsed';
+        function loadState(){ try{ var s=localStorage.getItem(key); return s?JSON.parse(s):{}; }catch(e){return{};} }
+        function saveState(s){ try{localStorage.setItem(key,JSON.stringify(s));}catch(e){} }
+        document.querySelectorAll('.nav-window').forEach(function(w){
+          var slug=w.getAttribute('data-window');
+          var toggle=w.querySelector('.nav-window-toggle-btn');
+          if(!toggle) return;
+          var state=loadState();
+          if(state[slug]){ w.classList.add('nav-window--collapsed'); toggle.textContent='▶'; toggle.setAttribute('aria-expanded','false'); }
+          toggle.addEventListener('click',function(e){
+            e.preventDefault(); w.classList.toggle('nav-window--collapsed');
+            var col=w.classList.contains('nav-window--collapsed');
+            toggle.textContent=col?'▶':'▼'; toggle.setAttribute('aria-expanded',col?'false':'true');
+            state[slug]=col; saveState(state);
           });
-          setInterval(function() {
-            balanceEls.forEach(function(el) {
-              var id = el.getAttribute('data-account-id');
-              if (id) fetchOne(id, el);
-            });
-          }, 45000);
-        })();
-        (function() {
-          var key = 'banks-dashboard-windows-collapsed';
-          function loadState() {
-            try {
-              var s = localStorage.getItem(key);
-              return s ? JSON.parse(s) : {};
-            } catch (e) { return {}; }
-          }
-          function saveState(state) {
-            try { localStorage.setItem(key, JSON.stringify(state)); } catch (e) {}
-          }
-          document.querySelectorAll('.nav-window').forEach(function(w) {
-            var slug = w.getAttribute('data-window');
-            var body = w.querySelector('.nav-window-body');
-            var toggle = w.querySelector('.nav-window-toggle-btn');
-            if (!toggle) return;
-            var state = loadState();
-            if (state[slug]) {
-              w.classList.add('nav-window--collapsed');
-              toggle.textContent = '▶';
-              toggle.setAttribute('aria-expanded', 'false');
-            }
-            toggle.addEventListener('click', function(e) {
-              e.preventDefault();
-              w.classList.toggle('nav-window--collapsed');
-              var collapsed = w.classList.contains('nav-window--collapsed');
-              toggle.textContent = collapsed ? '▶' : '▼';
-              toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-              state[slug] = collapsed;
-              saveState(state);
-            });
-          });
-        })();
+        });
+      })();
       </script>
     </aside>
     {% endblock %}
+
     <main class="main">
       {% block content %}{% endblock %}
     </main>
   </div>
+
+  <!-- Модальное окно подтверждения удаления -->
+  <div id="confirm-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center">
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:2rem;max-width:420px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5)">
+      <h3 style="margin:0 0 0.75rem;color:#f1f5f9;font-size:1.1rem">⚠️ Подтвердите удаление</h3>
+      <p id="confirm-modal-text" style="color:#94a3b8;margin:0 0 1.5rem;line-height:1.5"></p>
+      <div style="display:flex;gap:0.75rem;justify-content:flex-end">
+        <button id="confirm-cancel" style="padding:0.6rem 1.2rem;background:#334155;color:#cbd5e1;border:none;border-radius:8px;cursor:pointer;font-size:0.95rem">Отмена</button>
+        <button id="confirm-ok" style="padding:0.6rem 1.4rem;background:#ef4444;color:white;border:none;border-radius:8px;cursor:pointer;font-size:0.95rem;font-weight:600">Удалить</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  // Универсальный модальный диалог подтверждения
+  (function(){
+    var modal=document.getElementById('confirm-modal');
+    var modalText=document.getElementById('confirm-modal-text');
+    var cancelBtn=document.getElementById('confirm-cancel');
+    var okBtn=document.getElementById('confirm-ok');
+    var pendingForm=null;
+
+    document.querySelectorAll('form[data-confirm]').forEach(function(form){
+      form.addEventListener('submit',function(e){
+        e.preventDefault();
+        modalText.textContent=form.getAttribute('data-confirm');
+        pendingForm=form;
+        modal.style.display='flex';
+      });
+    });
+
+    cancelBtn.addEventListener('click',function(){
+      modal.style.display='none'; pendingForm=null;
+    });
+    okBtn.addEventListener('click',function(){
+      if(pendingForm){ modal.style.display='none'; pendingForm.submit(); pendingForm=null; }
+    });
+    modal.addEventListener('click',function(e){
+      if(e.target===modal){ modal.style.display='none'; pendingForm=null; }
+    });
+  })();
+  </script>
 </body>
 </html>

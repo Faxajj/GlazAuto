@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Обзор — Banks Dashboard{% endblock %}
+
+{% block content %}
+<section class="card">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;margin-bottom:1.5rem">
+    <h2 style="margin:0">📊 Обзор всех аккаунтов</h2>
+    <button id="refresh-all" class="btn-refresh">↻ Обновить все балансы</button>
+  </div>
+
+  {% if not accounts %}
+  <p style="color:#94a3b8">Аккаунтов пока нет. <a href="/add" style="color:#38bdf8">Добавить первый</a></p>
+  {% else %}
+    {% for w_slug, w_name in window_list %}
+      {% set w_accounts = groups.get(w_slug, []) %}
+      {% if w_accounts %}
+      <div style="margin-bottom:2rem">
+        <h3 style="color:#94a3b8;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.08em;margin:0 0 0.75rem">{{ w_name }}</h3>
+        <div class="dashboard-grid">
+          {% for acc in w_accounts %}
+          <div class="dashboard-card" data-account-id="{{ acc.id }}">
+            <div class="dashboard-card-header">
+              <span class="dashboard-card-label">{{ acc.label }}</span>
+              <span class="dashboard-card-type">{{ acc.bank_type }}</span>
+            </div>
+            <div class="dashboard-card-balance" id="dash-balance-{{ acc.id }}">
+              <span class="balance-spinner">⟳</span>
+            </div>
+            <div class="dashboard-card-meta" id="dash-meta-{{ acc.id }}" style="color:#64748b;font-size:0.8rem;margin-top:0.25rem"></div>
+            <div class="dashboard-card-actions">
+              <a href="/?account_id={{ acc.id }}" class="btn-table btn-open">Открыть</a>
+              <form method="post" action="/account/{{ acc.id }}/delete" class="form-inline"
+                    data-confirm="Вы уверены, что хотите удалить счёт «{{ acc.label }}»? Все данные для входа будут удалены.">
+                <button type="submit" class="btn-table btn-danger">Удалить</button>
+              </form>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    {% endfor %}
+  {% endif %}
+</section>
+
+<script>
+(function(){
+  var fmt = function(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : v; };
+
+  function fetchBalance(id){
+    var balEl = document.getElementById('dash-balance-'+id);
+    var metaEl = document.getElementById('dash-meta-'+id);
+    fetch('/account/'+id+'/balance')
+      .then(r=>r.json())
+      .then(d=>{
+        if(d.error){
+          balEl.innerHTML='<span style="color:#f87171;font-size:0.85rem">⚠ Ошибка подключения</span>';
+        } else {
+          balEl.textContent = fmt(d.balance) + ' ARS';
+          balEl.style.color = d.balance > 0 ? '#34d399' : '#94a3b8';
+          if(metaEl){
+            var parts=[];
+            if(d.cvu_number) parts.push('CVU: '+d.cvu_number);
+            if(d.cvu_alias) parts.push('Алиас: '+d.cvu_alias);
+            metaEl.textContent=parts.join(' · ');
+          }
+        }
+      })
+      .catch(()=>{ balEl.innerHTML='<span style="color:#f87171;font-size:0.85rem">⚠ Недоступен</span>'; });
+  }
+
+  var cards = document.querySelectorAll('.dashboard-card[data-account-id]');
+  cards.forEach(function(card){
+    fetchBalance(card.getAttribute('data-account-id'));
+  });
+
+  document.getElementById('refresh-all').addEventListener('click', function(){
+    cards.forEach(function(card){
+      var id = card.getAttribute('data-account-id');
+      document.getElementById('dash-balance-'+id).innerHTML='<span class="balance-spinner">⟳</span>';
+      fetchBalance(id);
+    });
+  });
+
+  setInterval(function(){
+    cards.forEach(function(card){ fetchBalance(card.getAttribute('data-account-id')); });
+  }, 30000);
+})();
+</script>
+{% endblock %}
