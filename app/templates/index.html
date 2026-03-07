@@ -352,26 +352,60 @@
 {% if selected %}
 <script>
 (function(){
-'use strict';
-
 var ACCOUNT_ID = {{ selected.id }};
 var ACCOUNT_LABEL = {{ selected.label | tojson }};
 var BANK_TYPE = {{ selected.bank_type | tojson }};
 var fmt = function(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : String(v||0); };
 
 // ─────────────────────────────────────────────────────────
-// 1. LAZY BALANCE
+// 1. ОСНОВНОЙ БАЛАНС — lazy load
+// Причина бага: refreshBtn.disabled блокировал повторные вызовы при зависшем fetch.
+// Исправление: флаг _balLoading, таймаут 15 сек на fetch, немедленный показ из sessionStorage.
 // ─────────────────────────────────────────────────────────
-var balEl   = document.getElementById('balance-value');
-var metaEl  = document.getElementById('balance-meta');
-var errBox  = document.getElementById('balance-error-box');
+var balEl      = document.getElementById('balance-value');
+var metaEl     = document.getElementById('balance-meta');
+var errBox     = document.getElementById('balance-error-box');
 var refreshBtn = document.getElementById('btn-refresh-balance');
+var _balLoading = false;
+var _balCacheKey = 'bal_main_' + ACCOUNT_ID;
 
-function loadBalance(){
+// Показать закешированное значение сразу (не ждать сети)
+(function(){
+  try {
+    var cached = sessionStorage.getItem(_balCacheKey);
+    if(cached){
+      var c = JSON.parse(cached);
+      if(balEl) balEl.textContent = c.text;
+      if(metaEl) metaEl.textContent = c.meta || '';
+    }
+  } catch(e){}
+})();
+
+function loadBalance(force){
+  if(_balLoading && !force) return;
+  _balLoading = true;
   if(refreshBtn) refreshBtn.disabled = true;
+
+  // Таймаут 20 секунд — после него показываем ошибку и разблокируем
+  var timedOut = false;
+  var timeoutId = setTimeout(function(){
+    timedOut = true;
+    _balLoading = false;
+    if(refreshBtn) refreshBtn.disabled = false;
+    if(balEl && !balEl.textContent.trim()) {
+      balEl.innerHTML = '<span style="color:#f87171">Таймаут</span>';
+    }
+    if(metaEl && metaEl.textContent === 'загружается...') metaEl.textContent = '';
+  }, 20000);
+
   fetch('/account/'+ACCOUNT_ID+'/balance')
-    .then(r=>r.json())
+    .then(function(r){ return r.json(); })
     .then(function(d){
+      if(timedOut) return;
+      clearTimeout(timeoutId);
+      _balLoading = false;
+      if(refreshBtn) refreshBtn.disabled = false;
+
       if(d.error){
         if(balEl) balEl.innerHTML = '<span style="color:#f87171;font-size:1rem">⚠ Ошибка</span>';
         if(metaEl) metaEl.textContent = '';
@@ -381,28 +415,38 @@ function loadBalance(){
             '<strong>Ошибка подключения к банку</strong><br>'+
             '<span style="font-size:0.85rem;opacity:0.8">'+d.error+'</span>'+
             (d.error.indexOf('403')!==-1 && BANK_TYPE==='personalpay' ?
-              '<p style="margin:0.5rem 0 0;font-size:0.85rem">Обнови токен в приложении и перехвати новый. '+
+              '<p style="margin:0.5rem 0 0;font-size:0.85rem">Обнови токен и перехвати новый. '+
               '<a href="/account/'+ACCOUNT_ID+'/edit" class="alert-link">Настройки</a></p>' : '')+
             '</div>';
         }
       } else {
-        if(balEl) balEl.textContent = fmt(d.balance) + ' ARS';
-        if(metaEl){
-          var parts=[];
-          if(d.cvu_number) parts.push('CVU: '+d.cvu_number);
-          if(d.cvu_alias)  parts.push('Алиас: '+d.cvu_alias);
-          metaEl.textContent = parts.join(' · ');
-        }
+        var balText = fmt(d.balance) + ' ARS';
+        var metaParts = [];
+        if(d.cvu_number) metaParts.push('CVU: '+d.cvu_number);
+        if(d.cvu_alias)  metaParts.push('Алиас: '+d.cvu_alias);
+        var metaText = metaParts.join(' · ');
+
+        if(balEl) balEl.textContent = balText;
+        if(metaEl) metaEl.textContent = metaText;
         if(errBox) errBox.style.display='none';
+
+        // Кешируем для мгновенного показа при следующей загрузке страницы
+        try { sessionStorage.setItem(_balCacheKey, JSON.stringify({text: balText, meta: metaText})); } catch(e){}
       }
     })
-    .catch(function(e){ if(balEl) balEl.innerHTML='<span style="color:#f87171">Недоступен</span>'; })
-    .then(function(){ if(refreshBtn) refreshBtn.disabled=false; });
+    .catch(function(){
+      if(timedOut) return;
+      clearTimeout(timeoutId);
+      _balLoading = false;
+      if(refreshBtn) refreshBtn.disabled = false;
+      if(balEl) balEl.innerHTML = '<span style="color:#f87171">Недоступен</span>';
+      if(metaEl) metaEl.textContent = '';
+    });
 }
 
 loadBalance();
-if(refreshBtn) refreshBtn.addEventListener('click', loadBalance);
-setInterval(loadBalance, 30000);
+if(refreshBtn) refreshBtn.addEventListener('click', function(){ loadBalance(true); });
+setInterval(function(){ loadBalance(); }, 40000);
 
 // ─────────────────────────────────────────────────────────
 // 2. LAZY ИСТОРИЯ
@@ -478,14 +522,14 @@ if(withdrawForm){
     var destVal = dest ? dest.value.trim() : '?';
     var amtVal  = amtInp ? amtInp.value.trim() : '?';
 
+    // БАГ 3 FIX: arguments.callee запрещён в 'use strict' — бросает TypeError.
+    // Используем флаг _confirmed вместо removeEventListener.
     showWithdrawConfirm(destVal, amtVal, ACCOUNT_LABEL, function(){
-      withdrawForm.removeEventListener('submit', arguments.callee);
-      // Создаём скрытую форму и отправляем по настоящему POST
+      // Создаём реальную форму с правильным action и отправляем напрямую
       var realForm = document.createElement('form');
       realForm.method = 'post';
       realForm.action = '/account/'+ACCOUNT_ID+'/withdraw';
-      var inputs = withdrawForm.querySelectorAll('input,select,textarea');
-      inputs.forEach(function(inp){
+      withdrawForm.querySelectorAll('input,select,textarea').forEach(function(inp){
         if(!inp.name) return;
         var h = document.createElement('input');
         h.type='hidden'; h.name=inp.name; h.value=inp.value;

@@ -55,15 +55,40 @@
       (function() {
         var fmt = function(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : v; };
 
-        // ── Балансы в сайдбаре: обновляются всегда, независимо от страницы ──
+        // ── Балансы в сайдбаре ─────────────────────────────────────────────
+        // БАГ 2 FIX: при переходе между страницами (MPA) DOM пересоздаётся —
+        // балансы сбрасываются в "—". Решение: sessionStorage как мгновенный кеш.
+        // При загрузке страницы сразу показываем кешированные значения,
+        // параллельно обновляем с сервера. Баланс никогда не пропадает.
+
+        var _sbLoading = {}; // защита от параллельных запросов на один id
+
         function fetchBal(id, el) {
+          if(_sbLoading[id]) return;
+          _sbLoading[id] = true;
+          var cacheKey = 'bal_sb_' + id;
+
+          // Мгновенно показываем кеш (если есть) — не ждём сеть
+          try {
+            var cached = sessionStorage.getItem(cacheKey);
+            if(cached && el.textContent === '—') el.textContent = cached;
+          } catch(e){}
+
           fetch('/account/'+id+'/balance')
             .then(function(r){ return r.json(); })
             .then(function(d){
-              if(d.error){ el.textContent='—'; el.title=d.error; }
-              else { el.textContent=fmt(d.balance)+' ARS'; el.title=''; }
+              _sbLoading[id] = false;
+              var text = d.error ? '—' : fmt(d.balance)+' ARS';
+              el.textContent = text;
+              el.title = d.error || '';
+              if(!d.error) {
+                try { sessionStorage.setItem(cacheKey, text); } catch(e){}
+              }
             })
-            .catch(function(){ el.textContent='—'; });
+            .catch(function(){
+              _sbLoading[id] = false;
+              // Не сбрасываем — оставляем кешированное значение
+            });
         }
 
         function refreshAllSidebarBalances() {
@@ -73,7 +98,7 @@
           });
         }
 
-        // Первая загрузка
+        // При загрузке: сначала показываем кеш, потом грузим свежие данные
         refreshAllSidebarBalances();
         // Обновление каждые 40 секунд
         setInterval(refreshAllSidebarBalances, 40000);
