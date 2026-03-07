@@ -623,10 +623,12 @@ def _error_page(msg: str) -> str:
 
 
 async def _index_impl(request: Request, account_id: Optional[int], window: Optional[str]):
+    # ── Только быстрые операции: чтение из БД (SQLite) ─────────────────────
+    # Никаких HTTP-запросов к банку. Баланс и история грузятся через JS.
     groups = accounts_by_window()
     accounts = [acc for accs in groups.values() for acc in accs]
 
-    selected = balance_info = accounts_display = error = None
+    selected = None
     window_accounts: list = []
     window_slug = window_name = None
 
@@ -636,16 +638,9 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
         window_accounts = groups.get(window, [])
 
     if account_id:
-        selected = get_account(account_id)
-        if selected:
-            try:
-                raw_balance = driver_balance(selected["bank_type"], selected["credentials"])
-                balance_info = _normalize_balance(raw_balance, selected["bank_type"])
-                accounts_display = balance_info.pop("raw_accounts", None)
-            except Exception as e:
-                balance_info = {"error": str(e)}
-                error = str(e)
+        selected = get_account(account_id)  # только SQLite — мгновенно
 
+    # JWT-статус — вычисляется локально без HTTP
     token_expired = False
     token_expires_in_hours = None
     if selected and selected.get("credentials", {}).get("auth_token"):
@@ -654,34 +649,11 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
         except Exception:
             pass
 
-    activities_list: list = []
+    # Правила автовывода и счётчики лимитов — только БД
     auto_rules: list = []
-    auto_run_result = None
-
+    withdraw_counts: dict = {}
     if selected:
         auto_rules = list_auto_withdraw_rules(selected["id"])
-        for rule in auto_rules:
-            if int(rule.get("is_active", 0)) != 1:
-                continue
-            ok, msg = _run_auto_withdraw_rule(selected, rule)
-            auto_run_result = "✅ Автовывод выполнен." if ok else f"ℹ️ {msg}"
-            break
-        auto_rules = list_auto_withdraw_rules(selected["id"])
-
-        if selected["bank_type"] == "personalpay":
-            try:
-                data = pp_activities_list(selected["credentials"], offset=0, limit=30)
-                raw = _extract_activities_raw(data)
-                for act in (raw if isinstance(raw, list) else []):
-                    normalized = _normalize_activity(act)
-                    if normalized:
-                        activities_list.append(normalized)
-            except Exception:
-                pass
-
-    # Лимиты для CVU из автоправил
-    withdraw_counts: dict = {}
-    if selected and auto_rules:
         for rule in auto_rules:
             cvu = rule.get("cvu", "")
             if cvu and cvu not in withdraw_counts:
@@ -697,21 +669,16 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
         "window_list":           WINDOWS,
         "selected":              selected,
         "account_id":            account_id,
-        "balance_info":          balance_info,
-        "accounts_display":      accounts_display,
         "bank_types":            BANK_TYPES,
         "concepts_uc":           CONCEPTS_UC,
-        "error":                 error,
         "error_display":         error_display,
         "token_expired":         token_expired,
         "token_expires_in_hours":token_expires_in_hours,
-        "activities_list":       activities_list,
         "window_slug":           window_slug,
         "window_name":           window_name,
         "window_accounts":       window_accounts,
         "current_user":          _current_user(request),
         "auto_rules":            auto_rules,
-        "auto_run_result":       auto_run_result,
         "withdraw_counts":       withdraw_counts,
         "daily_limit":           DAILY_WITHDRAW_LIMIT,
         "prefill": {
@@ -743,7 +710,7 @@ async def dashboard(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# API: баланс (JSON)
+# API: баланс + история (JSON, для lazy-loading)
 # ---------------------------------------------------------------------------
 
 @app.get("/account/{account_id}/balance")
@@ -758,6 +725,116 @@ async def api_balance(account_id: int):
         return info
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/account/{account_id}/activities")
+async def api_activities(account_id: int):
+    """Lazy-load: история операций. Вызывается из JS после рендера страницы."""
+    acc = get_account(account_id)
+    if not acc:
+        return JSONResponse({"error": "account not found"}, status_code=404)
+    if acc["bank_type"] != "personalpay":
+        return JSONResponse({"activities": []})
+    try:
+        data = pp_activities_list(acc["credentials"], offset=0, limit=30)
+        raw = _extract_activities_raw(data)
+        activities = []
+        for act in (raw if isinstance(raw, list) else []):
+            n = _normalize_activity(act)
+            if n:
+                activities.append({
+                    "id":          n.get("id"),
+                    "title":       n.get("title"),
+                    "receipt_id":  n.get("receipt_id"),
+                    "amount":      n.get("amount"),
+                    "date_str":    n.get("date_str"),
+                    "is_outgoing": n.get("is_outgoing"),
+                    "sender":      n.get("sender"),
+                    "recipient":   n.get("recipient"),
+                })
+        return JSONResponse({"activities": activities})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/account/{account_id}/auto-withdraw/{rule_id}/trigger")
+async def api_trigger_auto_withdraw(account_id: int, rule_id: int):
+    """Запуск автовывода через JS (без перезагрузки страницы)."""
+    acc = get_account(account_id)
+    rule = get_auto_withdraw_rule(rule_id)
+    if not acc or not rule or int(rule.get("account_id", 0)) != account_id:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    ok, message = _run_auto_withdraw_rule(acc, rule)
+    updated = get_auto_withdraw_rule(rule_id)
+    return JSONResponse({
+        "ok": ok,
+        "message": message,
+        "rule": updated,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Multi-withdraw API
+# ---------------------------------------------------------------------------
+
+@app.post("/multi-withdraw")
+async def multi_withdraw(request: Request):
+    """Вывод с нескольких счетов одновременно.
+    Тело: { account_ids: [1,2,3], destination: "CVU", amount: "1000",
+            concept: "VARIOS", comments: "..." }
+    Возвращает: { results: [{account_id, label, ok, error, tid}] }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    account_ids = body.get("account_ids") or []
+    destination = (body.get("destination") or body.get("cvu") or "").strip()
+    amount_raw  = str(body.get("amount") or "")
+    concept     = body.get("concept") or "VARIOS"
+    comments    = body.get("comments") or "Varios (VAR)"
+
+    if not account_ids or not destination:
+        return JSONResponse({"error": "account_ids and destination required"}, status_code=400)
+
+    amt = _parse_amount(amount_raw)
+    if not amt:
+        return JSONResponse({"error": "invalid amount"}, status_code=400)
+
+    results = []
+    for acc_id in account_ids:
+        acc = get_account(int(acc_id))
+        if not acc:
+            results.append({"account_id": acc_id, "label": "?", "ok": False, "error": "Счёт не найден", "tid": None})
+            continue
+
+        if is_withdraw_limit_reached(destination, acc["id"]):
+            results.append({
+                "account_id": acc_id, "label": acc["label"], "ok": False,
+                "error": f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут", "tid": None,
+            })
+            continue
+
+        try:
+            if acc["bank_type"] == "universalcoins":
+                result = driver_withdraw(
+                    acc["bank_type"], acc["credentials"],
+                    cvu_recipient=destination, amount=amt, concept=concept,
+                )
+            else:
+                result = driver_withdraw(
+                    acc["bank_type"], acc["credentials"],
+                    destination=destination, amount=amt, comments=comments,
+                )
+            increment_withdraw_count(destination, acc["id"])
+            tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
+            results.append({"account_id": acc_id, "label": acc["label"], "ok": True, "error": None, "tid": tid})
+        except Exception as e:
+            err = str(e)
+            results.append({"account_id": acc_id, "label": acc["label"], "ok": False, "error": err, "tid": None})
+
+    return JSONResponse({"results": results})
 
 
 # ---------------------------------------------------------------------------
