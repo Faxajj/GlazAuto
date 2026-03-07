@@ -958,3 +958,31 @@ body {
   flex-wrap: wrap;
   align-items: center;
 }
+
+/* ── Skeleton loader ──────────────────────────────────── */
+@keyframes shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+.skeleton-line {
+  height: 1.4em;
+  border-radius: 6px;
+  background: linear-gradient(90deg, #1e293b 25%, #2d3f55 50%, #1e293b 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+  vertical-align: middle;
+}
+
+/* ── Multi-withdraw чекбоксы в сайдбаре ──────────────── */
+.profile-card { position: relative; }
+.multi-cb {
+  flex-shrink: 0;
+  width: 16px !important;
+  height: 16px !important;
+  margin-left: auto !important;
+  cursor: pointer;
+  accent-color: #0ea5e9;
+}
+
+/* ── Toast ────────────────────────────────────────────── */
+/* (стили заданы inline в JS для простоты) */
