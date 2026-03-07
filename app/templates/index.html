@@ -188,9 +188,7 @@
     <h2>Баланс</h2>
     <button type="button" id="btn-refresh-balance" class="btn-refresh">↻ Обновить</button>
   </div>
-  <p class="balance" id="balance-value">
-    <span class="skeleton-line" style="width:160px;display:inline-block"></span>
-  </p>
+  <p class="balance" id="balance-value" style="min-height:2rem">—</p>
   <p class="meta" id="balance-meta" style="color:#64748b;font-size:0.85rem">загружается...</p>
   <div id="balance-error-box" style="display:none"></div>
 </section>
@@ -199,7 +197,7 @@
 <section class="card">
   <h2>Создать вывод</h2>
   {% if selected.bank_type == 'universalcoins' %}
-  <form id="withdraw-form" class="form" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="universalcoins">
+  <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="universalcoins">
     <div class="form-row">
       <label for="cvu">CVU получателя *</label>
       <input id="cvu" name="cvu" type="text" inputmode="numeric" maxlength="24" placeholder="0000357301000001621038" required />
@@ -235,7 +233,7 @@
     <button type="submit" class="btn-primary">Вывести</button>
   </form>
   {% else %}
-  <form id="withdraw-form" class="form" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="personalpay">
+  <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="personalpay">
     <div class="form-row">
       <label for="destination">Получатель (CVU / псевдоним) *</label>
       <input id="destination" name="destination" type="text" required />
@@ -392,9 +390,7 @@ function loadBalance(force){
     timedOut = true;
     _balLoading = false;
     if(refreshBtn) refreshBtn.disabled = false;
-    if(balEl && !balEl.textContent.trim()) {
-      balEl.innerHTML = '<span style="color:#f87171">Таймаут</span>';
-    }
+    if(balEl) balEl.innerHTML = '<span style="color:#f87171">Таймаут ответа</span>';
     if(metaEl && metaEl.textContent === 'загружается...') metaEl.textContent = '';
   }, 20000);
 
@@ -515,28 +511,24 @@ if(BANK_TYPE === 'personalpay'){
 // ─────────────────────────────────────────────────────────
 var withdrawForm = document.getElementById('withdraw-form');
 if(withdrawForm){
+  // FIX: форма уже имеет method="post" и action="/account/.../withdraw".
+  // Просто перехватываем submit, показываем модал, потом отпускаем нативный submit.
+  var _withdrawConfirmed = false;
   withdrawForm.addEventListener('submit', function(e){
+    if(_withdrawConfirmed){
+      // Пользователь уже подтвердил — пропускаем нативный submit
+      _withdrawConfirmed = false;
+      return;
+    }
     e.preventDefault();
     var dest = (withdrawForm.querySelector('[name=destination]') || withdrawForm.querySelector('[name=cvu]'));
     var amtInp = withdrawForm.querySelector('[name=amount]');
     var destVal = dest ? dest.value.trim() : '?';
     var amtVal  = amtInp ? amtInp.value.trim() : '?';
 
-    // БАГ 3 FIX: arguments.callee запрещён в 'use strict' — бросает TypeError.
-    // Используем флаг _confirmed вместо removeEventListener.
     showWithdrawConfirm(destVal, amtVal, ACCOUNT_LABEL, function(){
-      // Создаём реальную форму с правильным action и отправляем напрямую
-      var realForm = document.createElement('form');
-      realForm.method = 'post';
-      realForm.action = '/account/'+ACCOUNT_ID+'/withdraw';
-      withdrawForm.querySelectorAll('input,select,textarea').forEach(function(inp){
-        if(!inp.name) return;
-        var h = document.createElement('input');
-        h.type='hidden'; h.name=inp.name; h.value=inp.value;
-        realForm.appendChild(h);
-      });
-      document.body.appendChild(realForm);
-      realForm.submit();
+      _withdrawConfirmed = true;
+      withdrawForm.submit(); // нативный submit — идёт на action формы
     });
   });
 }

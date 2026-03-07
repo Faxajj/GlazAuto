@@ -122,20 +122,25 @@
         });
 
         // ── Чекбоксы для Multi-withdraw — доступны отовсюду ────────────────
-        // Плавающая панель массового вывода
-        var mwPanel = document.getElementById('mw-float-panel');
-        var mwLabelsEl = document.getElementById('mw-float-labels');
-        var mwCountEl  = document.getElementById('mw-float-count');
+        // FIX: ищем элементы панели лениво (в момент использования),
+        // а не при инициализации скрипта, когда #mw-float-panel ещё не в DOM.
         var selectedAccounts = {};
+
+        function getMwPanel()    { return document.getElementById('mw-float-panel'); }
+        function getMwLabelsEl() { return document.getElementById('mw-float-labels'); }
+        function getMwCountEl()  { return document.getElementById('mw-float-count'); }
 
         function updateMultiPanel(){
           var ids = Object.keys(selectedAccounts);
+          var panel    = getMwPanel();
+          var countEl  = getMwCountEl();
+          var labelsEl = getMwLabelsEl();
           if(ids.length >= 2){
-            if(mwPanel){ mwPanel.style.display='flex'; }
-            if(mwCountEl)  mwCountEl.textContent = ids.length;
-            if(mwLabelsEl) mwLabelsEl.textContent = Object.values(selectedAccounts).join(', ');
+            if(panel){ panel.style.display='flex'; }
+            if(countEl)  countEl.textContent = ids.length;
+            if(labelsEl) labelsEl.textContent = Object.values(selectedAccounts).join(', ');
           } else {
-            if(mwPanel) mwPanel.style.display='none';
+            if(panel) panel.style.display='none';
           }
         }
 
@@ -157,29 +162,24 @@
             else delete selectedAccounts[id];
             updateMultiPanel();
           });
-          // Переход по клику на карточку не сбрасывает чекбокс
-          card.addEventListener('click', function(e){
-            if(e.target === cb) e.stopPropagation();
-          });
+          // Клик на чекбокс не должен триггерить переход по ссылке
+          cb.addEventListener('click', function(e){ e.stopPropagation(); });
         });
 
-        // Кнопки плавающей панели
-        var mwCancelBtn = document.getElementById('mw-float-cancel');
-        var mwWithdrawBtn = document.getElementById('mw-float-withdraw');
-        if(mwCancelBtn){
-          mwCancelBtn.addEventListener('click', function(){
+        // Кнопки плавающей панели — вешаем через делегирование на document,
+        // так как кнопки могут появиться позже скрипта сайдбара.
+        document.addEventListener('click', function(e){
+          if(e.target && e.target.id === 'mw-float-cancel'){
             document.querySelectorAll('.multi-cb').forEach(function(cb){ cb.checked=false; });
             selectedAccounts={};
             updateMultiPanel();
-          });
-        }
-        if(mwWithdrawBtn){
-          mwWithdrawBtn.addEventListener('click', function(){
+          }
+          if(e.target && e.target.id === 'mw-float-withdraw'){
             var ids = Object.keys(selectedAccounts);
             if(ids.length < 2){ return; }
             showMwModal(ids, Object.assign({}, selectedAccounts));
-          });
-        }
+          }
+        });
 
         // ── Модал массового вывода ──────────────────────────────────────────
         function showMwModal(ids, labels){
