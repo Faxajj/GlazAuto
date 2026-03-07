@@ -843,3 +843,118 @@ body {
 .list-balance {
   font-variant-numeric: tabular-nums;
 }
+
+/* ── Dashboard ─────────────────────────────────────── */
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+}
+.dashboard-card {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  padding: 1.25rem;
+  transition: border-color 0.2s;
+}
+.dashboard-card:hover { border-color: #334155; }
+.dashboard-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 0.75rem;
+}
+.dashboard-card-label {
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: #e2e8f0;
+}
+.dashboard-card-type {
+  font-size: 0.7rem;
+  background: #1e293b;
+  color: #64748b;
+  padding: 2px 8px;
+  border-radius: 20px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.dashboard-card-balance {
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: #34d399;
+  margin-bottom: 0.25rem;
+  min-height: 1.8rem;
+}
+.dashboard-card-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+.balance-spinner {
+  display: inline-block;
+  animation: spin 1s linear infinite;
+  color: #475569;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Фильтры истории операций ────────────────────── */
+.tx-filter-btn {
+  padding: 0.3rem 0.9rem;
+  border-radius: 20px;
+  border: 1px solid #334155;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.tx-filter-btn:hover { border-color: #38bdf8; color: #38bdf8; }
+.tx-filter-btn.active { background: #0ea5e9; border-color: #0ea5e9; color: white; }
+
+/* ── Автоправила ─────────────────────────────────── */
+.auto-rule-card {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+}
+.auto-rule-done { opacity: 0.55; }
+.auto-rule-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+.auto-rule-cvu {
+  font-family: monospace;
+  font-size: 0.82rem;
+  color: #94a3b8;
+  word-break: break-all;
+}
+.auto-rule-progress { font-weight: 600; font-size: 0.9rem; color: #e2e8f0; }
+.auto-rule-step { font-size: 0.82rem; color: #64748b; }
+.auto-rule-limit { font-size: 0.78rem; color: #94a3b8; background: #1e293b; padding: 2px 8px; border-radius: 10px; }
+.auto-rule-limit.limit-warn { color: #fbbf24; background: #1c1208; border: 1px solid #78350f; }
+.auto-rule-error { color: #f87171; font-size: 0.8rem; }
+.auto-rule-bar-wrap {
+  background: #1e293b;
+  border-radius: 4px;
+  height: 6px;
+  overflow: hidden;
+  margin-bottom: 0.75rem;
+}
+.auto-rule-bar {
+  background: linear-gradient(90deg, #0ea5e9, #38bdf8);
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.4s ease;
+  min-width: 4px;
+}
+.auto-rule-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
