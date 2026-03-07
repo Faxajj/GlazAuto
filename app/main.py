@@ -1,6 +1,7 @@
 """
 Banks Dashboard — единый дашборд для нескольких банковских аккаунтов.
 """
+import asyncio
 import base64
 import json
 import logging
@@ -719,7 +720,9 @@ async def api_balance(account_id: int):
     if not acc:
         return JSONResponse({"error": "account not found"}, status_code=404)
     try:
-        raw = driver_balance(acc["bank_type"], acc["credentials"])
+        # Запускаем синхронный (blocking) HTTP-драйвер в отдельном потоке,
+        # чтобы не блокировать asyncio event loop FastAPI.
+        raw = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
         info = _normalize_balance(raw, acc["bank_type"])
         info.pop("raw_accounts", None)
         return info
@@ -736,7 +739,7 @@ async def api_activities(account_id: int):
     if acc["bank_type"] != "personalpay":
         return JSONResponse({"activities": []})
     try:
-        data = pp_activities_list(acc["credentials"], offset=0, limit=30)
+        data = await asyncio.to_thread(pp_activities_list, acc["credentials"], 0, 30)
         raw = _extract_activities_raw(data)
         activities = []
         for act in (raw if isinstance(raw, list) else []):
@@ -764,7 +767,7 @@ async def api_trigger_auto_withdraw(account_id: int, rule_id: int):
     rule = get_auto_withdraw_rule(rule_id)
     if not acc or not rule or int(rule.get("account_id", 0)) != account_id:
         return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
-    ok, message = _run_auto_withdraw_rule(acc, rule)
+    ok, message = await asyncio.to_thread(_run_auto_withdraw_rule, acc, rule)
     updated = get_auto_withdraw_rule(rule_id)
     return JSONResponse({
         "ok": ok,
@@ -802,38 +805,34 @@ async def multi_withdraw(request: Request):
     if not amt:
         return JSONResponse({"error": "invalid amount"}, status_code=400)
 
-    results = []
-    for acc_id in account_ids:
+    async def _do_one(acc_id):
         acc = get_account(int(acc_id))
         if not acc:
-            results.append({"account_id": acc_id, "label": "?", "ok": False, "error": "Счёт не найден", "tid": None})
-            continue
-
+            return {"account_id": acc_id, "label": "?", "ok": False, "error": "Счёт не найден", "tid": None}
         if is_withdraw_limit_reached(destination, acc["id"]):
-            results.append({
+            return {
                 "account_id": acc_id, "label": acc["label"], "ok": False,
                 "error": f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут", "tid": None,
-            })
-            continue
-
+            }
         try:
             if acc["bank_type"] == "universalcoins":
-                result = driver_withdraw(
-                    acc["bank_type"], acc["credentials"],
+                result = await asyncio.to_thread(
+                    driver_withdraw, acc["bank_type"], acc["credentials"],
                     cvu_recipient=destination, amount=amt, concept=concept,
                 )
             else:
-                result = driver_withdraw(
-                    acc["bank_type"], acc["credentials"],
+                result = await asyncio.to_thread(
+                    driver_withdraw, acc["bank_type"], acc["credentials"],
                     destination=destination, amount=amt, comments=comments,
                 )
             increment_withdraw_count(destination, acc["id"])
             tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
-            results.append({"account_id": acc_id, "label": acc["label"], "ok": True, "error": None, "tid": tid})
+            return {"account_id": acc_id, "label": acc["label"], "ok": True, "error": None, "tid": tid}
         except Exception as e:
-            err = str(e)
-            results.append({"account_id": acc_id, "label": acc["label"], "ok": False, "error": err, "tid": None})
+            return {"account_id": acc_id, "label": acc["label"], "ok": False, "error": str(e), "tid": None}
 
+    # Выполняем все выводы параллельно
+    results = list(await asyncio.gather(*[_do_one(acc_id) for acc_id in account_ids]))
     return JSONResponse({"results": results})
 
 
@@ -876,7 +875,8 @@ async def withdraw(
             doc_clean = (document or "").strip().replace("-", "").replace(" ", "")
             if not doc_clean or len(doc_clean) < 10:
                 return RedirectResponse(url=f"/?account_id={account_id}&error=document_required", status_code=302)
-            result = driver_withdraw(
+            result = await asyncio.to_thread(
+                driver_withdraw,
                 acc["bank_type"], acc["credentials"],
                 cvu_recipient=dest, amount=amt, concept=concept,
                 alias_recipient=alias.strip() or None,
@@ -885,7 +885,8 @@ async def withdraw(
                 bank_recipient=bank.strip() or None,
             )
         else:
-            result = driver_withdraw(
+            result = await asyncio.to_thread(
+                driver_withdraw,
                 acc["bank_type"], acc["credentials"],
                 destination=dest, amount=amt, comments=comments,
             )
