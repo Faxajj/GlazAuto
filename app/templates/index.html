@@ -8,355 +8,662 @@
 
 {% block content %}
 
-{# ── Список аккаунтов в группе ── #}
+{# ══════════════════════════════════════════════════════════
+   СПИСОК АККАУНТОВ В ГРУППЕ
+══════════════════════════════════════════════════════════ #}
 {% if window_slug and window_name and not selected %}
-  <section class="card card-window-list">
-    <h2>Список аккаунтов — {{ window_name }}</h2>
-    <p class="window-list-hint">Выберите аккаунт, чтобы перейти к балансу и переводу средств.</p>
-    {% if not window_accounts %}
-      <p class="empty-window">В этой группе пока нет аккаунтов. <a href="/add?window={{ window_slug }}">Добавить в {{ window_name }}</a></p>
-    {% else %}
-      <div class="table-wrap">
-        <table class="accounts-table">
-          <thead><tr><th>Имя</th><th>Баланс</th><th>Действия</th></tr></thead>
-          <tbody>
-            {% for acc in window_accounts %}
-            <tr>
-              <td class="col-name">{{ acc.label }}</td>
-              <td class="col-balance"><span class="list-balance" data-account-id="{{ acc.id }}">—</span></td>
-              <td class="col-actions">
-                <a href="/?account_id={{ acc.id }}" class="btn-table btn-open">Открыть</a>
-                <a href="/account/{{ acc.id }}/edit" class="btn-table btn-edit">Изменить</a>
-                <form method="post" action="/account/{{ acc.id }}/delete" class="form-inline"
-                      data-confirm="Вы уверены, что хотите удалить счёт «{{ acc.label }}»? Данные для входа будут удалены.">
-                  <input type="hidden" name="redirect_window" value="{{ window_slug }}" />
-                  <button type="submit" class="btn-table btn-danger">Удалить</button>
-                </form>
-              </td>
-            </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      </div>
-      <p class="window-list-add"><a href="/add?window={{ window_slug }}" class="btn-add-secondary">+ Добавить в {{ window_name }}</a></p>
-    {% endif %}
-    <script>
-    (function(){
-      document.querySelectorAll('.list-balance[data-account-id]').forEach(function(el){
-        var id=el.getAttribute('data-account-id');
-        fetch('/account/'+id+'/balance').then(r=>r.json()).then(d=>{
-          el.textContent = d.error ? '—' : (typeof d.balance==='number'?d.balance.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}):d.balance)+' ARS';
-        }).catch(()=>{el.textContent='—';});
-      });
-    })();
-    </script>
-  </section>
+<section class="card card-window-list">
+  <h2>{{ window_name }}</h2>
+  <p class="window-list-hint">Выберите счёт для работы.</p>
+  {% if not window_accounts %}
+    <p class="empty-window">Здесь пока нет счетов. <a href="/add?window={{ window_slug }}">Добавить</a></p>
+  {% else %}
+    <div class="table-wrap">
+      <table class="accounts-table">
+        <thead><tr><th>Имя</th><th>Баланс</th><th>Действия</th></tr></thead>
+        <tbody>
+          {% for acc in window_accounts %}
+          <tr>
+            <td class="col-name">{{ acc.label }}</td>
+            <td class="col-balance"><span class="list-balance" data-account-id="{{ acc.id }}">—</span></td>
+            <td class="col-actions">
+              <a href="/?account_id={{ acc.id }}" class="btn-table btn-open">Открыть</a>
+              <a href="/account/{{ acc.id }}/edit" class="btn-table btn-edit">Изменить</a>
+              <form method="post" action="/account/{{ acc.id }}/delete" class="form-inline"
+                    data-confirm="Удалить счёт «{{ acc.label }}»? Данные для входа будут удалены.">
+                <input type="hidden" name="redirect_window" value="{{ window_slug }}" />
+                <button type="submit" class="btn-table btn-danger">Удалить</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <p class="window-list-add"><a href="/add?window={{ window_slug }}" class="btn-add-secondary">+ Добавить в {{ window_name }}</a></p>
+  {% endif %}
+  <script>
+  (function(){
+    document.querySelectorAll('.list-balance[data-account-id]').forEach(function(el){
+      var id=el.getAttribute('data-account-id');
+      fetch('/account/'+id+'/balance').then(r=>r.json()).then(d=>{
+        el.textContent=d.error?'—':(typeof d.balance==='number'?d.balance.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}):d.balance)+' ARS';
+      }).catch(()=>{el.textContent='—';});
+    });
+  })();
+  </script>
+</section>
 
-{# ── Пустой экран ── #}
+{# ══════════════════════════════════════════════════════════
+   ПУСТОЙ ЭКРАН
+══════════════════════════════════════════════════════════ #}
 {% elif not selected %}
-  <section class="card empty-state">
-    <h2>Выберите группу или аккаунт</h2>
-    <p>Слева выберите группу (GLAZARS, GLAZ3, GLAZ6) — откроется список аккаунтов.<br>Либо нажмите на аккаунт в боковой панели или <strong>«+ Добавить аккаунт»</strong>.</p>
-    <p><a href="/dashboard" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:0.5rem">📊 Посмотреть обзор всех счетов</a></p>
-  </section>
+<section class="card empty-state">
+  <h2>Выберите счёт</h2>
+  <p>Слева выберите группу или нажмите на счёт в боковой панели.</p>
+  <p><a href="/dashboard" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:0.5rem">📊 Посмотреть все счета</a></p>
+</section>
 
-{# ── Детали аккаунта ── #}
+{# ══════════════════════════════════════════════════════════
+   ДЕТАЛИ СЧЁТА
+══════════════════════════════════════════════════════════ #}
 {% else %}
 
-  {# — Уведомления — #}
-  {% if error_display %}
-  <div class="alert alert-error">{{ error_display }}</div>
-  {% endif %}
+{# — Уведомления — #}
+{% if error_display %}
+<div class="alert alert-error" id="page-error-alert">{{ error_display }}</div>
+{% endif %}
 
-  {% if request.query_params.get('success') %}
-  <div class="alert alert-success">
-    {% if request.query_params.get('success') == 'updated' %}✅ Профиль обновлён.
-    {% elif request.query_params.get('success') == 'auto_rule_created' %}✅ Автоправило создано.
-    {% elif request.query_params.get('success') == 'auto_withdraw_done' %}✅ Автовывод выполнен.
-    {% else %}✅ Успешно отправлено.{% endif %}
-    {% if selected.bank_type == 'personalpay' and request.query_params.get('transaction_id') %}
-    <span class="ml"><a href="/account/{{ selected.id }}/receipt?transaction_id={{ request.query_params.get('transaction_id') }}" class="alert-link">Показать чек</a></span>
-    {% endif %}
+{% if request.query_params.get('success') %}
+<div class="alert alert-success">
+  {% set s = request.query_params.get('success') %}
+  {% if s == 'updated' %}✅ Профиль обновлён.
+  {% elif s == 'auto_rule_created' %}✅ Автоправило создано.
+  {% elif s == 'auto_withdraw_done' %}✅ Автовывод выполнен.
+  {% else %}✅ Успешно отправлено.{% endif %}
+</div>
+{% endif %}
+
+{% if token_expired %}
+<div class="alert alert-error">
+  🔑 <strong>Токен истёк.</strong> Обновите в <a href="/account/{{ selected.id }}/edit" class="alert-link">настройках</a>.
+</div>
+{% elif token_expires_in_hours is not none and token_expires_in_hours < 24 %}
+<div class="alert alert-warning">
+  ⏰ Токен истекает через
+  <strong>{% if token_expires_in_hours < 1 %}{{ (token_expires_in_hours * 60)|int }} мин.{% else %}{{ "%.1f"|format(token_expires_in_hours) }} ч.{% endif %}</strong>
+  — <a href="/account/{{ selected.id }}/edit" class="alert-link">обновить</a>.
+</div>
+{% endif %}
+
+{# ── Баланс (lazy) ─────────────────────────────────────── #}
+<section class="card balance-card" id="balance-section">
+  <div class="balance-header">
+    <h2>Баланс</h2>
+    <button type="button" id="btn-refresh-balance" class="btn-refresh">↻ Обновить</button>
   </div>
-  {% endif %}
+  <p class="balance" id="balance-value">
+    <span class="skeleton-line" style="width:160px;display:inline-block"></span>
+  </p>
+  <p class="meta" id="balance-meta" style="color:#64748b;font-size:0.85rem">загружается...</p>
+  <div id="balance-error-box" style="display:none"></div>
+</section>
 
-  {% if auto_run_result %}
-  <div class="alert alert-warning">{{ auto_run_result }}</div>
-  {% endif %}
-
-  {% if token_expired %}
-  <div class="alert alert-error">
-    <strong>🔑 Токен истёк.</strong> Обновите его в <a href="/account/{{ selected.id }}/edit" class="alert-link">«Изменить профиль»</a> (вставьте новый idToken из перехвата).
-  </div>
-  {% elif token_expires_in_hours is not none and token_expires_in_hours < 24 %}
-  <div class="alert alert-warning">
-    ⏰ Токен истекает через <strong>{% if token_expires_in_hours < 1 %}{{ (token_expires_in_hours * 60)|int }} мин.{% else %}{{ "%.1f"|format(token_expires_in_hours) }} ч.{% endif %}</strong> — обновите в <a href="/account/{{ selected.id }}/edit" class="alert-link">«Изменить профиль»</a>.
-  </div>
-  {% endif %}
-
-  {# — Ошибка подключения — #}
-  {% if balance_info and balance_info.get('error') %}
-  <section class="card">
-    <div class="alert alert-error">
-      <strong>⚠️ Ошибка подключения к банку</strong><br>
-      <span style="font-size:0.9rem;opacity:0.8">{{ balance_info.error }}</span>
-      {% if '403' in (balance_info.error or '') and selected.bank_type == 'personalpay' %}
-      <p style="margin:0.75rem 0 0;font-size:0.9rem">
-        Что делать: обнови токен в приложении Personal Pay, перехвати новый запрос и вставь <code>auth_token</code> + <code>device_id</code> в <a href="/account/{{ selected.id }}/edit" class="alert-link">настройки аккаунта</a>.
-      </p>
-      {% endif %}
+{# ── Форма вывода ──────────────────────────────────────── #}
+<section class="card">
+  <h2>Создать вывод</h2>
+  {% if selected.bank_type == 'universalcoins' %}
+  <form id="withdraw-form" class="form" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="universalcoins">
+    <div class="form-row">
+      <label for="cvu">CVU получателя *</label>
+      <input id="cvu" name="cvu" type="text" inputmode="numeric" maxlength="24" placeholder="0000357301000001621038" required />
     </div>
-    <div style="margin-top:1rem;display:flex;gap:0.75rem;flex-wrap:wrap">
-      <a href="/?account_id={{ selected.id }}" class="btn-primary" style="text-decoration:none">↻ Попробовать снова</a>
-      <a href="/account/{{ selected.id }}/edit" class="btn-table btn-edit" style="text-decoration:none">Изменить настройки</a>
-      <form method="post" action="/account/{{ selected.id }}/delete" class="form-inline"
-            data-confirm="Удалить счёт «{{ selected.label }}»? Это нельзя отменить.">
-        <button type="submit" class="btn-table btn-danger">Удалить счёт</button>
-      </form>
+    <div class="form-row">
+      <label for="amount">Сумма (ARS) *</label>
+      <input id="amount" name="amount" type="text" inputmode="decimal" placeholder="100.00" required />
     </div>
-  </section>
-
+    <div class="form-row">
+      <label for="concept">Причина перевода</label>
+      <select id="concept" name="concept">
+        {% for val, label in concepts_uc %}
+        <option value="{{ val }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="form-row">
+      <label for="document">Документ (CUIT/CUIL) *</label>
+      <input id="document" name="document" type="text" placeholder="20402526700" required />
+    </div>
+    <div class="form-row">
+      <label for="name">Имя получателя</label>
+      <input id="name" name="name" type="text" />
+    </div>
+    <div class="form-row">
+      <label for="alias">Алиас</label>
+      <input id="alias" name="alias" type="text" />
+    </div>
+    <div class="form-row">
+      <label for="bank">Банк получателя</label>
+      <input id="bank" name="bank" type="text" />
+    </div>
+    <button type="submit" class="btn-primary">Вывести</button>
+  </form>
   {% else %}
-
-  {# — Баланс — #}
-  <section class="card balance-card">
-    <div class="balance-header">
-      <h2>Баланс</h2>
-      <button type="button" id="btn-refresh-balance" class="btn-refresh" title="Обновить">↻ Обновить</button>
+  <form id="withdraw-form" class="form" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="personalpay">
+    <div class="form-row">
+      <label for="destination">Получатель (CVU / псевдоним) *</label>
+      <input id="destination" name="destination" type="text" required />
     </div>
-    <p class="balance" id="balance-value">{{ balance_info.balance|default(0)|ars }} ARS</p>
-    <p class="meta" id="balance-meta">
-      {% if balance_info.cvu_number %}CVU/счёт: {{ balance_info.cvu_number }}{% endif %}
-      {% if balance_info.cvu_alias %} · Алиас: {{ balance_info.cvu_alias }}{% endif %}
-    </p>
-    <script>
-    (function(){
-      var id={{ selected.id }}, balEl=document.getElementById('balance-value'), metaEl=document.getElementById('balance-meta'), btn=document.getElementById('btn-refresh-balance');
-      var fmt=function(v){return typeof v==='number'?v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}):v;};
-      function refresh(){
-        if(btn) btn.disabled=true;
-        fetch('/account/'+id+'/balance').then(r=>r.json()).then(d=>{
-          balEl.textContent = d.error ? 'Ошибка: '+d.error : fmt(d.balance)+' ARS';
-          if(metaEl) metaEl.textContent=[d.cvu_number?'CVU/счёт: '+d.cvu_number:'',d.cvu_alias?'Алиас: '+d.cvu_alias:''].filter(Boolean).join(' · ');
-        }).catch(e=>{balEl.textContent='Ошибка: '+e.message;}).then(()=>{if(btn) btn.disabled=false;});
-      }
-      if(btn) btn.addEventListener('click',refresh);
-      setInterval(refresh, 30000);
-    })();
-    </script>
-  </section>
-
-  {% if selected.bank_type == 'personalpay' and accounts_display %}
-  <section class="card card-accounts-json">
-    <h3>Счета (Personal Pay)</h3>
-    <pre class="code-block code-block--compact">{{ accounts_display|tojson(indent=2) }}</pre>
-  </section>
+    <div class="form-row">
+      <label for="amount">Сумма (ARS) *</label>
+      <input id="amount" name="amount" type="text" inputmode="decimal" required />
+    </div>
+    <button type="submit" class="btn-primary">Вывести</button>
+  </form>
   {% endif %}
+</section>
 
-  {# — Вывод средств — #}
-  <section class="card">
-    <h2>Создать вывод</h2>
-    {% if selected.bank_type == 'universalcoins' %}
-    <form method="post" action="/account/{{ selected.id }}/withdraw" class="form">
-      <div class="form-row">
-        <label for="cvu">CVU получателя (22 цифры) *</label>
-        <input id="cvu" name="cvu" type="text" inputmode="numeric" maxlength="24" placeholder="0000357301000001621038" required value="{{ prefill.cvu }}" />
-      </div>
-      <div class="form-row">
-        <label for="amount">Сумма (ARS) *</label>
-        <input id="amount" name="amount" type="text" inputmode="decimal" placeholder="100.00" required value="{{ prefill.amount }}" />
-      </div>
-      <div class="form-row">
-        <label for="concept">Причина перевода</label>
-        <select id="concept" name="concept">
-          {% for val, label in concepts_uc %}
-          <option value="{{ val }}" {% if prefill.concept == val %}selected{% endif %}>{{ label }}</option>
-          {% endfor %}
-        </select>
-      </div>
-      <div class="form-row">
-        <label for="name">Имя получателя (необязательно)</label>
-        <input id="name" name="name" type="text" value="{{ prefill.name }}" />
-      </div>
-      <div class="form-row">
-        <label for="document">Документ (CUIT/CUIL) *</label>
-        <input id="document" name="document" type="text" placeholder="20402526700" required value="{{ prefill.document }}" />
-      </div>
-      <div class="form-row">
-        <label for="alias">Алиас (необязательно)</label>
-        <input id="alias" name="alias" type="text" value="{{ prefill.alias }}" />
-      </div>
-      <div class="form-row">
-        <label for="bank">Банк (необязательно)</label>
-        <input id="bank" name="bank" type="text" value="{{ prefill.bank }}" />
-      </div>
-      <button type="submit" class="btn-primary">Вывести</button>
+{# ── История (lazy) ──────────────────────────────────────── #}
+{% if selected.bank_type == 'personalpay' %}
+<section class="card" id="history-section">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem">
+    <h3 style="margin:0">История операций</h3>
+    <div style="display:flex;gap:0.5rem" id="tx-filters" style="display:none">
+      <button class="tx-filter-btn active" data-filter="all">Все</button>
+      <button class="tx-filter-btn" data-filter="incoming">Приходы</button>
+      <button class="tx-filter-btn" data-filter="outgoing">Выводы</button>
+    </div>
+  </div>
+  <div id="tx-loading" style="color:#64748b;font-size:0.9rem;padding:1rem 0">
+    <span class="balance-spinner">⟳</span> Загружаем историю...
+  </div>
+  <ul class="activities-list tx-history" id="tx-list" style="display:none"></ul>
+  <div id="tx-error" style="display:none"></div>
+
+  <section style="margin-top:1.25rem;padding-top:1.25rem;border-top:1px solid #1e293b">
+    <h4 style="margin:0 0 0.75rem;font-size:0.9rem;color:#94a3b8">Просмотр чека по ID</h4>
+    <form method="get" action="/account/{{ selected.id }}/receipt" class="receipt-form">
+      <input name="transaction_id" type="text" placeholder="ID операции (32 символа)" class="receipt-input" />
+      <button type="submit" class="btn-primary">Показать</button>
     </form>
-    {% else %}
-    <form method="post" action="/account/{{ selected.id }}/withdraw" class="form">
-      <div class="form-row">
-        <label for="destination">Получатель (CVU/alias) *</label>
-        <input id="destination" name="destination" type="text" required value="{{ prefill.destination }}" />
-      </div>
-      <div class="form-row">
-        <label for="amount">Сумма (ARS) *</label>
-        <input id="amount" name="amount" type="text" inputmode="decimal" required value="{{ prefill.amount }}" />
-      </div>
-      <button type="submit" class="btn-primary">Отправить</button>
-    </form>
-    {% endif %}
   </section>
+</section>
+{% endif %}
 
-  {# — История операций — #}
-  {% if selected.bank_type == 'personalpay' and activities_list %}
-  <section class="card">
-    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem">
-      <h3 style="margin:0">История операций</h3>
-      <div style="display:flex;gap:0.5rem">
-        <button class="tx-filter-btn active" data-filter="all">Все</button>
-        <button class="tx-filter-btn" data-filter="incoming">Приходы</button>
-        <button class="tx-filter-btn" data-filter="outgoing">Выводы</button>
+{# ── Автовывод ─────────────────────────────────────────── #}
+<section class="card">
+  <h3>Автоматический вывод</h3>
+  <p class="form-hint">Вывод выполняется при ручном запуске или через API. Правило активно пока не достигнут лимит.</p>
+  <form id="auto-withdraw-form" class="form" action="/account/{{ selected.id }}/auto-withdraw" method="post">
+    <div class="form-row">
+      <label for="auto-cvu">CVU получателя *</label>
+      <input id="auto-cvu" name="cvu" type="text" required />
+    </div>
+    <div class="form-row">
+      <label for="auto-total">Общий лимит (ARS) *</label>
+      <input id="auto-total" name="total_limit" type="text" required placeholder="4.000.000" />
+    </div>
+    <div class="form-row">
+      <label for="auto-chunk">Сумма одной выплаты (ARS) *</label>
+      <input id="auto-chunk" name="chunk_amount" type="text" required placeholder="400.000" />
+    </div>
+    <div class="form-row">
+      <label for="auto-min-balance">Минимальный баланс для запуска</label>
+      <input id="auto-min-balance" name="min_balance" type="text" placeholder="0" />
+      <span class="form-hint" style="margin-top:4px">Оставьте пустым — выводить всегда.</span>
+    </div>
+    <button type="submit" class="btn-primary">Добавить правило</button>
+  </form>
+
+  {% if auto_rules %}
+  <div style="margin-top:1.5rem;display:flex;flex-direction:column;gap:0.75rem" id="auto-rules-list">
+    {% for rule in auto_rules %}
+    <div class="auto-rule-card {% if not rule.is_active %}auto-rule-done{% endif %}" id="rule-{{ rule.id }}">
+      <div class="auto-rule-info">
+        <span class="auto-rule-cvu">{{ rule.cvu }}</span>
+        <span class="auto-rule-progress">{{ rule.paid_amount|ars }} / {{ rule.total_limit|ars }} ARS</span>
+        <span class="auto-rule-step">шаг {{ rule.chunk_amount|ars }} ARS{% if rule.min_balance %} · порог {{ rule.min_balance|ars }} ARS{% endif %}</span>
+        {% if rule.cvu in withdraw_counts %}
+        <span class="auto-rule-limit {% if withdraw_counts[rule.cvu] >= daily_limit %}limit-warn{% endif %}">
+          Сегодня: {{ withdraw_counts[rule.cvu] }} / {{ daily_limit }}
+        </span>
+        {% endif %}
+        {% if rule.last_error %}<span class="auto-rule-error">⚠ {{ rule.last_error }}</span>{% endif %}
+      </div>
+      <div class="auto-rule-bar-wrap">
+        <div class="auto-rule-bar" style="width:{{ [(rule.paid_amount / rule.total_limit * 100) if rule.total_limit else 0, 100]|min|int }}%"></div>
+      </div>
+      <div class="auto-rule-actions">
+        {% if rule.is_active %}
+        <button class="btn-table btn-open js-run-rule" data-rule-id="{{ rule.id }}" data-account-id="{{ selected.id }}">▶ Выполнить шаг</button>
+        {% else %}
+        <span class="tx-badge tx-incoming">✓ Завершено</span>
+        {% endif %}
+        <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/delete" class="form-inline" style="margin:0"
+              data-confirm="Удалить автоправило для CVU {{ rule.cvu }}?">
+          <button type="submit" class="btn-table btn-danger">✕ Удалить</button>
+        </form>
       </div>
     </div>
-    <p class="form-hint" style="margin-bottom:0.75rem">Нажми «Чек» — откроются детали операции.</p>
+    {% endfor %}
+  </div>
+  {% endif %}
+</section>
 
-    <ul class="activities-list tx-history" id="tx-list">
-      {% for act in activities_list %}
-      <li class="tx-item" data-type="{{ 'outgoing' if act.is_outgoing else 'incoming' }}">
-        <span class="tx-badge tx-{{ 'outgoing' if act.is_outgoing else 'incoming' }}">{{ 'Вывод' if act.is_outgoing else 'Приход' }}</span>
-        {% if act.date_str %}<span class="tx-date">{{ act.date_str }}</span>{% endif %}
-        {% if act.amount is not none %}
-        <span class="tx-amount">{{ '-' if act.is_outgoing else '+' }}{{ act.amount|ars }} ARS</span>
-        {% endif %}
-        <span class="tx-counterparty">
-          {% if act.is_outgoing %}
-            {% if act.recipient %}Кому: {{ act.recipient }}{% else %}{{ act.title }}{% endif %}
-          {% else %}
-            {% if act.sender %}От: {{ act.sender }}{% else %}{{ act.title }}{% endif %}
-          {% endif %}
-        </span>
-        {% set rid = act.receipt_id %}
-        {% if rid and (rid|length) == 32 %}
-        <a href="/account/{{ selected.id }}/receipt?transaction_id={{ rid }}" class="tx-cheque">Чек</a>
-        {% else %}
-        <span class="tx-cheque-hint" title="Для чека нужен 32-симв. ID из приложения">Чек ↓</span>
-        {% endif %}
-      </li>
-      {% endfor %}
-    </ul>
+{# ── Управление счётом ─────────────────────────────────── #}
+<section class="card card-actions">
+  <a href="/account/{{ selected.id }}/edit" class="btn-edit">Изменить профиль</a>
+  <form method="post" action="/account/{{ selected.id }}/delete" class="form-inline"
+        data-confirm="Удалить счёт «{{ selected.label }}»? Данные для входа будут удалены.">
+    <button type="submit" class="btn-danger">Удалить счёт</button>
+  </form>
+</section>
 
-    <script>
-    (function(){
-      var btns=document.querySelectorAll('.tx-filter-btn');
-      var items=document.querySelectorAll('#tx-list .tx-item');
-      btns.forEach(function(btn){
+{% endif %}{# end selected #}
+{% endblock %}
+
+{% block extra_js %}
+{% if selected %}
+<script>
+(function(){
+'use strict';
+
+var ACCOUNT_ID = {{ selected.id }};
+var ACCOUNT_LABEL = {{ selected.label | tojson }};
+var BANK_TYPE = {{ selected.bank_type | tojson }};
+var fmt = function(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : String(v||0); };
+
+// ─────────────────────────────────────────────────────────
+// 1. LAZY BALANCE
+// ─────────────────────────────────────────────────────────
+var balEl   = document.getElementById('balance-value');
+var metaEl  = document.getElementById('balance-meta');
+var errBox  = document.getElementById('balance-error-box');
+var refreshBtn = document.getElementById('btn-refresh-balance');
+
+function loadBalance(){
+  if(refreshBtn) refreshBtn.disabled = true;
+  fetch('/account/'+ACCOUNT_ID+'/balance')
+    .then(r=>r.json())
+    .then(function(d){
+      if(d.error){
+        if(balEl) balEl.innerHTML = '<span style="color:#f87171;font-size:1rem">⚠ Ошибка</span>';
+        if(metaEl) metaEl.textContent = '';
+        if(errBox){
+          errBox.style.display='block';
+          errBox.innerHTML = '<div class="alert alert-error" style="margin-top:0.75rem">'+
+            '<strong>Ошибка подключения к банку</strong><br>'+
+            '<span style="font-size:0.85rem;opacity:0.8">'+d.error+'</span>'+
+            (d.error.indexOf('403')!==-1 && BANK_TYPE==='personalpay' ?
+              '<p style="margin:0.5rem 0 0;font-size:0.85rem">Обнови токен в приложении и перехвати новый. '+
+              '<a href="/account/'+ACCOUNT_ID+'/edit" class="alert-link">Настройки</a></p>' : '')+
+            '</div>';
+        }
+      } else {
+        if(balEl) balEl.textContent = fmt(d.balance) + ' ARS';
+        if(metaEl){
+          var parts=[];
+          if(d.cvu_number) parts.push('CVU: '+d.cvu_number);
+          if(d.cvu_alias)  parts.push('Алиас: '+d.cvu_alias);
+          metaEl.textContent = parts.join(' · ');
+        }
+        if(errBox) errBox.style.display='none';
+      }
+    })
+    .catch(function(e){ if(balEl) balEl.innerHTML='<span style="color:#f87171">Недоступен</span>'; })
+    .then(function(){ if(refreshBtn) refreshBtn.disabled=false; });
+}
+
+loadBalance();
+if(refreshBtn) refreshBtn.addEventListener('click', loadBalance);
+setInterval(loadBalance, 30000);
+
+// ─────────────────────────────────────────────────────────
+// 2. LAZY ИСТОРИЯ
+// ─────────────────────────────────────────────────────────
+if(BANK_TYPE === 'personalpay'){
+  var txLoading = document.getElementById('tx-loading');
+  var txList    = document.getElementById('tx-list');
+  var txError   = document.getElementById('tx-error');
+  var txFilters = document.getElementById('tx-filters');
+
+  fetch('/account/'+ACCOUNT_ID+'/activities')
+    .then(r=>r.json())
+    .then(function(d){
+      if(txLoading) txLoading.style.display='none';
+      if(d.error){
+        if(txError){ txError.style.display='block'; txError.innerHTML='<p style="color:#f87171">Не удалось загрузить историю: '+d.error+'</p>'; }
+        return;
+      }
+      var acts = d.activities || [];
+      if(!acts.length){
+        if(txList){ txList.style.display='block'; txList.innerHTML='<li style="color:#64748b;padding:0.5rem 0">Нет операций</li>'; }
+        return;
+      }
+      var html = '';
+      acts.forEach(function(act){
+        var cls = act.is_outgoing ? 'outgoing' : 'incoming';
+        var sign = act.is_outgoing ? '−' : '+';
+        var amtStr = act.amount != null ? sign + fmt(act.amount) + ' ARS' : '';
+        var counterparty = act.is_outgoing
+          ? (act.recipient ? 'Кому: '+act.recipient : (act.title||''))
+          : (act.sender    ? 'От: '+act.sender       : (act.title||''));
+        var chequeHtml = '';
+        if(act.receipt_id && act.receipt_id.length===32){
+          chequeHtml = '<a href="/account/'+ACCOUNT_ID+'/receipt?transaction_id='+act.receipt_id+'" class="tx-cheque">Чек</a>';
+        } else {
+          chequeHtml = '<span class="tx-cheque-hint" title="Нужен 32-симв. ID из приложения">Чек ↓</span>';
+        }
+        html += '<li class="tx-item" data-type="'+cls+'">' +
+          '<span class="tx-badge tx-'+cls+'">'+(act.is_outgoing?'Вывод':'Приход')+'</span>' +
+          (act.date_str ? '<span class="tx-date">'+act.date_str+'</span>' : '') +
+          (amtStr ? '<span class="tx-amount">'+amtStr+'</span>' : '') +
+          '<span class="tx-counterparty">'+counterparty+'</span>' +
+          chequeHtml +
+          '</li>';
+      });
+      if(txList){ txList.innerHTML=html; txList.style.display='block'; }
+      if(txFilters) txFilters.style.display='flex';
+
+      // Фильтрация
+      document.querySelectorAll('.tx-filter-btn').forEach(function(btn){
         btn.addEventListener('click',function(){
-          btns.forEach(b=>b.classList.remove('active'));
+          document.querySelectorAll('.tx-filter-btn').forEach(b=>b.classList.remove('active'));
           btn.classList.add('active');
-          var f=btn.getAttribute('data-filter');
-          items.forEach(function(item){
-            item.style.display=(f==='all'||item.getAttribute('data-type')===f)?'':'none';
+          var f = btn.getAttribute('data-filter');
+          document.querySelectorAll('#tx-list .tx-item').forEach(function(item){
+            item.style.display = (f==='all' || item.getAttribute('data-type')===f) ? '' : 'none';
           });
         });
       });
-    })();
-    </script>
-  </section>
-  {% endif %}
+    })
+    .catch(function(){ if(txLoading) txLoading.style.display='none'; });
+}
 
-  {# — Просмотр чека по ID — #}
-  {% if selected.bank_type == 'personalpay' %}
-  <section class="card card-receipt">
-    <h3>Просмотр чека по ID операции</h3>
-    <form method="get" action="/account/{{ selected.id }}/receipt" class="receipt-form">
-      <input id="tid" name="transaction_id" type="text" placeholder="Вставьте ID операции (32 символа)" class="receipt-input" />
-      <button type="submit" class="btn-primary">Показать чек</button>
-    </form>
-  </section>
-  {% endif %}
+// ─────────────────────────────────────────────────────────
+// 3. МОДАЛ ПОДТВЕРЖДЕНИЯ ВЫВОДА
+// ─────────────────────────────────────────────────────────
+var withdrawForm = document.getElementById('withdraw-form');
+if(withdrawForm){
+  withdrawForm.addEventListener('submit', function(e){
+    e.preventDefault();
+    var dest = (withdrawForm.querySelector('[name=destination]') || withdrawForm.querySelector('[name=cvu]'));
+    var amtInp = withdrawForm.querySelector('[name=amount]');
+    var destVal = dest ? dest.value.trim() : '?';
+    var amtVal  = amtInp ? amtInp.value.trim() : '?';
 
-  {# — Автоматический вывод — #}
-  <section class="card">
-    <h3>Автоматический вывод</h3>
-    <p class="form-hint">При каждом обновлении страницы выполняется следующая выплата до достижения лимита.</p>
+    showWithdrawConfirm(destVal, amtVal, ACCOUNT_LABEL, function(){
+      withdrawForm.removeEventListener('submit', arguments.callee);
+      // Создаём скрытую форму и отправляем по настоящему POST
+      var realForm = document.createElement('form');
+      realForm.method = 'post';
+      realForm.action = '/account/'+ACCOUNT_ID+'/withdraw';
+      var inputs = withdrawForm.querySelectorAll('input,select,textarea');
+      inputs.forEach(function(inp){
+        if(!inp.name) return;
+        var h = document.createElement('input');
+        h.type='hidden'; h.name=inp.name; h.value=inp.value;
+        realForm.appendChild(h);
+      });
+      document.body.appendChild(realForm);
+      realForm.submit();
+    });
+  });
+}
 
-    <form method="post" action="/account/{{ selected.id }}/auto-withdraw" class="form">
-      <div class="form-row">
-        <label for="auto-cvu">CVU получателя *</label>
-        <input id="auto-cvu" name="cvu" type="text" required />
-      </div>
-      <div class="form-row">
-        <label for="auto-total">Общий лимит (ARS) *</label>
-        <input id="auto-total" name="total_limit" type="text" required placeholder="4.000.000" />
-      </div>
-      <div class="form-row">
-        <label for="auto-chunk">Сумма одной выплаты (ARS) *</label>
-        <input id="auto-chunk" name="chunk_amount" type="text" required placeholder="400.000" />
-      </div>
-      <div class="form-row">
-        <label for="auto-min-balance">Минимальный баланс для запуска (ARS)</label>
-        <input id="auto-min-balance" name="min_balance" type="text" placeholder="400.000" />
-        <span class="form-hint" style="margin-top:4px">Вывод произойдёт только если баланс ≥ этой суммы. Оставьте пустым — выводить всегда.</span>
-      </div>
-      <button type="submit" class="btn-primary">Добавить автоправило</button>
-    </form>
+// ─────────────────────────────────────────────────────────
+// 4. АВТОВЫВОД — кнопки "Выполнить шаг" через AJAX
+// ─────────────────────────────────────────────────────────
+document.querySelectorAll('.js-run-rule').forEach(function(btn){
+  btn.addEventListener('click', function(){
+    var ruleId = btn.getAttribute('data-rule-id');
+    var accId  = btn.getAttribute('data-account-id');
+    btn.disabled = true;
+    btn.textContent = '⟳ ...';
+    fetch('/account/'+accId+'/auto-withdraw/'+ruleId+'/trigger', {method:'POST'})
+      .then(r=>r.json())
+      .then(function(d){
+        showToast(d.ok ? '✅ ' + (d.message||'Выполнено') : '⚠️ ' + (d.message||d.error||'Ошибка'), d.ok ? 'success' : 'warn');
+        if(d.rule){
+          var r = d.rule;
+          var card = document.getElementById('rule-'+ruleId);
+          if(card){
+            var prog = card.querySelector('.auto-rule-progress');
+            if(prog) prog.textContent = fmtARS(r.paid_amount) + ' / ' + fmtARS(r.total_limit) + ' ARS';
+            var pct = r.total_limit > 0 ? Math.min(100, r.paid_amount/r.total_limit*100) : 0;
+            var bar = card.querySelector('.auto-rule-bar');
+            if(bar) bar.style.width = pct + '%';
+            if(r.last_error){
+              var errSpan = card.querySelector('.auto-rule-error');
+              if(!errSpan){ errSpan=document.createElement('span'); errSpan.className='auto-rule-error'; card.querySelector('.auto-rule-info').appendChild(errSpan); }
+              errSpan.textContent = '⚠ ' + r.last_error;
+            }
+            if(!r.is_active){
+              card.classList.add('auto-rule-done');
+              btn.replaceWith(Object.assign(document.createElement('span'),{className:'tx-badge tx-incoming',textContent:'✓ Завершено'}));
+              return;
+            }
+          }
+        }
+        btn.disabled=false; btn.textContent='▶ Выполнить шаг';
+      })
+      .catch(function(){ btn.disabled=false; btn.textContent='▶ Выполнить шаг'; showToast('Ошибка сети','warn'); });
+  });
+});
 
-    {% if auto_rules %}
-    <div style="margin-top:1.5rem;display:flex;flex-direction:column;gap:0.75rem">
-      {% for rule in auto_rules %}
-      <div class="auto-rule-card {% if not rule.is_active %}auto-rule-done{% endif %}">
-        <div class="auto-rule-info">
-          <span class="auto-rule-cvu">CVU: {{ rule.cvu }}</span>
-          <span class="auto-rule-progress">
-            {{ rule.paid_amount|ars }} / {{ rule.total_limit|ars }} ARS
-          </span>
-          <span class="auto-rule-step">шаг {{ rule.chunk_amount|ars }} ARS{% if rule.min_balance %} · порог {{ rule.min_balance|ars }} ARS{% endif %}</span>
+// ─────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────
+function fmtARS(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : String(v||0); }
 
-          {# Лимит выводов #}
-          {% if rule.cvu in withdraw_counts %}
-          <span class="auto-rule-limit {% if withdraw_counts[rule.cvu] >= daily_limit %}limit-warn{% endif %}">
-            Сегодня: {{ withdraw_counts[rule.cvu] }} / {{ daily_limit }}
-          </span>
-          {% endif %}
+function showToast(msg, type){
+  var t=document.createElement('div');
+  t.style.cssText='position:fixed;bottom:1.5rem;right:1.5rem;z-index:9999;padding:0.85rem 1.25rem;border-radius:10px;font-size:0.9rem;font-weight:500;box-shadow:0 4px 20px rgba(0,0,0,0.4);max-width:340px;transition:opacity 0.3s;';
+  t.style.background = type==='success' ? '#14532d' : '#431407';
+  t.style.color = type==='success' ? '#86efac' : '#fca5a5';
+  t.style.border = '1px solid ' + (type==='success'?'#16a34a':'#dc2626');
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(function(){ t.style.opacity='0'; setTimeout(function(){ t.remove(); },300); }, 3500);
+}
 
-          {% if rule.last_error %}
-          <span class="auto-rule-error">⚠ {{ rule.last_error }}</span>
-          {% endif %}
-        </div>
+function showWithdrawConfirm(dest, amt, accLabel, onConfirm){
+  var overlay = document.createElement('div');
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:2000;display:flex;align-items:center;justify-content:center;';
+  overlay.innerHTML=
+    '<div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:2rem;max-width:420px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.6)">'+
+    '<h3 style="margin:0 0 0.5rem;color:#f1f5f9;font-size:1.05rem">💸 Подтвердите вывод</h3>'+
+    '<div style="background:#0f172a;border-radius:10px;padding:1rem;margin:1rem 0;font-size:0.95rem;line-height:1.9">'+
+    '<div style="display:flex;justify-content:space-between"><span style="color:#64748b">Счёт:</span><span style="color:#e2e8f0;font-weight:600">'+accLabel+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between"><span style="color:#64748b">CVU/Получатель:</span><span style="color:#e2e8f0;font-family:monospace;font-size:0.85rem">'+dest+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between"><span style="color:#64748b">Сумма:</span><span style="color:#34d399;font-weight:700;font-size:1.1rem">'+amt+' ARS</span></div>'+
+    '</div>'+
+    '<div style="display:flex;align-items:center;justify-content:space-between;gap:0.75rem">'+
+    '<span id="wc-timer" style="font-size:0.82rem;color:#64748b">Авто-подтверждение через <b id="wc-sec">30</b> сек</span>'+
+    '<div style="display:flex;gap:0.75rem">'+
+    '<button id="wc-cancel" style="padding:0.6rem 1.2rem;background:#334155;color:#cbd5e1;border:none;border-radius:8px;cursor:pointer;font-size:0.9rem">Отмена</button>'+
+    '<button id="wc-ok" style="padding:0.6rem 1.4rem;background:#0ea5e9;color:white;border:none;border-radius:8px;cursor:pointer;font-size:0.9rem;font-weight:600">Подтвердить</button>'+
+    '</div></div></div>';
 
-        {# Прогресс-бар #}
-        <div class="auto-rule-bar-wrap">
-          <div class="auto-rule-bar" style="width:{{ [(rule.paid_amount / rule.total_limit * 100) if rule.total_limit else 0, 100]|min|int }}%"></div>
-        </div>
+  document.body.appendChild(overlay);
+  var secEl = overlay.querySelector('#wc-sec');
+  var okBtn = overlay.querySelector('#wc-ok');
+  var cancelBtn = overlay.querySelector('#wc-cancel');
+  var secs = 30;
+  var interval = setInterval(function(){
+    secs--;
+    if(secEl) secEl.textContent = secs;
+    if(secs<=0){ clearInterval(interval); confirm_it(); }
+  }, 1000);
 
-        <div class="auto-rule-actions">
-          {% if rule.is_active %}
-          <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/run" class="form-inline" style="margin:0">
-            <button type="submit" class="btn-table btn-open">▶ Выполнить шаг</button>
-          </form>
-          {% else %}
-          <span class="tx-badge tx-incoming">✓ Завершено</span>
-          {% endif %}
-          <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/delete" class="form-inline" style="margin:0"
-                data-confirm="Удалить автоправило для CVU {{ rule.cvu }}?">
-            <button type="submit" class="btn-table btn-danger">✕ Удалить</button>
-          </form>
-        </div>
-      </div>
-      {% endfor %}
+  function confirm_it(){ overlay.remove(); onConfirm(); }
+  function cancel_it(){ clearInterval(interval); overlay.remove(); }
+
+  okBtn.addEventListener('click', function(){ clearInterval(interval); confirm_it(); });
+  cancelBtn.addEventListener('click', cancel_it);
+  overlay.addEventListener('click', function(e){ if(e.target===overlay) cancel_it(); });
+}
+
+})();
+</script>
+{% endif %}
+
+{# ══════════════════════════════════════════════════════════
+   MULTI-WITHDRAW — показывается на странице группы или на пустом экране
+══════════════════════════════════════════════════════════ #}
+{% if not selected %}
+<section class="card" id="multi-withdraw-section" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem">
+    <h3 style="margin:0">💸 Массовый вывод</h3>
+    <button id="multi-cancel-select" class="btn-table btn-edit">✕ Отмена</button>
+  </div>
+  <p class="form-hint">Выбраны счета: <span id="multi-selected-labels" style="color:#e2e8f0;font-weight:500"></span></p>
+  <div class="form" style="max-width:420px">
+    <div class="form-row">
+      <label for="multi-dest">CVU получателя *</label>
+      <input id="multi-dest" type="text" placeholder="CVU или псевдоним" />
     </div>
-    {% endif %}
-  </section>
+    <div class="form-row">
+      <label for="multi-amount">Сумма с каждого счёта (ARS) *</label>
+      <input id="multi-amount" type="text" placeholder="1000" />
+    </div>
+    <button id="multi-submit" class="btn-primary">Вывести со всех выбранных</button>
+  </div>
+  <div id="multi-results" style="margin-top:1.5rem;display:flex;flex-direction:column;gap:0.5rem"></div>
+</section>
 
-  {# — Управление аккаунтом — #}
-  <section class="card card-actions">
-    <a href="/account/{{ selected.id }}/edit" class="btn-edit">Изменить профиль</a>
-    <form method="post" action="/account/{{ selected.id }}/delete" class="form-inline"
-          data-confirm="Удалить счёт «{{ selected.label }}»? Все данные для входа будут удалены.">
-      <button type="submit" class="btn-danger">Удалить аккаунт</button>
-    </form>
-  </section>
+<script>
+(function(){
+// ─────────────────────────────────────────────────────────
+// MULTI-WITHDRAW
+// ─────────────────────────────────────────────────────────
+var selectedAccounts = {}; // id -> label
+var multiSection = document.getElementById('multi-withdraw-section');
+var multiLabels  = document.getElementById('multi-selected-labels');
+var multiResults = document.getElementById('multi-results');
+var multiCancel  = document.getElementById('multi-cancel-select');
 
-  {% endif %} {# конец блока balance_info.error #}
-{% endif %} {# конец selected #}
+// Добавляем чекбоксы к карточкам аккаунтов в сайдбаре
+document.querySelectorAll('.profile-card[data-account-id]').forEach(function(card){
+  var id    = card.getAttribute('data-account-id');
+  var label = card.querySelector('.profile-card-label');
+  var labelText = label ? label.textContent.trim() : 'Счёт '+id;
+
+  var cb = document.createElement('input');
+  cb.type='checkbox'; cb.className='multi-cb';
+  cb.setAttribute('data-id', id);
+  cb.setAttribute('data-label', labelText);
+  cb.style.cssText='width:16px;height:16px;margin-left:auto;flex-shrink:0;cursor:pointer;accent-color:#0ea5e9';
+  cb.addEventListener('change', function(e){ e.stopPropagation(); updateSelection(); });
+  card.style.display='flex'; card.style.alignItems='center';
+  card.appendChild(cb);
+  // Клик по карточке не должен переключать чекбокс
+  card.addEventListener('click', function(e){ if(e.target===cb) return; });
+});
+
+function updateSelection(){
+  selectedAccounts = {};
+  document.querySelectorAll('.multi-cb:checked').forEach(function(cb){
+    selectedAccounts[cb.getAttribute('data-id')] = cb.getAttribute('data-label');
+  });
+  var count = Object.keys(selectedAccounts).length;
+  if(count >= 2){
+    if(multiSection) multiSection.style.display='block';
+    if(multiLabels)  multiLabels.textContent = Object.values(selectedAccounts).join(', ');
+  } else {
+    if(multiSection) multiSection.style.display='none';
+  }
+}
+
+if(multiCancel){
+  multiCancel.addEventListener('click', function(){
+    document.querySelectorAll('.multi-cb').forEach(function(cb){ cb.checked=false; });
+    selectedAccounts={};
+    if(multiSection) multiSection.style.display='none';
+    if(multiResults) multiResults.innerHTML='';
+  });
+}
+
+var multiSubmit = document.getElementById('multi-submit');
+if(multiSubmit){
+  multiSubmit.addEventListener('click', function(){
+    var dest = (document.getElementById('multi-dest').value||'').trim();
+    var amt  = (document.getElementById('multi-amount').value||'').trim();
+    var ids  = Object.keys(selectedAccounts);
+    if(!dest || !amt || !ids.length) return;
+    var labels = Object.assign({}, selectedAccounts);
+
+    // Модал подтверждения
+    showMultiConfirm(ids, labels, dest, amt, function(){
+      doMultiWithdraw(ids, dest, amt);
+    });
+  });
+}
+
+function showMultiConfirm(ids, labels, dest, amt, onConfirm){
+  var rows = ids.map(function(id){ return '<li style="padding:0.25rem 0;color:#e2e8f0">'+labels[id]+'</li>'; }).join('');
+  var overlay = document.createElement('div');
+  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:2000;display:flex;align-items:center;justify-content:center;';
+  overlay.innerHTML=
+    '<div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:2rem;max-width:440px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.6)">'+
+    '<h3 style="margin:0 0 1rem;color:#f1f5f9;font-size:1.05rem">💸 Подтвердите массовый вывод</h3>'+
+    '<div style="background:#0f172a;border-radius:10px;padding:1rem;margin-bottom:1rem;font-size:0.9rem">'+
+    '<div style="display:flex;justify-content:space-between;margin-bottom:0.5rem"><span style="color:#64748b">Получатель:</span><span style="color:#e2e8f0;font-family:monospace;font-size:0.82rem">'+dest+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between;margin-bottom:0.75rem"><span style="color:#64748b">Сумма с каждого:</span><span style="color:#34d399;font-weight:700">'+amt+' ARS</span></div>'+
+    '<div style="color:#64748b;margin-bottom:0.35rem">Счета ('+ids.length+' шт.):</div>'+
+    '<ul style="margin:0;padding-left:1.2rem;color:#e2e8f0">'+rows+'</ul>'+
+    '<div style="margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid #1e293b;display:flex;justify-content:space-between"><span style="color:#64748b">Итого спишется:</span><span style="color:#fbbf24;font-weight:700">~'+amt+' × '+ids.length+' = '+String(parseFloat(amt.replace(/\./g,'').replace(',','.'))*ids.length)+' ARS</span></div>'+
+    '</div>'+
+    '<div style="display:flex;align-items:center;justify-content:space-between;gap:0.75rem">'+
+    '<span style="font-size:0.82rem;color:#64748b">Авто-подтверждение через <b id="mc-sec">30</b> сек</span>'+
+    '<div style="display:flex;gap:0.75rem">'+
+    '<button id="mc-cancel" style="padding:0.6rem 1.2rem;background:#334155;color:#cbd5e1;border:none;border-radius:8px;cursor:pointer">Отмена</button>'+
+    '<button id="mc-ok" style="padding:0.6rem 1.4rem;background:#0ea5e9;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600">Выполнить</button>'+
+    '</div></div></div>';
+  document.body.appendChild(overlay);
+
+  var secEl=overlay.querySelector('#mc-sec'); var secs=30;
+  var timer=setInterval(function(){ secs--; if(secEl) secEl.textContent=secs; if(secs<=0){clearInterval(timer);go();} },1000);
+  function go(){ overlay.remove(); onConfirm(); }
+  overlay.querySelector('#mc-ok').addEventListener('click',function(){clearInterval(timer);go();});
+  overlay.querySelector('#mc-cancel').addEventListener('click',function(){clearInterval(timer);overlay.remove();});
+  overlay.addEventListener('click',function(e){if(e.target===overlay){clearInterval(timer);overlay.remove();}});
+}
+
+function doMultiWithdraw(ids, dest, amt){
+  if(multiSubmit){ multiSubmit.disabled=true; multiSubmit.textContent='⟳ Выполняется...'; }
+  if(multiResults) multiResults.innerHTML='<p style="color:#64748b;font-size:0.9rem">Выполняем переводы...</p>';
+
+  fetch('/multi-withdraw',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({account_ids:ids, destination:dest, amount:amt})
+  })
+  .then(r=>r.json())
+  .then(function(d){
+    if(multiResults) multiResults.innerHTML='';
+    (d.results||[]).forEach(function(r){
+      var div=document.createElement('div');
+      div.style.cssText='padding:0.75rem 1rem;border-radius:8px;border:1px solid;display:flex;align-items:center;justify-content:space-between;gap:0.5rem;';
+      if(r.ok){
+        div.style.background='#14532d'; div.style.borderColor='#16a34a'; div.style.color='#86efac';
+        div.innerHTML='<span>✅ <strong>'+r.label+'</strong></span>'+
+          (r.tid ? '<a href="/account/'+r.account_id+'/receipt?transaction_id='+r.tid+'" style="color:#86efac;font-size:0.82rem;text-decoration:underline">Чек</a>' : '<span style="font-size:0.82rem;opacity:0.7">OK</span>');
+      } else {
+        div.style.background='#431407'; div.style.borderColor='#dc2626'; div.style.color='#fca5a5';
+        div.innerHTML='<span>❌ <strong>'+r.label+'</strong></span><span style="font-size:0.82rem">'+r.error+'</span>';
+      }
+      if(multiResults) multiResults.appendChild(div);
+    });
+  })
+  .catch(function(e){
+    if(multiResults) multiResults.innerHTML='<p style="color:#f87171">Ошибка: '+e.message+'</p>';
+  })
+  .then(function(){
+    if(multiSubmit){ multiSubmit.disabled=false; multiSubmit.textContent='Вывести со всех выбранных'; }
+  });
+}
+})();
+</script>
+{% endif %}
 {% endblock %}
