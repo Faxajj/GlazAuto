@@ -27,7 +27,10 @@
     <aside class="sidebar">
       <p class="sidebar-hint">Группы можно сворачивать — нажми на название.</p>
       <nav class="nav-accounts">
-        <a href="/" class="nav-item nav-item-all {% if not account_id and not (window_slug|default(none)) %}active{% endif %}">Все аккаунты</a>
+        <a href="/" class="nav-item nav-item-all {% if not account_id and not (window_slug|default(none)) %}active{% endif %}">
+          <span class="nav-all-icon">◈</span>
+          <span class="nav-all-label">Все аккаунты</span>
+        </a>
         {% for w_slug, w_name in (window_list|default([])) %}
         <section class="nav-window {% if (window_slug|default(none)) == w_slug %}nav-window--current{% endif %}" data-window="{{ w_slug }}">
           <div class="nav-window-title">
@@ -50,18 +53,32 @@
 
       <script>
       (function() {
-        // Балансы в сайдбаре
-        var balEls = document.querySelectorAll('.sidebar-balance[data-account-id]');
-        function fmt(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : v; }
-        function fetchBal(id, el) {
-          fetch('/account/'+id+'/balance').then(r=>r.json()).then(d=>{
-            el.textContent = d.error ? '—' : fmt(d.balance)+' ARS';
-          }).catch(()=>{ el.textContent='—'; });
-        }
-        balEls.forEach(el=>{ var id=el.getAttribute('data-account-id'); if(id) fetchBal(id,el); });
-        setInterval(()=>{ balEls.forEach(el=>{ var id=el.getAttribute('data-account-id'); if(id) fetchBal(id,el); }); }, 45000);
+        var fmt = function(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : v; };
 
-        // Сворачивание групп
+        // ── Балансы в сайдбаре: обновляются всегда, независимо от страницы ──
+        function fetchBal(id, el) {
+          fetch('/account/'+id+'/balance')
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+              if(d.error){ el.textContent='—'; el.title=d.error; }
+              else { el.textContent=fmt(d.balance)+' ARS'; el.title=''; }
+            })
+            .catch(function(){ el.textContent='—'; });
+        }
+
+        function refreshAllSidebarBalances() {
+          document.querySelectorAll('.sidebar-balance[data-account-id]').forEach(function(el){
+            var id = el.getAttribute('data-account-id');
+            if(id) fetchBal(id, el);
+          });
+        }
+
+        // Первая загрузка
+        refreshAllSidebarBalances();
+        // Обновление каждые 40 секунд
+        setInterval(refreshAllSidebarBalances, 40000);
+
+        // ── Сворачивание групп ──────────────────────────────────────────────
         var key='banks-dashboard-windows-collapsed';
         function loadState(){ try{ var s=localStorage.getItem(key); return s?JSON.parse(s):{}; }catch(e){return{};} }
         function saveState(s){ try{localStorage.setItem(key,JSON.stringify(s));}catch(e){} }
@@ -78,6 +95,153 @@
             state[slug]=col; saveState(state);
           });
         });
+
+        // ── Чекбоксы для Multi-withdraw — доступны отовсюду ────────────────
+        // Плавающая панель массового вывода
+        var mwPanel = document.getElementById('mw-float-panel');
+        var mwLabelsEl = document.getElementById('mw-float-labels');
+        var mwCountEl  = document.getElementById('mw-float-count');
+        var selectedAccounts = {};
+
+        function updateMultiPanel(){
+          var ids = Object.keys(selectedAccounts);
+          if(ids.length >= 2){
+            if(mwPanel){ mwPanel.style.display='flex'; }
+            if(mwCountEl)  mwCountEl.textContent = ids.length;
+            if(mwLabelsEl) mwLabelsEl.textContent = Object.values(selectedAccounts).join(', ');
+          } else {
+            if(mwPanel) mwPanel.style.display='none';
+          }
+        }
+
+        document.querySelectorAll('.profile-card[data-account-id]').forEach(function(card){
+          var id    = card.getAttribute('data-account-id');
+          var labelEl = card.querySelector('.profile-card-label');
+          var labelText = labelEl ? labelEl.textContent.trim() : 'Счёт '+id;
+
+          var cb = document.createElement('input');
+          cb.type='checkbox'; cb.className='multi-cb';
+          cb.setAttribute('data-id', id);
+          cb.setAttribute('data-label', labelText);
+          cb.title='Выбрать для массового вывода';
+          card.appendChild(cb);
+
+          cb.addEventListener('change', function(e){
+            e.stopPropagation();
+            if(cb.checked) selectedAccounts[id] = labelText;
+            else delete selectedAccounts[id];
+            updateMultiPanel();
+          });
+          // Переход по клику на карточку не сбрасывает чекбокс
+          card.addEventListener('click', function(e){
+            if(e.target === cb) e.stopPropagation();
+          });
+        });
+
+        // Кнопки плавающей панели
+        var mwCancelBtn = document.getElementById('mw-float-cancel');
+        var mwWithdrawBtn = document.getElementById('mw-float-withdraw');
+        if(mwCancelBtn){
+          mwCancelBtn.addEventListener('click', function(){
+            document.querySelectorAll('.multi-cb').forEach(function(cb){ cb.checked=false; });
+            selectedAccounts={};
+            updateMultiPanel();
+          });
+        }
+        if(mwWithdrawBtn){
+          mwWithdrawBtn.addEventListener('click', function(){
+            var ids = Object.keys(selectedAccounts);
+            if(ids.length < 2){ return; }
+            showMwModal(ids, Object.assign({}, selectedAccounts));
+          });
+        }
+
+        // ── Модал массового вывода ──────────────────────────────────────────
+        function showMwModal(ids, labels){
+          var overlay = document.createElement('div');
+          overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:3000;display:flex;align-items:center;justify-content:center;';
+          var rows = ids.map(function(id){ return '<li style="padding:0.2rem 0;color:#e2e8f0">'+labels[id]+'</li>'; }).join('');
+          overlay.innerHTML=
+            '<div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:2rem;max-width:440px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.6)">'+
+            '<h3 style="margin:0 0 1rem;color:#f1f5f9;font-size:1.05rem">💸 Массовый вывод</h3>'+
+            '<div style="background:#0f172a;border-radius:10px;padding:1rem;margin-bottom:1rem;font-size:0.9rem">'+
+            '<div style="color:#64748b;margin-bottom:0.4rem">Выбранные счета ('+ids.length+'):</div>'+
+            '<ul style="margin:0 0 0.75rem;padding-left:1.2rem">'+rows+'</ul>'+
+            '<div class="form-row" style="margin-bottom:0.75rem">'+
+            '<label style="display:block;margin-bottom:0.3rem;color:#94a3b8;font-size:0.85rem">CVU получателя *</label>'+
+            '<input id="mw-dest" type="text" placeholder="CVU или псевдоним" style="width:100%;box-sizing:border-box;background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:0.6rem 0.9rem;font-size:0.95rem"/>'+
+            '</div>'+
+            '<div class="form-row">'+
+            '<label style="display:block;margin-bottom:0.3rem;color:#94a3b8;font-size:0.85rem">Сумма с каждого счёта (ARS) *</label>'+
+            '<input id="mw-amount" type="text" placeholder="1000" style="width:100%;box-sizing:border-box;background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:0.6rem 0.9rem;font-size:0.95rem"/>'+
+            '</div>'+
+            '</div>'+
+            '<div id="mw-results" style="margin-bottom:0.75rem;display:flex;flex-direction:column;gap:0.4rem"></div>'+
+            '<div style="display:flex;align-items:center;justify-content:space-between;gap:0.75rem">'+
+            '<span style="font-size:0.82rem;color:#64748b" id="mw-timer-text">Авто-подтверждение через <b id="mw-sec">30</b> сек</span>'+
+            '<div style="display:flex;gap:0.75rem">'+
+            '<button id="mw-cancel-btn" style="padding:0.6rem 1.2rem;background:#334155;color:#cbd5e1;border:none;border-radius:8px;cursor:pointer">Отмена</button>'+
+            '<button id="mw-ok-btn" style="padding:0.6rem 1.4rem;background:#0ea5e9;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600">Выполнить</button>'+
+            '</div></div></div>';
+          document.body.appendChild(overlay);
+
+          var secEl=overlay.querySelector('#mw-sec');
+          var timerText=overlay.querySelector('#mw-timer-text');
+          var secs=30;
+          var autoTimer=setInterval(function(){
+            secs--;
+            if(secEl) secEl.textContent=secs;
+            if(secs<=0){ clearInterval(autoTimer); doSubmit(); }
+          },1000);
+
+          function doSubmit(){
+            var dest=(overlay.querySelector('#mw-dest').value||'').trim();
+            var amt=(overlay.querySelector('#mw-amount').value||'').trim();
+            if(!dest||!amt){ alert('Укажите CVU и сумму'); return; }
+            clearInterval(autoTimer);
+            if(timerText) timerText.style.display='none';
+            overlay.querySelector('#mw-ok-btn').disabled=true;
+            overlay.querySelector('#mw-ok-btn').textContent='⟳ ...';
+            var resultsEl=overlay.querySelector('#mw-results');
+            fetch('/multi-withdraw',{
+              method:'POST',
+              headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({account_ids:ids, destination:dest, amount:amt})
+            })
+            .then(function(r){return r.json();})
+            .then(function(d){
+              if(resultsEl) resultsEl.innerHTML='';
+              (d.results||[]).forEach(function(r){
+                var div=document.createElement('div');
+                div.style.cssText='padding:0.6rem 0.9rem;border-radius:8px;border:1px solid;display:flex;justify-content:space-between;align-items:center;font-size:0.88rem;';
+                if(r.ok){
+                  div.style.background='#14532d';div.style.borderColor='#16a34a';div.style.color='#86efac';
+                  div.innerHTML='<span>✅ '+r.label+'</span>'+(r.tid?'<a href="/account/'+r.account_id+'/receipt?transaction_id='+r.tid+'" style="color:#86efac;text-decoration:underline">Чек</a>':'<span>OK</span>');
+                } else {
+                  div.style.background='#431407';div.style.borderColor='#dc2626';div.style.color='#fca5a5';
+                  div.innerHTML='<span>❌ '+r.label+'</span><span>'+r.error+'</span>';
+                }
+                if(resultsEl) resultsEl.appendChild(div);
+              });
+              overlay.querySelector('#mw-ok-btn').textContent='Закрыть';
+              overlay.querySelector('#mw-ok-btn').disabled=false;
+              overlay.querySelector('#mw-ok-btn').onclick=function(){ overlay.remove(); };
+            })
+            .catch(function(e){
+              if(resultsEl) resultsEl.innerHTML='<p style="color:#f87171">Ошибка: '+e.message+'</p>';
+              overlay.querySelector('#mw-ok-btn').disabled=false;
+              overlay.querySelector('#mw-ok-btn').textContent='Выполнить';
+            });
+          }
+
+          overlay.querySelector('#mw-ok-btn').addEventListener('click',function(){
+            if(overlay.querySelector('#mw-ok-btn').textContent==='Закрыть'){ overlay.remove(); return; }
+            clearInterval(autoTimer); doSubmit();
+          });
+          overlay.querySelector('#mw-cancel-btn').addEventListener('click',function(){ clearInterval(autoTimer); overlay.remove(); });
+          overlay.addEventListener('click',function(e){ if(e.target===overlay){ clearInterval(autoTimer); overlay.remove(); } });
+        }
+
       })();
       </script>
     </aside>
@@ -129,6 +293,16 @@
     });
   })();
   </script>
+  <!-- Плавающая панель массового вывода -->
+  <div id="mw-float-panel" style="display:none;position:fixed;bottom:1.5rem;left:50%;transform:translateX(-50%);z-index:500;background:#1e293b;border:1px solid #0ea5e9;border-radius:14px;padding:0.75rem 1.25rem;box-shadow:0 8px 32px rgba(0,0,0,0.5);align-items:center;gap:1rem;min-width:320px;max-width:560px;width:90%;">
+    <div style="flex:1;min-width:0">
+      <div style="font-size:0.78rem;color:#64748b;margin-bottom:0.15rem">Выбрано счетов: <strong id="mw-float-count" style="color:#0ea5e9">0</strong></div>
+      <div id="mw-float-labels" style="font-size:0.82rem;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+    </div>
+    <button id="mw-float-withdraw" style="padding:0.55rem 1.1rem;background:#0ea5e9;color:white;border:none;border-radius:9px;cursor:pointer;font-weight:600;font-size:0.9rem;white-space:nowrap;flex-shrink:0">💸 Вывести</button>
+    <button id="mw-float-cancel" style="padding:0.55rem 0.8rem;background:#334155;color:#cbd5e1;border:none;border-radius:9px;cursor:pointer;font-size:0.85rem;flex-shrink:0">✕</button>
+  </div>
+
   {% block extra_js %}{% endblock %}
 </body>
 </html>

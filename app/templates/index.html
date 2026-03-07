@@ -55,14 +55,100 @@
 </section>
 
 {# ══════════════════════════════════════════════════════════
-   ПУСТОЙ ЭКРАН
+   ГЛАВНЫЙ ЭКРАН — ВСЕ АККАУНТЫ (при заходе на /)
 ══════════════════════════════════════════════════════════ #}
 {% elif not selected %}
-<section class="card empty-state">
-  <h2>Выберите счёт</h2>
-  <p>Слева выберите группу или нажмите на счёт в боковой панели.</p>
-  <p><a href="/dashboard" class="btn-primary" style="display:inline-block;text-decoration:none;margin-top:0.5rem">📊 Посмотреть все счета</a></p>
+<section class="card all-accounts-overview">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;margin-bottom:1.5rem">
+    <div>
+      <h2 style="margin:0;font-size:1.3rem">◈ Все аккаунты</h2>
+      <p style="margin:0.3rem 0 0;color:#64748b;font-size:0.875rem">Выберите счёт или выполните массовый вывод</p>
+    </div>
+    <button id="refresh-all-btn" class="btn-refresh">↻ Обновить все</button>
+  </div>
+
+  {% if not accounts %}
+    <p style="color:#64748b">Счетов пока нет. <a href="/add" style="color:#38bdf8">Добавить первый</a></p>
+  {% else %}
+    {% for w_slug, w_name in window_list %}
+      {% set w_accounts = groups.get(w_slug, []) %}
+      {% if w_accounts %}
+      <div style="margin-bottom:2rem">
+        <div style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.08em;color:#475569;margin-bottom:0.75rem;font-weight:600">{{ w_name }}</div>
+        <div class="overview-grid">
+          {% for acc in w_accounts %}
+          <div class="overview-card" data-account-id="{{ acc.id }}">
+            <div class="overview-card-top">
+              <a href="/?account_id={{ acc.id }}" class="overview-card-name">{{ acc.label }}</a>
+              <span class="overview-card-type">{{ acc.bank_type }}</span>
+            </div>
+            <div class="overview-card-balance" id="ov-balance-{{ acc.id }}">
+              <span class="skeleton-line" style="width:100px;display:inline-block"></span>
+            </div>
+            <div class="overview-card-meta" id="ov-meta-{{ acc.id }}"></div>
+            <div class="overview-card-actions">
+              <a href="/?account_id={{ acc.id }}" class="btn-table btn-open">Открыть</a>
+              <a href="/account/{{ acc.id }}/edit" class="btn-table btn-edit">Изменить</a>
+              <form method="post" action="/account/{{ acc.id }}/delete" class="form-inline"
+                    data-confirm="Удалить счёт «{{ acc.label }}»? Данные для входа будут удалены.">
+                <button type="submit" class="btn-table btn-danger">Удалить</button>
+              </form>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+    {% endfor %}
+  {% endif %}
 </section>
+
+<script>
+(function(){
+  var fmt = function(v){ return typeof v==='number'?v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}):String(v||0); };
+
+  function loadOne(id){
+    var balEl = document.getElementById('ov-balance-'+id);
+    var metaEl = document.getElementById('ov-meta-'+id);
+    fetch('/account/'+id+'/balance')
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(balEl){
+          if(d.error){
+            balEl.innerHTML='<span style="color:#f87171;font-size:0.82rem">⚠ Недоступен</span>';
+          } else {
+            balEl.textContent = fmt(d.balance)+' ARS';
+            balEl.style.color = d.balance>0 ? '#34d399' : '#94a3b8';
+          }
+        }
+        if(metaEl && !d.error){
+          var parts=[];
+          if(d.cvu_number) parts.push('CVU: '+d.cvu_number);
+          if(d.cvu_alias)  parts.push(d.cvu_alias);
+          metaEl.textContent=parts.join(' · ');
+        }
+      })
+      .catch(function(){ if(balEl) balEl.innerHTML='<span style="color:#f87171;font-size:0.82rem">⚠ Ошибка</span>'; });
+  }
+
+  var cards = document.querySelectorAll('.overview-card[data-account-id]');
+  cards.forEach(function(c){ loadOne(c.getAttribute('data-account-id')); });
+
+  var refreshBtn = document.getElementById('refresh-all-btn');
+  if(refreshBtn){
+    refreshBtn.addEventListener('click', function(){
+      cards.forEach(function(c){
+        var id=c.getAttribute('data-account-id');
+        var balEl=document.getElementById('ov-balance-'+id);
+        if(balEl) balEl.innerHTML='<span class="skeleton-line" style="width:100px;display:inline-block"></span>';
+        loadOne(id);
+      });
+    });
+  }
+
+  setInterval(function(){ cards.forEach(function(c){ loadOne(c.getAttribute('data-account-id')); }); }, 35000);
+})();
+</script>
 
 {# ══════════════════════════════════════════════════════════
    ДЕТАЛИ СЧЁТА
@@ -507,163 +593,3 @@ function showWithdrawConfirm(dest, amt, accLabel, onConfirm){
 })();
 </script>
 {% endif %}
-
-{# ══════════════════════════════════════════════════════════
-   MULTI-WITHDRAW — показывается на странице группы или на пустом экране
-══════════════════════════════════════════════════════════ #}
-{% if not selected %}
-<section class="card" id="multi-withdraw-section" style="display:none">
-  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem">
-    <h3 style="margin:0">💸 Массовый вывод</h3>
-    <button id="multi-cancel-select" class="btn-table btn-edit">✕ Отмена</button>
-  </div>
-  <p class="form-hint">Выбраны счета: <span id="multi-selected-labels" style="color:#e2e8f0;font-weight:500"></span></p>
-  <div class="form" style="max-width:420px">
-    <div class="form-row">
-      <label for="multi-dest">CVU получателя *</label>
-      <input id="multi-dest" type="text" placeholder="CVU или псевдоним" />
-    </div>
-    <div class="form-row">
-      <label for="multi-amount">Сумма с каждого счёта (ARS) *</label>
-      <input id="multi-amount" type="text" placeholder="1000" />
-    </div>
-    <button id="multi-submit" class="btn-primary">Вывести со всех выбранных</button>
-  </div>
-  <div id="multi-results" style="margin-top:1.5rem;display:flex;flex-direction:column;gap:0.5rem"></div>
-</section>
-
-<script>
-(function(){
-// ─────────────────────────────────────────────────────────
-// MULTI-WITHDRAW
-// ─────────────────────────────────────────────────────────
-var selectedAccounts = {}; // id -> label
-var multiSection = document.getElementById('multi-withdraw-section');
-var multiLabels  = document.getElementById('multi-selected-labels');
-var multiResults = document.getElementById('multi-results');
-var multiCancel  = document.getElementById('multi-cancel-select');
-
-// Добавляем чекбоксы к карточкам аккаунтов в сайдбаре
-document.querySelectorAll('.profile-card[data-account-id]').forEach(function(card){
-  var id    = card.getAttribute('data-account-id');
-  var label = card.querySelector('.profile-card-label');
-  var labelText = label ? label.textContent.trim() : 'Счёт '+id;
-
-  var cb = document.createElement('input');
-  cb.type='checkbox'; cb.className='multi-cb';
-  cb.setAttribute('data-id', id);
-  cb.setAttribute('data-label', labelText);
-  cb.style.cssText='width:16px;height:16px;margin-left:auto;flex-shrink:0;cursor:pointer;accent-color:#0ea5e9';
-  cb.addEventListener('change', function(e){ e.stopPropagation(); updateSelection(); });
-  card.style.display='flex'; card.style.alignItems='center';
-  card.appendChild(cb);
-  // Клик по карточке не должен переключать чекбокс
-  card.addEventListener('click', function(e){ if(e.target===cb) return; });
-});
-
-function updateSelection(){
-  selectedAccounts = {};
-  document.querySelectorAll('.multi-cb:checked').forEach(function(cb){
-    selectedAccounts[cb.getAttribute('data-id')] = cb.getAttribute('data-label');
-  });
-  var count = Object.keys(selectedAccounts).length;
-  if(count >= 2){
-    if(multiSection) multiSection.style.display='block';
-    if(multiLabels)  multiLabels.textContent = Object.values(selectedAccounts).join(', ');
-  } else {
-    if(multiSection) multiSection.style.display='none';
-  }
-}
-
-if(multiCancel){
-  multiCancel.addEventListener('click', function(){
-    document.querySelectorAll('.multi-cb').forEach(function(cb){ cb.checked=false; });
-    selectedAccounts={};
-    if(multiSection) multiSection.style.display='none';
-    if(multiResults) multiResults.innerHTML='';
-  });
-}
-
-var multiSubmit = document.getElementById('multi-submit');
-if(multiSubmit){
-  multiSubmit.addEventListener('click', function(){
-    var dest = (document.getElementById('multi-dest').value||'').trim();
-    var amt  = (document.getElementById('multi-amount').value||'').trim();
-    var ids  = Object.keys(selectedAccounts);
-    if(!dest || !amt || !ids.length) return;
-    var labels = Object.assign({}, selectedAccounts);
-
-    // Модал подтверждения
-    showMultiConfirm(ids, labels, dest, amt, function(){
-      doMultiWithdraw(ids, dest, amt);
-    });
-  });
-}
-
-function showMultiConfirm(ids, labels, dest, amt, onConfirm){
-  var rows = ids.map(function(id){ return '<li style="padding:0.25rem 0;color:#e2e8f0">'+labels[id]+'</li>'; }).join('');
-  var overlay = document.createElement('div');
-  overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:2000;display:flex;align-items:center;justify-content:center;';
-  overlay.innerHTML=
-    '<div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:2rem;max-width:440px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.6)">'+
-    '<h3 style="margin:0 0 1rem;color:#f1f5f9;font-size:1.05rem">💸 Подтвердите массовый вывод</h3>'+
-    '<div style="background:#0f172a;border-radius:10px;padding:1rem;margin-bottom:1rem;font-size:0.9rem">'+
-    '<div style="display:flex;justify-content:space-between;margin-bottom:0.5rem"><span style="color:#64748b">Получатель:</span><span style="color:#e2e8f0;font-family:monospace;font-size:0.82rem">'+dest+'</span></div>'+
-    '<div style="display:flex;justify-content:space-between;margin-bottom:0.75rem"><span style="color:#64748b">Сумма с каждого:</span><span style="color:#34d399;font-weight:700">'+amt+' ARS</span></div>'+
-    '<div style="color:#64748b;margin-bottom:0.35rem">Счета ('+ids.length+' шт.):</div>'+
-    '<ul style="margin:0;padding-left:1.2rem;color:#e2e8f0">'+rows+'</ul>'+
-    '<div style="margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid #1e293b;display:flex;justify-content:space-between"><span style="color:#64748b">Итого спишется:</span><span style="color:#fbbf24;font-weight:700">~'+amt+' × '+ids.length+' = '+String(parseFloat(amt.replace(/\./g,'').replace(',','.'))*ids.length)+' ARS</span></div>'+
-    '</div>'+
-    '<div style="display:flex;align-items:center;justify-content:space-between;gap:0.75rem">'+
-    '<span style="font-size:0.82rem;color:#64748b">Авто-подтверждение через <b id="mc-sec">30</b> сек</span>'+
-    '<div style="display:flex;gap:0.75rem">'+
-    '<button id="mc-cancel" style="padding:0.6rem 1.2rem;background:#334155;color:#cbd5e1;border:none;border-radius:8px;cursor:pointer">Отмена</button>'+
-    '<button id="mc-ok" style="padding:0.6rem 1.4rem;background:#0ea5e9;color:white;border:none;border-radius:8px;cursor:pointer;font-weight:600">Выполнить</button>'+
-    '</div></div></div>';
-  document.body.appendChild(overlay);
-
-  var secEl=overlay.querySelector('#mc-sec'); var secs=30;
-  var timer=setInterval(function(){ secs--; if(secEl) secEl.textContent=secs; if(secs<=0){clearInterval(timer);go();} },1000);
-  function go(){ overlay.remove(); onConfirm(); }
-  overlay.querySelector('#mc-ok').addEventListener('click',function(){clearInterval(timer);go();});
-  overlay.querySelector('#mc-cancel').addEventListener('click',function(){clearInterval(timer);overlay.remove();});
-  overlay.addEventListener('click',function(e){if(e.target===overlay){clearInterval(timer);overlay.remove();}});
-}
-
-function doMultiWithdraw(ids, dest, amt){
-  if(multiSubmit){ multiSubmit.disabled=true; multiSubmit.textContent='⟳ Выполняется...'; }
-  if(multiResults) multiResults.innerHTML='<p style="color:#64748b;font-size:0.9rem">Выполняем переводы...</p>';
-
-  fetch('/multi-withdraw',{
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({account_ids:ids, destination:dest, amount:amt})
-  })
-  .then(r=>r.json())
-  .then(function(d){
-    if(multiResults) multiResults.innerHTML='';
-    (d.results||[]).forEach(function(r){
-      var div=document.createElement('div');
-      div.style.cssText='padding:0.75rem 1rem;border-radius:8px;border:1px solid;display:flex;align-items:center;justify-content:space-between;gap:0.5rem;';
-      if(r.ok){
-        div.style.background='#14532d'; div.style.borderColor='#16a34a'; div.style.color='#86efac';
-        div.innerHTML='<span>✅ <strong>'+r.label+'</strong></span>'+
-          (r.tid ? '<a href="/account/'+r.account_id+'/receipt?transaction_id='+r.tid+'" style="color:#86efac;font-size:0.82rem;text-decoration:underline">Чек</a>' : '<span style="font-size:0.82rem;opacity:0.7">OK</span>');
-      } else {
-        div.style.background='#431407'; div.style.borderColor='#dc2626'; div.style.color='#fca5a5';
-        div.innerHTML='<span>❌ <strong>'+r.label+'</strong></span><span style="font-size:0.82rem">'+r.error+'</span>';
-      }
-      if(multiResults) multiResults.appendChild(div);
-    });
-  })
-  .catch(function(e){
-    if(multiResults) multiResults.innerHTML='<p style="color:#f87171">Ошибка: '+e.message+'</p>';
-  })
-  .then(function(){
-    if(multiSubmit){ multiSubmit.disabled=false; multiSubmit.textContent='Вывести со всех выбранных'; }
-  });
-}
-})();
-</script>
-{% endif %}
-{% endblock %}
