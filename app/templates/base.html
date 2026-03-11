@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>{% block title %}Banks Dashboard{% endblock %}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <link rel="stylesheet" href="/static/style.css?v=8" />
 </head>
 <body>
   <header class="header">
@@ -78,10 +78,18 @@
             .then(function(r){ return r.json(); })
             .then(function(d){
               _sbLoading[id] = false;
-              var text = d.error ? '—' : fmt(d.balance)+' ARS';
-              el.textContent = text;
-              el.title = d.error || '';
-              if(!d.error) {
+              if(d.error){
+                var errMeta = d.error_meta || {};
+                var low = String(d.error || '').toLowerCase();
+                var tokenErr = (errMeta.code === 'token_expired') || low.includes('403') || low.includes('401') || low.includes('token');
+                el.textContent = tokenErr ? '⚠' : '▲';
+                el.classList.add('sidebar-balance-error');
+                el.title = (errMeta.message || 'Ошибка обновления баланса') + (errMeta.suggestion ? ('\n' + errMeta.suggestion) : '');
+              } else {
+                var text = fmt(d.balance)+' ARS';
+                el.textContent = text;
+                el.classList.remove('sidebar-balance-error');
+                el.title = '';
                 try { sessionStorage.setItem(cacheKey, text); } catch(e){}
               }
             })
@@ -101,7 +109,13 @@
         // При загрузке: сначала показываем кеш, потом грузим свежие данные
         refreshAllSidebarBalances();
         // Обновление каждые 40 секунд
-        setInterval(refreshAllSidebarBalances, 40000);
+        (function scheduleSidebarRefresh(){
+          var delay = 30000 + Math.floor(Math.random() * 20000);
+          setTimeout(function(){
+            refreshAllSidebarBalances();
+            scheduleSidebarRefresh();
+          }, delay);
+        })();
 
         // ── Сворачивание групп ──────────────────────────────────────────────
         var key='banks-dashboard-windows-collapsed';

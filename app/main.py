@@ -34,9 +34,12 @@ from app.database import (
     get_auto_withdraw_rule,
     get_session,
     get_user_by_username,
+    get_account_withdraw_count,
     get_withdraw_count,
+    increment_account_withdraw_count,
     increment_withdraw_count,
     init_db,
+    is_account_withdraw_limit_reached,
     is_withdraw_limit_reached,
     list_accounts,
     list_auto_withdraw_rules,
@@ -72,13 +75,16 @@ CONCEPTS_UC = [
 
 # Человекочитаемые сообщения об ошибках
 ERROR_MESSAGES: dict[str, str] = {
-    "rejected_by_bank":  "❌ Перевод отклонён банком. Проверьте данные получателя или попробуйте позже.",
-    "invalid_amount":    "❌ Неверная сумма. Введите число больше нуля.",
-    "no_destination":    "❌ Укажите CVU или псевдоним получателя.",
+    "rejected_by_bank": "❌ Перевод отклонён банком. Проверьте данные получателя или попробуйте позже.",
+    "invalid_amount": "❌ Неверная сумма. Введите число больше нуля.",
+    "no_destination": "❌ Укажите CVU или псевдоним получателя.",
     "document_required": "❌ Документ получателя (CUIT/CUIL) обязателен для UniversalCoins.",
     "invalid_auto_rule": "❌ Неверные параметры автоправила. Проверьте суммы.",
-    "invalid_amount_rule":"❌ Неверная сумма в правиле автовывода.",
-    "limit_reached":     f"❌ Достигнут дневной лимит ({DAILY_WITHDRAW_LIMIT} выводов). Лимит сбрасывается ежедневно в 09:30 МСК.",
+    "invalid_amount_rule": "❌ Неверная сумма в правиле автовывода.",
+    "limit_reached": f"❌ Достигнут дневной лимит ({DAILY_WITHDRAW_LIMIT} выводов). Лимит обновляется ежедневно с 09:30 до 10:00 МСК.",
+    "account_limit_reached": f"❌ Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT} в день). Попробуйте после обновления лимитов с 09:30 до 10:00 МСК.",
+    "token_expired": "❌ Сессия банка истекла. Обновите токен в настройках карты.",
+    "bank_unavailable": "❌ Банк временно недоступен. Попробуйте повторить через 1–2 минуты.",
 }
 
 logging.basicConfig(level=logging.INFO)
@@ -185,6 +191,15 @@ def _normalize_balance(balance_info: dict, bank_type: str) -> dict:
 
 def _error_text(code: str) -> str:
     return ERROR_MESSAGES.get(code, f"❌ Ошибка: {code}")
+
+
+def _error_payload(code: str, details: str = "", suggestion: str = "") -> dict:
+    return {
+        "code": code,
+        "message": _error_text(code),
+        "details": details,
+        "suggestion": suggestion,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +535,11 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
         update_auto_withdraw_progress(rule["id"], last_error="Некорректная сумма", is_active=False)
         return False, "Некорректная сумма"
 
+    if is_account_withdraw_limit_reached(acc["id"]):
+        msg = f"Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT})"
+        update_auto_withdraw_progress(rule["id"], last_error=msg)
+        return False, msg
+
     # Проверка дневного лимита по CVU
     cvu = rule.get("cvu", "")
     if is_withdraw_limit_reached(cvu, acc["id"]):
@@ -548,6 +568,7 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
             destination=cvu, amount=chunk, comments="Auto withdraw",
         )
         increment_withdraw_count(cvu, acc["id"])
+        increment_account_withdraw_count(acc["id"])
         update_auto_withdraw_progress(rule["id"], paid_delta=chunk, last_error="")
     except Exception as e:
         update_auto_withdraw_progress(rule["id"], last_error=str(e))
@@ -653,8 +674,14 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
     # Правила автовывода и счётчики лимитов — только БД
     auto_rules: list = []
     withdraw_counts: dict = {}
+    account_withdraw_count = 0
+    account_limit_reached = False
+    account_limit_near = False
     if selected:
         auto_rules = list_auto_withdraw_rules(selected["id"])
+        account_withdraw_count = get_account_withdraw_count(selected["id"])
+        account_limit_reached = account_withdraw_count >= DAILY_WITHDRAW_LIMIT
+        account_limit_near = account_withdraw_count >= (DAILY_WITHDRAW_LIMIT - 1)
         for rule in auto_rules:
             cvu = rule.get("cvu", "")
             if cvu and cvu not in withdraw_counts:
@@ -682,6 +709,9 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
         "auto_rules":            auto_rules,
         "withdraw_counts":       withdraw_counts,
         "daily_limit":           DAILY_WITHDRAW_LIMIT,
+        "account_withdraw_count": account_withdraw_count,
+        "account_limit_reached":  account_limit_reached,
+        "account_limit_near":     account_limit_near,
         "prefill": {
             "cvu": "", "destination": "", "amount": "",
             "concept": "VARIOS", "comments": "Varios (VAR)",
@@ -720,14 +750,42 @@ async def api_balance(account_id: int):
     if not acc:
         return JSONResponse({"error": "account not found"}, status_code=404)
     try:
-        # Запускаем синхронный (blocking) HTTP-драйвер в отдельном потоке,
-        # чтобы не блокировать asyncio event loop FastAPI.
         raw = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
         info = _normalize_balance(raw, acc["bank_type"])
         info.pop("raw_accounts", None)
+        info["account_withdraw_count"] = get_account_withdraw_count(account_id)
+        info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
         return info
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        err = str(e)
+        low = err.lower()
+        code = "bank_unavailable"
+        if any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
+            code = "token_expired"
+        return JSONResponse({
+            "error": err,
+            "error_meta": _error_payload(
+                code,
+                details=err,
+                suggestion="Откройте настройки карты и обновите токен, затем повторите обновление баланса." if code == "token_expired" else "Проверьте интернет/прокси и повторите через 1–2 минуты.",
+            ),
+        }, status_code=500)
+
+
+@app.get("/account/{account_id}/status")
+async def api_account_status(account_id: int):
+    acc = get_account(account_id)
+    if not acc:
+        return JSONResponse({"error": "account not found"}, status_code=404)
+
+    count = get_account_withdraw_count(account_id)
+    return JSONResponse({
+        "account_id": account_id,
+        "withdraw_count": count,
+        "withdraw_limit": DAILY_WITHDRAW_LIMIT,
+        "is_limit_reached": count >= DAILY_WITHDRAW_LIMIT,
+        "is_near_limit": count >= (DAILY_WITHDRAW_LIMIT - 1),
+    })
 
 
 @app.get("/account/{account_id}/activities")
@@ -745,15 +803,19 @@ async def api_activities(account_id: int):
         for act in (raw if isinstance(raw, list) else []):
             n = _normalize_activity(act)
             if n:
+                is_outgoing = bool(n.get("is_outgoing"))
+                full_name = (n.get("recipient") if is_outgoing else n.get("sender")) or "Не указано"
                 activities.append({
-                    "id":          n.get("id"),
-                    "title":       n.get("title"),
-                    "receipt_id":  n.get("receipt_id"),
-                    "amount":      n.get("amount"),
-                    "date_str":    n.get("date_str"),
-                    "is_outgoing": n.get("is_outgoing"),
-                    "sender":      n.get("sender"),
-                    "recipient":   n.get("recipient"),
+                    "id": n.get("id"),
+                    "title": n.get("title"),
+                    "receipt_id": n.get("receipt_id"),
+                    "amount": n.get("amount"),
+                    "date_str": n.get("date_str"),
+                    "is_outgoing": is_outgoing,
+                    "type": "outgoing" if is_outgoing else "incoming",
+                    "sender": n.get("sender"),
+                    "recipient": n.get("recipient"),
+                    "full_name": full_name,
                 })
         return JSONResponse({"activities": activities})
     except Exception as e:
@@ -809,6 +871,11 @@ async def multi_withdraw(request: Request):
         acc = get_account(int(acc_id))
         if not acc:
             return {"account_id": acc_id, "label": "?", "ok": False, "error": "Счёт не найден", "tid": None}
+        if is_account_withdraw_limit_reached(acc["id"]):
+            return {
+                "account_id": acc_id, "label": acc["label"], "ok": False,
+                "error": "Карта достигла лимита выводов", "tid": None,
+            }
         if is_withdraw_limit_reached(destination, acc["id"]):
             return {
                 "account_id": acc_id, "label": acc["label"], "ok": False,
@@ -826,6 +893,7 @@ async def multi_withdraw(request: Request):
                     destination=destination, amount=amt, comments=comments,
                 )
             increment_withdraw_count(destination, acc["id"])
+            increment_account_withdraw_count(acc["id"])
             tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
             return {"account_id": acc_id, "label": acc["label"], "ok": True, "error": None, "tid": tid}
         except Exception as e:
@@ -866,6 +934,9 @@ async def withdraw(
     if not dest:
         return RedirectResponse(url=f"/?account_id={account_id}&error=no_destination", status_code=302)
 
+    if is_account_withdraw_limit_reached(account_id):
+        return RedirectResponse(url=f"/?account_id={account_id}&error=account_limit_reached", status_code=302)
+
     # Проверка дневного лимита
     if is_withdraw_limit_reached(dest, account_id):
         return RedirectResponse(url=f"/?account_id={account_id}&error=limit_reached", status_code=302)
@@ -891,6 +962,7 @@ async def withdraw(
                 destination=dest, amount=amt, comments=comments,
             )
         increment_withdraw_count(dest, account_id)
+        increment_account_withdraw_count(account_id)
     except Exception as e:
         err_msg = str(e)
         if any(x in err_msg.lower() for x in ("rechazad", "rejected", "rechazo", "denied", "denegad")):
