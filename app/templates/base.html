@@ -14,6 +14,7 @@
     </div>
     <div style="display:flex;align-items:center;gap:0.75rem">
       <a href="/dashboard" class="btn-table btn-open" style="text-decoration:none">📊 Обзор</a>
+      <a href="/windows" class="btn-table btn-edit" style="text-decoration:none">🗂 Кабинеты</a>
       {% if current_user %}
       <form method="post" action="/logout" class="form-inline">
         <button type="submit" class="btn-table btn-edit">Выйти ({{ current_user.username }})</button>
