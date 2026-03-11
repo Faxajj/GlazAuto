@@ -1085,3 +1085,33 @@ body {
   from { opacity:0; transform: translateX(-50%) translateY(12px); }
   to   { opacity:1; transform: translateX(-50%) translateY(0); }
 }
+
+.sidebar-balance-error {
+  color: #ef4444 !important;
+  font-weight: 700;
+}
+
+.tx-history .tx-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.4rem 0.8rem;
+  align-items: center;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid #334155;
+}
+
+.tx-history .tx-item .tx-badge {
+  grid-row: 1 / span 3;
+}
+
+.tx-history .tx-counterparty,
+.tx-history .tx-date,
+.tx-history .tx-amount {
+  font-size: 0.87rem;
+}
+
+button[disabled],
+.btn-primary[disabled] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}

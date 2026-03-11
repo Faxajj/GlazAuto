@@ -44,12 +44,26 @@
   {% endif %}
   <script>
   (function(){
-    document.querySelectorAll('.list-balance[data-account-id]').forEach(function(el){
-      var id=el.getAttribute('data-account-id');
-      fetch('/account/'+id+'/balance').then(r=>r.json()).then(d=>{
-        el.textContent=d.error?'—':(typeof d.balance==='number'?d.balance.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}):d.balance)+' ARS';
-      }).catch(()=>{el.textContent='—';});
-    });
+    function refreshWindowBalances(){
+      document.querySelectorAll('.list-balance[data-account-id]').forEach(function(el){
+        var id=el.getAttribute('data-account-id');
+        fetch('/account/'+id+'/balance').then(r=>r.json()).then(d=>{
+          if(d.error){
+            el.textContent='⚠';
+            el.classList.add('sidebar-balance-error');
+            return;
+          }
+          el.classList.remove('sidebar-balance-error');
+          el.textContent=(typeof d.balance==='number'?d.balance.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}):d.balance)+' ARS';
+        }).catch(()=>{el.textContent='▲';el.classList.add('sidebar-balance-error');});
+      });
+    }
+
+    refreshWindowBalances();
+    (function schedule(){
+      var delay = 30000 + Math.floor(Math.random() * 20000);
+      setTimeout(function(){ refreshWindowBalances(); schedule(); }, delay);
+    })();
   })();
   </script>
 </section>
@@ -170,6 +184,15 @@
 </div>
 {% endif %}
 
+{% if account_limit_reached or account_limit_near %}
+<div class="alert {% if account_limit_reached %}alert-error{% else %}alert-warning{% endif %}" id="withdraw-limit-banner">
+  {% if account_limit_reached %}⛔ <strong>Карта достигла лимита выводов.</strong>
+  {% else %}⚠️ <strong>Карта почти достигла лимита выводов.</strong>{% endif %}
+  Сегодня: <strong>{{ account_withdraw_count }} / {{ daily_limit }}</strong>.
+  Лимиты обновляются ежедневно с 09:30 до 10:00 МСК.
+</div>
+{% endif %}
+
 {% if token_expired %}
 <div class="alert alert-error">
   🔑 <strong>Токен истёк.</strong> Обновите в <a href="/account/{{ selected.id }}/edit" class="alert-link">настройках</a>.
@@ -197,7 +220,7 @@
 <section class="card">
   <h2>Создать вывод</h2>
   {% if selected.bank_type == 'universalcoins' %}
-  <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="universalcoins">
+  <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="universalcoins" data-limit-reached="{{ 1 if account_limit_reached else 0 }}">
     <div class="form-row">
       <label for="cvu">CVU получателя *</label>
       <input id="cvu" name="cvu" type="text" inputmode="numeric" maxlength="24" placeholder="0000357301000001621038" required />
@@ -230,10 +253,10 @@
       <label for="bank">Банк получателя</label>
       <input id="bank" name="bank" type="text" />
     </div>
-    <button type="submit" class="btn-primary">Вывести</button>
+    <button type="submit" class="btn-primary" {% if account_limit_reached %}disabled title="Лимит выводов достигнут"{% endif %}>Вывести</button>
   </form>
   {% else %}
-  <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="personalpay">
+  <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="personalpay" data-limit-reached="{{ 1 if account_limit_reached else 0 }}">
     <div class="form-row">
       <label for="destination">Получатель (CVU / псевдоним) *</label>
       <input id="destination" name="destination" type="text" required />
@@ -242,7 +265,7 @@
       <label for="amount">Сумма (ARS) *</label>
       <input id="amount" name="amount" type="text" inputmode="decimal" required />
     </div>
-    <button type="submit" class="btn-primary">Вывести</button>
+    <button type="submit" class="btn-primary" {% if account_limit_reached %}disabled title="Лимит выводов достигнут"{% endif %}>Вывести</button>
   </form>
   {% endif %}
 </section>
@@ -263,14 +286,6 @@
   </div>
   <ul class="activities-list tx-history" id="tx-list" style="display:none"></ul>
   <div id="tx-error" style="display:none"></div>
-
-  <section style="margin-top:1.25rem;padding-top:1.25rem;border-top:1px solid #1e293b">
-    <h4 style="margin:0 0 0.75rem;font-size:0.9rem;color:#94a3b8">Просмотр чека по ID</h4>
-    <form method="get" action="/account/{{ selected.id }}/receipt" class="receipt-form">
-      <input name="transaction_id" type="text" placeholder="ID операции (32 символа)" class="receipt-input" />
-      <button type="submit" class="btn-primary">Показать</button>
-    </form>
-  </section>
 </section>
 {% endif %}
 
@@ -406,13 +421,12 @@ function loadBalance(force){
         if(balEl) balEl.innerHTML = '<span style="color:#f87171;font-size:1rem">⚠ Ошибка</span>';
         if(metaEl) metaEl.textContent = '';
         if(errBox){
+          var meta = d.error_meta || {};
           errBox.style.display='block';
           errBox.innerHTML = '<div class="alert alert-error" style="margin-top:0.75rem">'+
-            '<strong>Ошибка подключения к банку</strong><br>'+
-            '<span style="font-size:0.85rem;opacity:0.8">'+d.error+'</span>'+
-            (d.error.indexOf('403')!==-1 && BANK_TYPE==='personalpay' ?
-              '<p style="margin:0.5rem 0 0;font-size:0.85rem">Обнови токен и перехвати новый. '+
-              '<a href="/account/'+ACCOUNT_ID+'/edit" class="alert-link">Настройки</a></p>' : '')+
+            '<strong>'+(meta.message || 'Ошибка подключения к банку')+'</strong><br>'+
+            '<span style="font-size:0.85rem;opacity:0.85">'+(meta.details || d.error)+'</span>'+
+            (meta.suggestion ? '<p style="margin:0.5rem 0 0;font-size:0.85rem">'+meta.suggestion+' <a href="/account/'+ACCOUNT_ID+'/edit" class="alert-link">Настройки</a></p>' : '')+
             '</div>';
         }
       } else {
@@ -442,7 +456,13 @@ function loadBalance(force){
 
 loadBalance();
 if(refreshBtn) refreshBtn.addEventListener('click', function(){ loadBalance(true); });
-setInterval(function(){ loadBalance(); }, 40000);
+(function scheduleBalanceRefresh(){
+  var delay = 30000 + Math.floor(Math.random() * 20000);
+  setTimeout(function(){
+    loadBalance();
+    scheduleBalanceRefresh();
+  }, delay);
+})();
 
 // ─────────────────────────────────────────────────────────
 // 2. LAZY ИСТОРИЯ
@@ -470,22 +490,14 @@ if(BANK_TYPE === 'personalpay'){
       acts.forEach(function(act){
         var cls = act.is_outgoing ? 'outgoing' : 'incoming';
         var sign = act.is_outgoing ? '−' : '+';
-        var amtStr = act.amount != null ? sign + fmt(act.amount) + ' ARS' : '';
-        var counterparty = act.is_outgoing
-          ? (act.recipient ? 'Кому: '+act.recipient : (act.title||''))
-          : (act.sender    ? 'От: '+act.sender       : (act.title||''));
-        var chequeHtml = '';
-        if(act.receipt_id && act.receipt_id.length===32){
-          chequeHtml = '<a href="/account/'+ACCOUNT_ID+'/receipt?transaction_id='+act.receipt_id+'" class="tx-cheque">Чек</a>';
-        } else {
-          chequeHtml = '<span class="tx-cheque-hint" title="Нужен 32-симв. ID из приложения">Чек ↓</span>';
-        }
+        var amtStr = act.amount != null ? sign + fmt(act.amount) + ' ARS' : '—';
+        var fio = act.full_name || 'Не указано';
+        var opLabel = act.is_outgoing ? 'Вывод' : 'Поступление';
         html += '<li class="tx-item" data-type="'+cls+'">' +
-          '<span class="tx-badge tx-'+cls+'">'+(act.is_outgoing?'Вывод':'Приход')+'</span>' +
-          (act.date_str ? '<span class="tx-date">'+act.date_str+'</span>' : '') +
-          (amtStr ? '<span class="tx-amount">'+amtStr+'</span>' : '') +
-          '<span class="tx-counterparty">'+counterparty+'</span>' +
-          chequeHtml +
+          '<span class="tx-badge tx-'+cls+'">'+opLabel+'</span>' +
+          '<span class="tx-counterparty">ФИО: '+fio+'</span>' +
+          '<span class="tx-date">Время: '+(act.date_str || '—')+'</span>' +
+          '<span class="tx-amount">Сумма: '+amtStr+'</span>' +
           '</li>';
       });
       if(txList){ txList.innerHTML=html; txList.style.display='block'; }
@@ -511,13 +523,16 @@ if(BANK_TYPE === 'personalpay'){
 // ─────────────────────────────────────────────────────────
 var withdrawForm = document.getElementById('withdraw-form');
 if(withdrawForm){
-  // FIX: форма уже имеет method="post" и action="/account/.../withdraw".
-  // Просто перехватываем submit, показываем модал, потом отпускаем нативный submit.
   var _withdrawConfirmed = false;
+  var limitReached = withdrawForm.getAttribute('data-limit-reached') === '1';
   withdrawForm.addEventListener('submit', function(e){
     if(_withdrawConfirmed){
-      // Пользователь уже подтвердил — пропускаем нативный submit
       _withdrawConfirmed = false;
+      return;
+    }
+    if(limitReached){
+      e.preventDefault();
+      showToast('Карта достигла лимита выводов. Повторите после обновления лимитов.', 'warn');
       return;
     }
     e.preventDefault();
@@ -526,9 +541,14 @@ if(withdrawForm){
     var destVal = dest ? dest.value.trim() : '?';
     var amtVal  = amtInp ? amtInp.value.trim() : '?';
 
-    showWithdrawConfirm(destVal, amtVal, ACCOUNT_LABEL, function(){
+    var nameInp = withdrawForm.querySelector('[name=name]');
+    var recipientName = nameInp ? nameInp.value.trim() : '';
+
+    showWithdrawConfirm(destVal, amtVal, recipientName, function(){
       _withdrawConfirmed = true;
-      withdrawForm.submit(); // нативный submit — идёт на action формы
+      var submitBtn = withdrawForm.querySelector('button[type="submit"]');
+      if(submitBtn){ submitBtn.disabled = true; submitBtn.textContent = '⟳ Отправляем...'; }
+      withdrawForm.submit();
     });
   });
 }
@@ -589,39 +609,32 @@ function showToast(msg, type){
   setTimeout(function(){ t.style.opacity='0'; setTimeout(function(){ t.remove(); },300); }, 3500);
 }
 
-function showWithdrawConfirm(dest, amt, accLabel, onConfirm){
+function showWithdrawConfirm(dest, amt, recipientName, onConfirm){
   var overlay = document.createElement('div');
   overlay.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:2000;display:flex;align-items:center;justify-content:center;';
   overlay.innerHTML=
     '<div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:2rem;max-width:420px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.6)">'+
     '<h3 style="margin:0 0 0.5rem;color:#f1f5f9;font-size:1.05rem">💸 Подтвердите вывод</h3>'+
     '<div style="background:#0f172a;border-radius:10px;padding:1rem;margin:1rem 0;font-size:0.95rem;line-height:1.9">'+
-    '<div style="display:flex;justify-content:space-between"><span style="color:#64748b">Счёт:</span><span style="color:#e2e8f0;font-weight:600">'+accLabel+'</span></div>'+
+    '<div style="display:flex;justify-content:space-between"><span style="color:#64748b">Имя получателя:</span><span style="color:#e2e8f0;font-weight:600">'+(recipientName||'—')+'</span></div>'+
     '<div style="display:flex;justify-content:space-between"><span style="color:#64748b">CVU/Получатель:</span><span style="color:#e2e8f0;font-family:monospace;font-size:0.85rem">'+dest+'</span></div>'+
     '<div style="display:flex;justify-content:space-between"><span style="color:#64748b">Сумма:</span><span style="color:#34d399;font-weight:700;font-size:1.1rem">'+amt+' ARS</span></div>'+
     '</div>'+
     '<div style="display:flex;align-items:center;justify-content:space-between;gap:0.75rem">'+
-    '<span id="wc-timer" style="font-size:0.82rem;color:#64748b">Авто-подтверждение через <b id="wc-sec">30</b> сек</span>'+
+    '<span style="font-size:0.82rem;color:#64748b">Проверьте реквизиты перед отправкой</span>'+
     '<div style="display:flex;gap:0.75rem">'+
     '<button id="wc-cancel" style="padding:0.6rem 1.2rem;background:#334155;color:#cbd5e1;border:none;border-radius:8px;cursor:pointer;font-size:0.9rem">Отмена</button>'+
     '<button id="wc-ok" style="padding:0.6rem 1.4rem;background:#0ea5e9;color:white;border:none;border-radius:8px;cursor:pointer;font-size:0.9rem;font-weight:600">Подтвердить</button>'+
     '</div></div></div>';
 
   document.body.appendChild(overlay);
-  var secEl = overlay.querySelector('#wc-sec');
   var okBtn = overlay.querySelector('#wc-ok');
   var cancelBtn = overlay.querySelector('#wc-cancel');
-  var secs = 30;
-  var interval = setInterval(function(){
-    secs--;
-    if(secEl) secEl.textContent = secs;
-    if(secs<=0){ clearInterval(interval); confirm_it(); }
-  }, 1000);
 
   function confirm_it(){ overlay.remove(); onConfirm(); }
-  function cancel_it(){ clearInterval(interval); overlay.remove(); }
+  function cancel_it(){ overlay.remove(); }
 
-  okBtn.addEventListener('click', function(){ clearInterval(interval); confirm_it(); });
+  okBtn.addEventListener('click', function(){ confirm_it(); });
   cancelBtn.addEventListener('click', cancel_it);
   overlay.addEventListener('click', function(e){ if(e.target===overlay) cancel_it(); });
 }
