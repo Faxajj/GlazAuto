@@ -7,11 +7,11 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 DB_PATH = "/var/www/app/accounts.db"
 
-def _load_windows() -> list[tuple[str, str]]:
+def _load_windows() -> List[Tuple[str, str]]:
     """Список кабинетов можно расширять через env WINDOWS_CONFIG.
 
     Формат: slug:Название,slug2:Название 2
@@ -25,7 +25,7 @@ def _load_windows() -> list[tuple[str, str]]:
             ("glaz6", "Glaz6"),
         ]
 
-    parsed: list[tuple[str, str]] = []
+    parsed: List[Tuple[str, str]] = []
     for chunk in raw.split(","):
         piece = chunk.strip()
         if not piece:
@@ -442,28 +442,36 @@ def is_withdraw_limit_reached(cvu: str, account_id: int) -> bool:
 
 def get_account_withdraw_count(account_id: int) -> int:
     today = _msk_date_str()
-    with _get_conn() as conn:
-        row = conn.execute(
-            "SELECT count FROM account_withdraw_limits WHERE account_id=? AND withdraw_date=?",
-            (account_id, today),
-        ).fetchone()
-    return int(row["count"]) if row else 0
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT count FROM account_withdraw_limits WHERE account_id=? AND withdraw_date=?",
+                (account_id, today),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+    except sqlite3.OperationalError:
+        # Безопасный fallback для серверов со старой БД/неприменённой миграцией.
+        return 0
 
 
 def increment_account_withdraw_count(account_id: int) -> int:
     today = _msk_date_str()
-    with _get_conn() as conn:
-        conn.execute(
-            "INSERT INTO account_withdraw_limits (account_id, withdraw_date, count) VALUES (?,?,1) "
-            "ON CONFLICT(account_id, withdraw_date) DO UPDATE SET count = count + 1",
-            (account_id, today),
-        )
-        conn.commit()
-        row = conn.execute(
-            "SELECT count FROM account_withdraw_limits WHERE account_id=? AND withdraw_date=?",
-            (account_id, today),
-        ).fetchone()
-    return int(row["count"]) if row else 1
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO account_withdraw_limits (account_id, withdraw_date, count) VALUES (?,?,1) "
+                "ON CONFLICT(account_id, withdraw_date) DO UPDATE SET count = count + 1",
+                (account_id, today),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT count FROM account_withdraw_limits WHERE account_id=? AND withdraw_date=?",
+                (account_id, today),
+            ).fetchone()
+        return int(row["count"]) if row else 1
+    except sqlite3.OperationalError:
+        # Не роняем выводы, если таблица лимитов карты ещё не доступна.
+        return get_account_withdraw_count(account_id)
 
 
 def is_account_withdraw_limit_reached(account_id: int) -> bool:
