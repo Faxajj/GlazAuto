@@ -20,7 +20,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.database import (
     DAILY_WITHDRAW_LIMIT,
-    WINDOWS,
+    get_window_list,
+    normalize_window_slug,
     accounts_by_window,
     add_account as db_add_account,
     add_auto_withdraw_rule,
@@ -34,9 +35,12 @@ from app.database import (
     get_auto_withdraw_rule,
     get_session,
     get_user_by_username,
+    get_account_withdraw_count,
     get_withdraw_count,
+    increment_account_withdraw_count,
     increment_withdraw_count,
     init_db,
+    is_account_withdraw_limit_reached,
     is_withdraw_limit_reached,
     list_accounts,
     list_auto_withdraw_rules,
@@ -72,13 +76,16 @@ CONCEPTS_UC = [
 
 # Человекочитаемые сообщения об ошибках
 ERROR_MESSAGES: dict[str, str] = {
-    "rejected_by_bank":  "❌ Перевод отклонён банком. Проверьте данные получателя или попробуйте позже.",
-    "invalid_amount":    "❌ Неверная сумма. Введите число больше нуля.",
-    "no_destination":    "❌ Укажите CVU или псевдоним получателя.",
+    "rejected_by_bank": "❌ Перевод отклонён банком. Проверьте данные получателя или попробуйте позже.",
+    "invalid_amount": "❌ Неверная сумма. Введите число больше нуля.",
+    "no_destination": "❌ Укажите CVU или псевдоним получателя.",
     "document_required": "❌ Документ получателя (CUIT/CUIL) обязателен для UniversalCoins.",
     "invalid_auto_rule": "❌ Неверные параметры автоправила. Проверьте суммы.",
-    "invalid_amount_rule":"❌ Неверная сумма в правиле автовывода.",
-    "limit_reached":     f"❌ Достигнут дневной лимит ({DAILY_WITHDRAW_LIMIT} выводов). Лимит сбрасывается ежедневно в 09:30 МСК.",
+    "invalid_amount_rule": "❌ Неверная сумма в правиле автовывода.",
+    "limit_reached": f"❌ Достигнут дневной лимит ({DAILY_WITHDRAW_LIMIT} выводов). Лимит обновляется ежедневно с 09:30 до 10:00 МСК.",
+    "account_limit_reached": f"❌ Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT} в день). Попробуйте после обновления лимитов с 09:30 до 10:00 МСК.",
+    "token_expired": "❌ Сессия банка истекла. Обновите токен в настройках карты.",
+    "bank_unavailable": "❌ Банк временно недоступен. Попробуйте повторить через 1–2 минуты.",
 }
 
 logging.basicConfig(level=logging.INFO)
@@ -94,7 +101,6 @@ init_db()
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
-templates.env.filters["tojson"] = lambda obj, indent=2: json.dumps(obj, indent=indent, ensure_ascii=False)
 templates.env.filters["ars"]    = lambda value, decimals=2: _format_ars(value, decimals)
 
 
@@ -126,7 +132,7 @@ def _current_user(request: Request) -> Optional[dict]:
 
 
 def _window_name(slug: str) -> str:
-    return next((name for s, name in WINDOWS if s == slug), slug)
+    return next((name for s, name in get_window_list() if s == slug), slug)
 
 
 def _parse_amount(raw: str) -> Optional[float]:
@@ -185,6 +191,15 @@ def _normalize_balance(balance_info: dict, bank_type: str) -> dict:
 
 def _error_text(code: str) -> str:
     return ERROR_MESSAGES.get(code, f"❌ Ошибка: {code}")
+
+
+def _error_payload(code: str, details: str = "", suggestion: str = "") -> dict:
+    return {
+        "code": code,
+        "message": _error_text(code),
+        "details": details,
+        "suggestion": suggestion,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +535,11 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
         update_auto_withdraw_progress(rule["id"], last_error="Некорректная сумма", is_active=False)
         return False, "Некорректная сумма"
 
+    if is_account_withdraw_limit_reached(acc["id"]):
+        msg = f"Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT})"
+        update_auto_withdraw_progress(rule["id"], last_error=msg)
+        return False, msg
+
     # Проверка дневного лимита по CVU
     cvu = rule.get("cvu", "")
     if is_withdraw_limit_reached(cvu, acc["id"]):
@@ -548,6 +568,7 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
             destination=cvu, amount=chunk, comments="Auto withdraw",
         )
         increment_withdraw_count(cvu, acc["id"])
+        increment_account_withdraw_count(acc["id"])
         update_auto_withdraw_progress(rule["id"], paid_delta=chunk, last_error="")
     except Exception as e:
         update_auto_withdraw_progress(rule["id"], last_error=str(e))
@@ -633,10 +654,12 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
     window_accounts: list = []
     window_slug = window_name = None
 
-    if window and window in {w[0] for w in WINDOWS}:
-        window_slug = window
-        window_name = _window_name(window)
-        window_accounts = groups.get(window, [])
+    if window:
+        wslug = normalize_window_slug(window)
+        if wslug in groups:
+            window_slug = wslug
+            window_name = _window_name(wslug)
+            window_accounts = groups.get(wslug, [])
 
     if account_id:
         selected = get_account(account_id)  # только SQLite — мгновенно
@@ -653,8 +676,14 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
     # Правила автовывода и счётчики лимитов — только БД
     auto_rules: list = []
     withdraw_counts: dict = {}
+    account_withdraw_count = 0
+    account_limit_reached = False
+    account_limit_near = False
     if selected:
         auto_rules = list_auto_withdraw_rules(selected["id"])
+        account_withdraw_count = get_account_withdraw_count(selected["id"])
+        account_limit_reached = account_withdraw_count >= DAILY_WITHDRAW_LIMIT
+        account_limit_near = account_withdraw_count >= (DAILY_WITHDRAW_LIMIT - 1)
         for rule in auto_rules:
             cvu = rule.get("cvu", "")
             if cvu and cvu not in withdraw_counts:
@@ -667,7 +696,7 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
         "request":               request,
         "accounts":              accounts,
         "groups":                groups,
-        "window_list":           WINDOWS,
+        "window_list":           get_window_list(),
         "selected":              selected,
         "account_id":            account_id,
         "bank_types":            BANK_TYPES,
@@ -682,6 +711,9 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
         "auto_rules":            auto_rules,
         "withdraw_counts":       withdraw_counts,
         "daily_limit":           DAILY_WITHDRAW_LIMIT,
+        "account_withdraw_count": account_withdraw_count,
+        "account_limit_reached":  account_limit_reached,
+        "account_limit_near":     account_limit_near,
         "prefill": {
             "cvu": "", "destination": "", "amount": "",
             "concept": "VARIOS", "comments": "Varios (VAR)",
@@ -702,7 +734,7 @@ async def dashboard(request: Request):
         "request":      request,
         "accounts":     accounts,
         "groups":       groups,
-        "window_list":  WINDOWS,
+        "window_list":  get_window_list(),
         "current_user": _current_user(request),
         "account_id":   None,
         "selected":     None,
@@ -720,14 +752,48 @@ async def api_balance(account_id: int):
     if not acc:
         return JSONResponse({"error": "account not found"}, status_code=404)
     try:
-        # Запускаем синхронный (blocking) HTTP-драйвер в отдельном потоке,
-        # чтобы не блокировать asyncio event loop FastAPI.
         raw = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
         info = _normalize_balance(raw, acc["bank_type"])
         info.pop("raw_accounts", None)
+        info["account_withdraw_count"] = get_account_withdraw_count(account_id)
+        info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
         return info
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        err = str(e)
+        low = err.lower()
+        code = "bank_unavailable"
+        if any(x in low for x in ("proxyerror", "proxy", "tunnel connection failed", "cannot connect to proxy")):
+            code = "bank_unavailable"
+        elif any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
+            code = "token_expired"
+        return JSONResponse({
+            "error": err,
+            "error_meta": _error_payload(
+                code,
+                details=err,
+                suggestion=(
+                    "Откройте настройки карты и обновите токен, затем повторите обновление баланса."
+                    if code == "token_expired"
+                    else "Проверьте настройки прокси/сети и повторите через 1–2 минуты."
+                ),
+            ),
+        }, status_code=500)
+
+
+@app.get("/account/{account_id}/status")
+async def api_account_status(account_id: int):
+    acc = get_account(account_id)
+    if not acc:
+        return JSONResponse({"error": "account not found"}, status_code=404)
+
+    count = get_account_withdraw_count(account_id)
+    return JSONResponse({
+        "account_id": account_id,
+        "withdraw_count": count,
+        "withdraw_limit": DAILY_WITHDRAW_LIMIT,
+        "is_limit_reached": count >= DAILY_WITHDRAW_LIMIT,
+        "is_near_limit": count >= (DAILY_WITHDRAW_LIMIT - 1),
+    })
 
 
 @app.get("/account/{account_id}/activities")
@@ -745,15 +811,19 @@ async def api_activities(account_id: int):
         for act in (raw if isinstance(raw, list) else []):
             n = _normalize_activity(act)
             if n:
+                is_outgoing = bool(n.get("is_outgoing"))
+                full_name = (n.get("recipient") if is_outgoing else n.get("sender")) or "Не указано"
                 activities.append({
-                    "id":          n.get("id"),
-                    "title":       n.get("title"),
-                    "receipt_id":  n.get("receipt_id"),
-                    "amount":      n.get("amount"),
-                    "date_str":    n.get("date_str"),
-                    "is_outgoing": n.get("is_outgoing"),
-                    "sender":      n.get("sender"),
-                    "recipient":   n.get("recipient"),
+                    "id": n.get("id"),
+                    "title": n.get("title"),
+                    "receipt_id": n.get("receipt_id"),
+                    "amount": n.get("amount"),
+                    "date_str": n.get("date_str"),
+                    "is_outgoing": is_outgoing,
+                    "type": "outgoing" if is_outgoing else "incoming",
+                    "sender": n.get("sender"),
+                    "recipient": n.get("recipient"),
+                    "full_name": full_name,
                 })
         return JSONResponse({"activities": activities})
     except Exception as e:
@@ -809,6 +879,11 @@ async def multi_withdraw(request: Request):
         acc = get_account(int(acc_id))
         if not acc:
             return {"account_id": acc_id, "label": "?", "ok": False, "error": "Счёт не найден", "tid": None}
+        if is_account_withdraw_limit_reached(acc["id"]):
+            return {
+                "account_id": acc_id, "label": acc["label"], "ok": False,
+                "error": "Карта достигла лимита выводов", "tid": None,
+            }
         if is_withdraw_limit_reached(destination, acc["id"]):
             return {
                 "account_id": acc_id, "label": acc["label"], "ok": False,
@@ -826,6 +901,7 @@ async def multi_withdraw(request: Request):
                     destination=destination, amount=amt, comments=comments,
                 )
             increment_withdraw_count(destination, acc["id"])
+            increment_account_withdraw_count(acc["id"])
             tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
             return {"account_id": acc_id, "label": acc["label"], "ok": True, "error": None, "tid": tid}
         except Exception as e:
@@ -866,6 +942,9 @@ async def withdraw(
     if not dest:
         return RedirectResponse(url=f"/?account_id={account_id}&error=no_destination", status_code=302)
 
+    if is_account_withdraw_limit_reached(account_id):
+        return RedirectResponse(url=f"/?account_id={account_id}&error=account_limit_reached", status_code=302)
+
     # Проверка дневного лимита
     if is_withdraw_limit_reached(dest, account_id):
         return RedirectResponse(url=f"/?account_id={account_id}&error=limit_reached", status_code=302)
@@ -891,6 +970,7 @@ async def withdraw(
                 destination=dest, amount=amt, comments=comments,
             )
         increment_withdraw_count(dest, account_id)
+        increment_account_withdraw_count(account_id)
     except Exception as e:
         err_msg = str(e)
         if any(x in err_msg.lower() for x in ("rechazad", "rejected", "rechazo", "denied", "denegad")):
@@ -973,8 +1053,8 @@ async def add_account_page(request: Request, window: str = ""):
     return templates.TemplateResponse("add_account.html", {
         "request":         request,
         "bank_types":      BANK_TYPES,
-        "window_list":     WINDOWS,
-        "preselect_window":window or "glazars",
+        "window_list":     get_window_list(),
+        "preselect_window":normalize_window_slug(window or "glazars"),
         "accounts":        list_accounts(),
         "groups":          groups,
         "account_id":      None,
@@ -996,11 +1076,11 @@ async def add_account_post(
     proxy_password:   str = Form(""),
     proxy_raw:        str = Form(""),
     window:           str = Form("glazars"),
+    window_custom:    str = Form(""),
 ):
     if bank_type not in BANK_TYPES:
         return RedirectResponse(url="/add?error=invalid_bank", status_code=302)
-    if window not in {w[0] for w in WINDOWS}:
-        window = "glazars"
+    window = normalize_window_slug(window_custom or window)
     credentials = _parse_credentials(credentials_json)
     if not credentials and credentials_json.strip():
         return RedirectResponse(url="/add?error=invalid_json", status_code=302)
@@ -1022,7 +1102,7 @@ async def edit_account_page(request: Request, account_id: int):
     return templates.TemplateResponse("edit_account.html", {
         "request":      request,
         "account":      acc,
-        "window_list":  WINDOWS,
+        "window_list":  get_window_list(),
         "accounts":     list_accounts(),
         "groups":       groups,
         "account_id":   None,
@@ -1045,6 +1125,7 @@ async def edit_account_post(
     proxy_password:   str = Form(""),
     proxy_raw:        str = Form(""),
     window:           str = Form(""),
+    window_custom:    str = Form(""),
 ):
     acc = get_account(account_id)
     if not acc:
@@ -1059,16 +1140,15 @@ async def edit_account_post(
         db_update_account(account_id, label=label.strip())
     if credentials:
         db_update_account(account_id, credentials=credentials)
-    if window and window in {w[0] for w in WINDOWS}:
-        db_update_account(account_id, window=window)
+    db_update_account(account_id, window=normalize_window_slug(window_custom or window or acc.get("window") or "glazars"))
     return RedirectResponse(url=f"/?account_id={account_id}&success=updated", status_code=302)
 
 
 @app.post("/account/{account_id}/delete", response_class=RedirectResponse)
 async def delete_account(account_id: int, redirect_window: Optional[str] = Form(None)):
     db_delete_account(account_id)
-    if redirect_window and redirect_window in {w[0] for w in WINDOWS}:
-        return RedirectResponse(url=f"/?window={redirect_window}", status_code=302)
+    if redirect_window:
+        return RedirectResponse(url=f"/?window={normalize_window_slug(redirect_window)}", status_code=302)
     return RedirectResponse(url="/", status_code=302)
 
 
@@ -1086,7 +1166,7 @@ async def receipt(request: Request, account_id: int, transaction_id: str = ""):
     base_ctx = {
         "request": request, "account": acc,
         "transaction_id": transaction_id,
-        "groups": groups, "window_list": WINDOWS, "window_slug": None,
+        "groups": groups, "window_list": get_window_list(), "window_slug": None,
         "current_user": _current_user(request),
     }
 

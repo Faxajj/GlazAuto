@@ -6,15 +6,76 @@ import json
 import os
 import sqlite3
 import time
-from typing import List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 DB_PATH = "/var/www/app/accounts.db"
 
-WINDOWS = [
-    ("glazars", "GLAZARS"),
-    ("glaz3",   "GLAZ3"),
-    ("glaz6",   "GLAZ6"),
-]
+def _load_windows() -> List[Tuple[str, str]]:
+    """Список кабинетов можно расширять через env WINDOWS_CONFIG.
+
+    Формат: slug:Название,slug2:Название 2
+    Пример: glazars:GLAZ ARS,glaz3:Glaz3,glaz6:Glaz6
+    """
+    raw = (os.getenv("WINDOWS_CONFIG") or "").strip()
+    if not raw:
+        return [
+            ("glazars", "GLaz ars"),
+            ("glaz3", "Glaz3"),
+            ("glaz6", "Glaz6"),
+        ]
+
+    parsed: List[Tuple[str, str]] = []
+    for chunk in raw.split(","):
+        piece = chunk.strip()
+        if not piece:
+            continue
+        if ":" in piece:
+            slug, title = piece.split(":", 1)
+        else:
+            slug, title = piece, piece
+        slug = slug.strip().lower()
+        title = title.strip()
+        if slug and title:
+            parsed.append((slug, title))
+
+    return parsed or [
+        ("glazars", "GLaz ars"),
+        ("glaz3", "Glaz3"),
+        ("glaz6", "Glaz6"),
+    ]
+
+
+WINDOWS = _load_windows()
+
+
+def normalize_window_slug(value: str) -> str:
+    raw = (value or "").strip().lower().replace(" ", "")
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789_-"
+    slug = "".join(ch for ch in raw if ch in allowed)
+    return slug or "glazars"
+
+
+def _window_title_from_slug(slug: str) -> str:
+    s = normalize_window_slug(slug)
+    if s == "glazars":
+        return "GLaz ars"
+    if s.startswith("glaz") and s[4:].isdigit():
+        return "Glaz" + s[4:]
+    return s.upper() if len(s) <= 5 else s.capitalize()
+
+
+def get_window_list() -> List[Tuple[str, str]]:
+    configured = [(normalize_window_slug(slug), name) for slug, name in WINDOWS if slug]
+    by_slug = {slug: name for slug, name in configured}
+    with _get_conn() as conn:
+        rows = conn.execute("SELECT DISTINCT COALESCE(window, 'glazars') AS window FROM accounts").fetchall()
+    for row in rows:
+        slug = normalize_window_slug(row["window"])
+        if slug not in by_slug:
+            by_slug[slug] = _window_title_from_slug(slug)
+    return sorted(by_slug.items(), key=lambda x: x[1].lower())
+
 
 DAILY_WITHDRAW_LIMIT = 15
 
@@ -82,12 +143,21 @@ def init_db() -> None:
             count         INTEGER NOT NULL DEFAULT 0,
             UNIQUE(cvu, account_id, withdraw_date)
         );
+        CREATE TABLE IF NOT EXISTS account_withdraw_limits (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id    INTEGER NOT NULL,
+            withdraw_date TEXT NOT NULL,
+            count         INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(account_id, withdraw_date)
+        );
         CREATE INDEX IF NOT EXISTS idx_accounts_window_created
             ON accounts(window, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_auto_withdraw_active
             ON auto_withdraw_rules(is_active, account_id);
         CREATE INDEX IF NOT EXISTS idx_withdraw_limits_lookup
             ON withdraw_limits(cvu, account_id, withdraw_date);
+        CREATE INDEX IF NOT EXISTS idx_account_withdraw_limits_lookup
+            ON account_withdraw_limits(account_id, withdraw_date);
         CREATE INDEX IF NOT EXISTS idx_sessions_exp
             ON sessions(exp);
         """)
@@ -213,7 +283,7 @@ def list_accounts() -> List[dict]:
 
 def accounts_by_window() -> dict:
     accounts = list_accounts()
-    groups: dict = {slug: [] for slug, _ in WINDOWS}
+    groups: dict = {slug: [] for slug, _ in get_window_list()}
     for acc in accounts:
         w = acc.get("window") or "glazars"
         groups.setdefault(w, []).append(acc)
@@ -231,6 +301,7 @@ def get_account(account_id: int) -> Optional[dict]:
 
 
 def add_account(bank_type: str, label: str, credentials: dict, window: str = "glazars") -> int:
+    window = normalize_window_slug(window)
     with _get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO accounts (bank_type, label, credentials, window) VALUES (?, ?, ?, ?)",
@@ -256,7 +327,7 @@ def update_account(
                 (json.dumps(credentials), account_id),
             )
         if window is not None:
-            cur.execute("UPDATE accounts SET window = ? WHERE id = ?", (window, account_id))
+            cur.execute("UPDATE accounts SET window = ? WHERE id = ?", (normalize_window_slug(window), account_id))
         conn.commit()
         return cur.rowcount > 0
 
@@ -357,10 +428,16 @@ def update_auto_withdraw_progress(
 # ---------------------------------------------------------------------------
 
 def _msk_date_str() -> str:
-    """Текущая дата по МСК (UTC+3)."""
-    msk_ts = time.time() + 3 * 3600
-    t = time.gmtime(msk_ts)
-    return f"{t.tm_year:04d}-{t.tm_mon:02d}-{t.tm_mday:02d}"
+    """Операционный день по МСК.
+
+    Сброс лимитов — в 09:30 МСК (фактически с 09:30 до 10:00 идёт обновление).
+    До 09:30 считаем, что действует предыдущий операционный день.
+    """
+    msk = timezone(timedelta(hours=3))
+    now = datetime.now(msk)
+    reset_point = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    business_day = now.date() if now >= reset_point else (now - timedelta(days=1)).date()
+    return business_day.isoformat()
 
 
 def get_withdraw_count(cvu: str, account_id: int) -> int:
@@ -391,3 +468,41 @@ def increment_withdraw_count(cvu: str, account_id: int) -> int:
 
 def is_withdraw_limit_reached(cvu: str, account_id: int) -> bool:
     return get_withdraw_count(cvu, account_id) >= DAILY_WITHDRAW_LIMIT
+
+
+def get_account_withdraw_count(account_id: int) -> int:
+    today = _msk_date_str()
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT count FROM account_withdraw_limits WHERE account_id=? AND withdraw_date=?",
+                (account_id, today),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+    except sqlite3.OperationalError:
+        # Безопасный fallback для серверов со старой БД/неприменённой миграцией.
+        return 0
+
+
+def increment_account_withdraw_count(account_id: int) -> int:
+    today = _msk_date_str()
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO account_withdraw_limits (account_id, withdraw_date, count) VALUES (?,?,1) "
+                "ON CONFLICT(account_id, withdraw_date) DO UPDATE SET count = count + 1",
+                (account_id, today),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT count FROM account_withdraw_limits WHERE account_id=? AND withdraw_date=?",
+                (account_id, today),
+            ).fetchone()
+        return int(row["count"]) if row else 1
+    except sqlite3.OperationalError:
+        # Не роняем выводы, если таблица лимитов карты ещё не доступна.
+        return get_account_withdraw_count(account_id)
+
+
+def is_account_withdraw_limit_reached(account_id: int) -> bool:
+    return get_account_withdraw_count(account_id) >= DAILY_WITHDRAW_LIMIT

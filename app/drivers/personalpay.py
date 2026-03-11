@@ -7,6 +7,7 @@ import uuid
 from typing import Optional
 
 import requests
+from requests import exceptions as req_exc
 
 
 HTTP_TIMEOUT = (5, 12)  # (connect, read) — даём API время ответить, без лишнего ожидания
@@ -80,6 +81,22 @@ def _session(c: dict) -> requests.Session:
     return s
 
 
+
+
+def _request_with_proxy_fallback(method: str, c: dict, url: str, **kwargs):
+    """Выполняет запрос через прокси (если задан), и при ProxyError ретраит без прокси."""
+    session = _session(c)
+    try:
+        return session.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+    except req_exc.ProxyError:
+        # Если прокси сломан/заблокирован, делаем один безопасный retry напрямую.
+        if c.get("proxy") or c.get("http_proxy") or c.get("https_proxy"):
+            direct = dict(c)
+            direct["proxy"] = direct["http_proxy"] = direct["https_proxy"] = ""
+            session2 = _session(direct)
+            return session2.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+        raise
+
 def _get_token(session: requests.Session, c: dict) -> tuple:
     """Возвращает (значение для заголовка Authorization, paygilant_session_id).
     Personal Pay в перехвате шлёт Authorization без 'Bearer ' — только голый JWT. Так и отдаём."""
@@ -100,7 +117,7 @@ def _get_token(session: requests.Session, c: dict) -> tuple:
         "useCase": "signin",
         "pushNotifications": {"deviceToken": c["push_device_token"]},
     }
-    r = session.post(f"{c['base_url']}/authority/v4/login", headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+    r = _request_with_proxy_fallback("POST", c, f"{c['base_url']}/authority/v4/login", headers=headers, json=payload)
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Login failed: {r.status_code} {r.text[:500]}")
     body = r.json()
@@ -129,10 +146,9 @@ def get_accounts(credentials: dict) -> dict:
         "Authorization": token,
         "x-fraud-paygilant-session-id": paygilant,
     }
-    r = session.get(
-        f"{c['base_url']}/payments/accounts-service/v1/financial-accounts",
+    r = _request_with_proxy_fallback(
+        "GET", c, f"{c['base_url']}/payments/accounts-service/v1/financial-accounts",
         headers=headers,
-        timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
     return r.json()
@@ -225,10 +241,9 @@ def beneficiary_discovery(credentials: dict, destination: str) -> dict:
         "x-fraud-paygilant-session-id": paygilant,
     }
     dest = destination.strip()
-    r = session.get(
-        f"{c['base_url']}/payments/cashout/b2c-bff-service/transfers/beneficiary-discovery/{dest}",
+    r = _request_with_proxy_fallback(
+        "GET", c, f"{c['base_url']}/payments/cashout/b2c-bff-service/transfers/beneficiary-discovery/{dest}",
         headers=headers,
-        timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
     return r.json()
@@ -255,11 +270,10 @@ def create_withdraw(
         "destination": destination.strip(),
         "additionalInfo": {"sessionId": paygilant, "deviceId": c.get("device_id") or "no_device_id"},
     }
-    r = session.post(
-        f"{c['base_url']}/payments/cashout/b2c-bff-service/transferences/commit-outer",
+    r = _request_with_proxy_fallback(
+        "POST", c, f"{c['base_url']}/payments/cashout/b2c-bff-service/transferences/commit-outer",
         headers=headers,
         json=payload,
-        timeout=HTTP_TIMEOUT,
     )
     if r.status_code >= 400:
         try:
@@ -280,11 +294,10 @@ def get_activities_list(credentials: dict, offset: int = 0, limit: int = 15) -> 
         "x-fraud-paygilant-session-id": paygilant,
     }
     params = {"page[offset]": offset, "page[limit]": limit}
-    r = session.get(
-        f"{c['base_url']}/platform/transactional-activity/v1/activities-list",
+    r = _request_with_proxy_fallback(
+        "GET", c, f"{c['base_url']}/platform/transactional-activity/v1/activities-list",
         headers=headers,
         params=params,
-        timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
     return r.json()
@@ -309,7 +322,7 @@ def get_transference_details(credentials: dict, transaction_id: str) -> dict:
     ]:
         url = base.rstrip("/") + path
         try:
-            r = session.post(url, headers=headers, json=payload, timeout=HTTP_TIMEOUT)
+            r = _request_with_proxy_fallback("POST", c, url, headers=headers, json=payload)
             r.raise_for_status()
             return r.json()
         except Exception as e:
