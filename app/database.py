@@ -66,15 +66,88 @@ def _window_title_from_slug(slug: str) -> str:
 
 
 def get_window_list() -> List[Tuple[str, str]]:
-    configured = [(normalize_window_slug(slug), name) for slug, name in WINDOWS if slug]
-    by_slug = {slug: name for slug, name in configured}
-    with _get_conn() as conn:
-        rows = conn.execute("SELECT DISTINCT COALESCE(window, 'glazars') AS window FROM accounts").fetchall()
-    for row in rows:
-        slug = normalize_window_slug(row["window"])
+    """Возвращает список (slug, title) — приоритет: таблица windows, затем WINDOWS env, затем аккаунты."""
+    by_slug: dict = {}
+    sort_order: dict = {}
+
+    # 1. Из таблицы windows (созданные через интерфейс)
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute("SELECT slug, title, sort_order FROM windows ORDER BY sort_order, id").fetchall()
+        for r in rows:
+            slug = normalize_window_slug(r["slug"])
+            by_slug[slug] = r["title"]
+            sort_order[slug] = r["sort_order"]
+    except Exception:
+        pass
+
+    # 2. Из WINDOWS env / дефолтов (если не было в таблице)
+    for slug_raw, name in WINDOWS:
+        slug = normalize_window_slug(slug_raw)
         if slug not in by_slug:
-            by_slug[slug] = _window_title_from_slug(slug)
-    return sorted(by_slug.items(), key=lambda x: x[1].lower())
+            by_slug[slug] = name
+            sort_order[slug] = 999
+
+    # 3. Кабинеты из аккаунтов, которые не в списке выше
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute("SELECT DISTINCT COALESCE(window, 'glazars') AS window FROM accounts").fetchall()
+        for row in rows:
+            slug = normalize_window_slug(row["window"])
+            if slug not in by_slug:
+                by_slug[slug] = _window_title_from_slug(slug)
+                sort_order[slug] = 9999
+    except Exception:
+        pass
+
+    return sorted(by_slug.items(), key=lambda x: (sort_order.get(x[0], 9999), x[1].lower()))
+
+
+def add_window(slug: str, title: str) -> bool:
+    """Создаёт кабинет. Возвращает True если создан, False если уже существует."""
+    slug = normalize_window_slug(slug)
+    title = (title or "").strip()
+    if not slug or not title:
+        return False
+    try:
+        with _get_conn() as conn:
+            max_order = conn.execute("SELECT COALESCE(MAX(sort_order), 0) FROM windows").fetchone()[0]
+            conn.execute(
+                "INSERT INTO windows (slug, title, sort_order) VALUES (?, ?, ?)",
+                (slug, title, int(max_order) + 10),
+            )
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def update_window(slug: str, title: str) -> bool:
+    """Переименовывает кабинет."""
+    slug = normalize_window_slug(slug)
+    title = (title or "").strip()
+    if not slug or not title:
+        return False
+    with _get_conn() as conn:
+        cur = conn.execute("UPDATE windows SET title = ? WHERE slug = ?", (title, slug))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def delete_window(slug: str) -> bool:
+    """Удаляет кабинет (аккаунты остаются, просто переходят в разряд неизвестных)."""
+    slug = normalize_window_slug(slug)
+    with _get_conn() as conn:
+        cur = conn.execute("DELETE FROM windows WHERE slug = ?", (slug,))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def window_exists(slug: str) -> bool:
+    slug = normalize_window_slug(slug)
+    with _get_conn() as conn:
+        row = conn.execute("SELECT 1 FROM windows WHERE slug = ?", (slug,)).fetchone()
+    return row is not None
 
 
 DAILY_WITHDRAW_LIMIT = 15
@@ -158,6 +231,13 @@ def init_db() -> None:
             ON withdraw_limits(cvu, account_id, withdraw_date);
         CREATE INDEX IF NOT EXISTS idx_account_withdraw_limits_lookup
             ON account_withdraw_limits(account_id, withdraw_date);
+        CREATE TABLE IF NOT EXISTS windows (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug       TEXT UNIQUE NOT NULL,
+            title      TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE INDEX IF NOT EXISTS idx_sessions_exp
             ON sessions(exp);
         """)

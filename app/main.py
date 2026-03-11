@@ -47,6 +47,10 @@ from app.database import (
     update_account as db_update_account,
     update_auto_withdraw_progress,
     verify_password,
+    add_window as db_add_window,
+    update_window as db_update_window,
+    delete_window as db_delete_window,
+    window_exists,
 )
 from app.drivers import (
     BANK_TYPES,
@@ -765,7 +769,6 @@ async def api_balance(account_id: int):
         if any(x in low for x in ("proxyerror", "proxy", "tunnel connection failed", "cannot connect to proxy")):
             code = "bank_unavailable"
         elif any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
-        if any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
             code = "token_expired"
         return JSONResponse({
             "error": err,
@@ -777,7 +780,6 @@ async def api_balance(account_id: int):
                     if code == "token_expired"
                     else "Проверьте настройки прокси/сети и повторите через 1–2 минуты."
                 ),
-                suggestion="Откройте настройки карты и обновите токен, затем повторите обновление баланса." if code == "token_expired" else "Проверьте интернет/прокси и повторите через 1–2 минуты.",
             ),
         }, status_code=500)
 
@@ -1245,6 +1247,61 @@ async def discover(request: Request, account_id: int, destination: str = ""):
         return HTMLResponse(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
     except Exception as e:
         return HTMLResponse(content=json.dumps({"error": str(e)}), media_type="application/json")
+
+
+# ---------------------------------------------------------------------------
+# Управление кабинетами (Windows) через интерфейс
+# ---------------------------------------------------------------------------
+
+@app.get("/windows", response_class=HTMLResponse)
+async def windows_page(request: Request):
+    """Страница управления кабинетами."""
+    groups = accounts_by_window()
+    return templates.TemplateResponse("windows.html", {
+        "request":      request,
+        "window_list":  get_window_list(),
+        "groups":       groups,
+        "accounts":     list_accounts(),
+        "account_id":   None,
+        "selected":     None,
+        "window_slug":  None,
+        "current_user": _current_user(request),
+        "error":        request.query_params.get("error", ""),
+        "success":      request.query_params.get("success", ""),
+    })
+
+
+@app.post("/windows/add", response_class=RedirectResponse)
+async def windows_add(
+    slug:  str = Form(""),
+    title: str = Form(""),
+):
+    slug = normalize_window_slug(slug)
+    title = title.strip()
+    if not slug or not title:
+        return RedirectResponse(url="/windows?error=empty_fields", status_code=302)
+    if window_exists(slug):
+        return RedirectResponse(url="/windows?error=already_exists", status_code=302)
+    db_add_window(slug, title)
+    return RedirectResponse(url=f"/windows?success=created&slug={slug}", status_code=302)
+
+
+@app.post("/windows/{slug}/rename", response_class=RedirectResponse)
+async def windows_rename(slug: str, title: str = Form("")):
+    title = title.strip()
+    if not title:
+        return RedirectResponse(url="/windows?error=empty_title", status_code=302)
+    db_update_window(slug, title)
+    return RedirectResponse(url="/windows?success=renamed", status_code=302)
+
+
+@app.post("/windows/{slug}/delete", response_class=RedirectResponse)
+async def windows_delete(slug: str):
+    groups = accounts_by_window()
+    if groups.get(normalize_window_slug(slug)):
+        return RedirectResponse(url="/windows?error=has_accounts", status_code=302)
+    db_delete_window(slug)
+    return RedirectResponse(url="/windows?success=deleted", status_code=302)
 
 
 @app.get("/health")
