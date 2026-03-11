@@ -765,6 +765,7 @@ async def api_balance(account_id: int):
         if any(x in low for x in ("proxyerror", "proxy", "tunnel connection failed", "cannot connect to proxy")):
             code = "bank_unavailable"
         elif any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
+        if any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
             code = "token_expired"
         return JSONResponse({
             "error": err,
@@ -776,6 +777,7 @@ async def api_balance(account_id: int):
                     if code == "token_expired"
                     else "Проверьте настройки прокси/сети и повторите через 1–2 минуты."
                 ),
+                suggestion="Откройте настройки карты и обновите токен, затем повторите обновление баланса." if code == "token_expired" else "Проверьте интернет/прокси и повторите через 1–2 минуты.",
             ),
         }, status_code=500)
 
