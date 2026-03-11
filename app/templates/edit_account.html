@@ -18,6 +18,8 @@
         <option value="{{ slug }}" {% if (account.window or 'glazars') == slug %}selected{% endif %}>{{ name }}</option>
         {% endfor %}
       </select>
+      <p class="form-hint">Или укажите новый кабинет вручную (например: <code>glaz7</code>).</p>
+      <input id="window_custom" name="window_custom" type="text" placeholder="Новый slug кабинета (опционально)" />
     </div>
     <div class="form-row">
       <label for="label">Название (как показывать в списке) *</label>

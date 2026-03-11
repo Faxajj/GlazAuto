@@ -20,7 +20,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.database import (
     DAILY_WITHDRAW_LIMIT,
-    WINDOWS,
+    get_window_list,
+    normalize_window_slug,
     accounts_by_window,
     add_account as db_add_account,
     add_auto_withdraw_rule,
@@ -100,7 +101,6 @@ init_db()
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
-templates.env.filters["tojson"] = lambda obj, indent=2: json.dumps(obj, indent=indent, ensure_ascii=False)
 templates.env.filters["ars"]    = lambda value, decimals=2: _format_ars(value, decimals)
 
 
@@ -132,7 +132,7 @@ def _current_user(request: Request) -> Optional[dict]:
 
 
 def _window_name(slug: str) -> str:
-    return next((name for s, name in WINDOWS if s == slug), slug)
+    return next((name for s, name in get_window_list() if s == slug), slug)
 
 
 def _parse_amount(raw: str) -> Optional[float]:
@@ -654,10 +654,12 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
     window_accounts: list = []
     window_slug = window_name = None
 
-    if window and window in {w[0] for w in WINDOWS}:
-        window_slug = window
-        window_name = _window_name(window)
-        window_accounts = groups.get(window, [])
+    if window:
+        wslug = normalize_window_slug(window)
+        if wslug in groups:
+            window_slug = wslug
+            window_name = _window_name(wslug)
+            window_accounts = groups.get(wslug, [])
 
     if account_id:
         selected = get_account(account_id)  # только SQLite — мгновенно
@@ -694,7 +696,7 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
         "request":               request,
         "accounts":              accounts,
         "groups":                groups,
-        "window_list":           WINDOWS,
+        "window_list":           get_window_list(),
         "selected":              selected,
         "account_id":            account_id,
         "bank_types":            BANK_TYPES,
@@ -732,7 +734,7 @@ async def dashboard(request: Request):
         "request":      request,
         "accounts":     accounts,
         "groups":       groups,
-        "window_list":  WINDOWS,
+        "window_list":  get_window_list(),
         "current_user": _current_user(request),
         "account_id":   None,
         "selected":     None,
@@ -760,6 +762,9 @@ async def api_balance(account_id: int):
         err = str(e)
         low = err.lower()
         code = "bank_unavailable"
+        if any(x in low for x in ("proxyerror", "proxy", "tunnel connection failed", "cannot connect to proxy")):
+            code = "bank_unavailable"
+        elif any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
         if any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
             code = "token_expired"
         return JSONResponse({
@@ -767,6 +772,11 @@ async def api_balance(account_id: int):
             "error_meta": _error_payload(
                 code,
                 details=err,
+                suggestion=(
+                    "Откройте настройки карты и обновите токен, затем повторите обновление баланса."
+                    if code == "token_expired"
+                    else "Проверьте настройки прокси/сети и повторите через 1–2 минуты."
+                ),
                 suggestion="Откройте настройки карты и обновите токен, затем повторите обновление баланса." if code == "token_expired" else "Проверьте интернет/прокси и повторите через 1–2 минуты.",
             ),
         }, status_code=500)
@@ -1045,8 +1055,8 @@ async def add_account_page(request: Request, window: str = ""):
     return templates.TemplateResponse("add_account.html", {
         "request":         request,
         "bank_types":      BANK_TYPES,
-        "window_list":     WINDOWS,
-        "preselect_window":window or "glazars",
+        "window_list":     get_window_list(),
+        "preselect_window":normalize_window_slug(window or "glazars"),
         "accounts":        list_accounts(),
         "groups":          groups,
         "account_id":      None,
@@ -1068,11 +1078,11 @@ async def add_account_post(
     proxy_password:   str = Form(""),
     proxy_raw:        str = Form(""),
     window:           str = Form("glazars"),
+    window_custom:    str = Form(""),
 ):
     if bank_type not in BANK_TYPES:
         return RedirectResponse(url="/add?error=invalid_bank", status_code=302)
-    if window not in {w[0] for w in WINDOWS}:
-        window = "glazars"
+    window = normalize_window_slug(window_custom or window)
     credentials = _parse_credentials(credentials_json)
     if not credentials and credentials_json.strip():
         return RedirectResponse(url="/add?error=invalid_json", status_code=302)
@@ -1094,7 +1104,7 @@ async def edit_account_page(request: Request, account_id: int):
     return templates.TemplateResponse("edit_account.html", {
         "request":      request,
         "account":      acc,
-        "window_list":  WINDOWS,
+        "window_list":  get_window_list(),
         "accounts":     list_accounts(),
         "groups":       groups,
         "account_id":   None,
@@ -1117,6 +1127,7 @@ async def edit_account_post(
     proxy_password:   str = Form(""),
     proxy_raw:        str = Form(""),
     window:           str = Form(""),
+    window_custom:    str = Form(""),
 ):
     acc = get_account(account_id)
     if not acc:
@@ -1131,16 +1142,15 @@ async def edit_account_post(
         db_update_account(account_id, label=label.strip())
     if credentials:
         db_update_account(account_id, credentials=credentials)
-    if window and window in {w[0] for w in WINDOWS}:
-        db_update_account(account_id, window=window)
+    db_update_account(account_id, window=normalize_window_slug(window_custom or window or acc.get("window") or "glazars"))
     return RedirectResponse(url=f"/?account_id={account_id}&success=updated", status_code=302)
 
 
 @app.post("/account/{account_id}/delete", response_class=RedirectResponse)
 async def delete_account(account_id: int, redirect_window: Optional[str] = Form(None)):
     db_delete_account(account_id)
-    if redirect_window and redirect_window in {w[0] for w in WINDOWS}:
-        return RedirectResponse(url=f"/?window={redirect_window}", status_code=302)
+    if redirect_window:
+        return RedirectResponse(url=f"/?window={normalize_window_slug(redirect_window)}", status_code=302)
     return RedirectResponse(url="/", status_code=302)
 
 
@@ -1158,7 +1168,7 @@ async def receipt(request: Request, account_id: int, transaction_id: str = ""):
     base_ctx = {
         "request": request, "account": acc,
         "transaction_id": transaction_id,
-        "groups": groups, "window_list": WINDOWS, "window_slug": None,
+        "groups": groups, "window_list": get_window_list(), "window_slug": None,
         "current_user": _current_user(request),
     }
 

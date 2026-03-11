@@ -48,6 +48,35 @@ def _load_windows() -> List[Tuple[str, str]]:
 
 WINDOWS = _load_windows()
 
+
+def normalize_window_slug(value: str) -> str:
+    raw = (value or "").strip().lower().replace(" ", "")
+    allowed = "abcdefghijklmnopqrstuvwxyz0123456789_-"
+    slug = "".join(ch for ch in raw if ch in allowed)
+    return slug or "glazars"
+
+
+def _window_title_from_slug(slug: str) -> str:
+    s = normalize_window_slug(slug)
+    if s == "glazars":
+        return "GLaz ars"
+    if s.startswith("glaz") and s[4:].isdigit():
+        return "Glaz" + s[4:]
+    return s.upper() if len(s) <= 5 else s.capitalize()
+
+
+def get_window_list() -> List[Tuple[str, str]]:
+    configured = [(normalize_window_slug(slug), name) for slug, name in WINDOWS if slug]
+    by_slug = {slug: name for slug, name in configured}
+    with _get_conn() as conn:
+        rows = conn.execute("SELECT DISTINCT COALESCE(window, 'glazars') AS window FROM accounts").fetchall()
+    for row in rows:
+        slug = normalize_window_slug(row["window"])
+        if slug not in by_slug:
+            by_slug[slug] = _window_title_from_slug(slug)
+    return sorted(by_slug.items(), key=lambda x: x[1].lower())
+
+
 DAILY_WITHDRAW_LIMIT = 15
 
 
@@ -254,7 +283,7 @@ def list_accounts() -> List[dict]:
 
 def accounts_by_window() -> dict:
     accounts = list_accounts()
-    groups: dict = {slug: [] for slug, _ in WINDOWS}
+    groups: dict = {slug: [] for slug, _ in get_window_list()}
     for acc in accounts:
         w = acc.get("window") or "glazars"
         groups.setdefault(w, []).append(acc)
@@ -272,6 +301,7 @@ def get_account(account_id: int) -> Optional[dict]:
 
 
 def add_account(bank_type: str, label: str, credentials: dict, window: str = "glazars") -> int:
+    window = normalize_window_slug(window)
     with _get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO accounts (bank_type, label, credentials, window) VALUES (?, ?, ?, ?)",
@@ -297,7 +327,7 @@ def update_account(
                 (json.dumps(credentials), account_id),
             )
         if window is not None:
-            cur.execute("UPDATE accounts SET window = ? WHERE id = ?", (window, account_id))
+            cur.execute("UPDATE accounts SET window = ? WHERE id = ?", (normalize_window_slug(window), account_id))
         conn.commit()
         return cur.rowcount > 0
 
