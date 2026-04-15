@@ -112,6 +112,12 @@ templates.env.filters["ars"]    = lambda value, decimals=2: _format_ars(value, d
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+def _is_pp_internal_cvu(destination: str) -> bool:
+    """Возвращает True если получатель — внутренняя карта Personal Pay (префикс 00000765).
+    Для таких переводов лимиты выводов не применяются."""
+    return (destination or "").strip().startswith("00000765")
+
+
 def _format_ars(value, decimals: int = 2) -> str:
     try:
         num = float(value)
@@ -539,17 +545,19 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
         update_auto_withdraw_progress(rule["id"], last_error="Некорректная сумма", is_active=False)
         return False, "Некорректная сумма"
 
-    if is_account_withdraw_limit_reached(acc["id"]):
-        msg = f"Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT})"
-        update_auto_withdraw_progress(rule["id"], last_error=msg)
-        return False, msg
-
-    # Проверка дневного лимита по CVU
+    # Лимиты не применяются для внутренних карт PP (префикс 00000765)
     cvu = rule.get("cvu", "")
-    if is_withdraw_limit_reached(cvu, acc["id"]):
-        msg = f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут для CVU {cvu}"
-        update_auto_withdraw_progress(rule["id"], last_error=msg)
-        return False, msg
+    if not _is_pp_internal_cvu(cvu):
+        if is_account_withdraw_limit_reached(acc["id"]):
+            msg = f"Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT})"
+            update_auto_withdraw_progress(rule["id"], last_error=msg)
+            return False, msg
+
+        # Проверка дневного лимита по CVU
+        if is_withdraw_limit_reached(cvu, acc["id"]):
+            msg = f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут для CVU {cvu}"
+            update_auto_withdraw_progress(rule["id"], last_error=msg)
+            return False, msg
 
     # Проверка минимального баланса
     min_balance = float(rule.get("min_balance") or 0)
@@ -883,16 +891,18 @@ async def multi_withdraw(request: Request):
         acc = get_account(int(acc_id))
         if not acc:
             return {"account_id": acc_id, "label": "?", "ok": False, "error": "Счёт не найден", "tid": None}
-        if is_account_withdraw_limit_reached(acc["id"]):
-            return {
-                "account_id": acc_id, "label": acc["label"], "ok": False,
-                "error": "Карта достигла лимита выводов", "tid": None,
-            }
-        if is_withdraw_limit_reached(destination, acc["id"]):
-            return {
-                "account_id": acc_id, "label": acc["label"], "ok": False,
-                "error": f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут", "tid": None,
-            }
+        # Лимиты не применяются для внутренних карт PP (префикс 00000765)
+        if not _is_pp_internal_cvu(destination):
+            if is_account_withdraw_limit_reached(acc["id"]):
+                return {
+                    "account_id": acc_id, "label": acc["label"], "ok": False,
+                    "error": "Карта достигла лимита выводов", "tid": None,
+                }
+            if is_withdraw_limit_reached(destination, acc["id"]):
+                return {
+                    "account_id": acc_id, "label": acc["label"], "ok": False,
+                    "error": f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут", "tid": None,
+                }
         try:
             if acc["bank_type"] == "universalcoins":
                 result = await asyncio.to_thread(
@@ -946,12 +956,14 @@ async def withdraw(
     if not dest:
         return RedirectResponse(url=f"/?account_id={account_id}&error=no_destination", status_code=302)
 
-    if is_account_withdraw_limit_reached(account_id):
-        return RedirectResponse(url=f"/?account_id={account_id}&error=account_limit_reached", status_code=302)
+    # Лимиты не применяются для внутренних карт PP (префикс 00000765)
+    if not _is_pp_internal_cvu(dest):
+        if is_account_withdraw_limit_reached(account_id):
+            return RedirectResponse(url=f"/?account_id={account_id}&error=account_limit_reached", status_code=302)
 
-    # Проверка дневного лимита
-    if is_withdraw_limit_reached(dest, account_id):
-        return RedirectResponse(url=f"/?account_id={account_id}&error=limit_reached", status_code=302)
+        # Проверка дневного лимита
+        if is_withdraw_limit_reached(dest, account_id):
+            return RedirectResponse(url=f"/?account_id={account_id}&error=limit_reached", status_code=302)
 
     try:
         if acc["bank_type"] == "universalcoins":
