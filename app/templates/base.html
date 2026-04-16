@@ -12,7 +12,22 @@
       <h1>Banks Dashboard</h1>
       <p class="header-sub">Несколько аккаунтов — переключение в один клик</p>
     </div>
-    <div style="display:flex;align-items:center;gap:0.75rem">
+    <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap">
+      <!-- Виджет курса USDT/ARS Bybit P2P -->
+      <div id="rate-widget" style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:0.4rem 0.85rem;font-size:0.8rem;cursor:pointer;user-select:none;min-width:160px" title="USDT/ARS — Bybit P2P. Нажми для обновления">
+        <div style="color:#475569;font-size:0.7rem;margin-bottom:0.1rem;display:flex;justify-content:space-between;align-items:center">
+          <span>USDT/ARS · Bybit P2P</span>
+          <span id="rate-age" style="color:#334155"></span>
+        </div>
+        <div style="display:flex;align-items:center;gap:0.5rem">
+          <span id="rate-buy"  style="color:#34d399;font-weight:700;font-size:0.92rem">—</span>
+          <span style="color:#334155">/</span>
+          <span id="rate-sell" style="color:#f87171;font-weight:700;font-size:0.92rem">—</span>
+        </div>
+        <div style="margin-top:0.3rem;height:28px;position:relative">
+          <canvas id="rate-chart" style="width:100%;height:28px;display:block"></canvas>
+        </div>
+      </div>
       <a href="/dashboard" class="btn-table btn-open" style="text-decoration:none">📊 Обзор</a>
       <a href="/windows" class="btn-table btn-edit" style="text-decoration:none">🗂 Кабинеты</a>
       {% if current_user %}
@@ -344,5 +359,180 @@
   </div>
 
   {% block extra_js %}{% endblock %}
+
+  <script>
+  // ── USDT/ARS Rate Widget ────────────────────────────────────────────────
+  (function(){
+    var STORAGE_KEY = 'usdt_ars_history';
+    var MAX_POINTS  = 288; // 24ч по 1 точке в 5 мин = 288 точек
+
+    // Загружаем историю из localStorage
+    function loadHistory(){
+      try {
+        var raw = localStorage.getItem(STORAGE_KEY);
+        return raw ? JSON.parse(raw) : [];
+      } catch(e){ return []; }
+    }
+
+    // Сохраняем точку в историю
+    function pushHistory(buyAvg, sellAvg, ts){
+      var hist = loadHistory();
+      // Не дублируем если та же минута
+      var lastTs = hist.length ? hist[hist.length-1].ts : 0;
+      if(ts - lastTs < 55) return hist;
+      hist.push({ ts: ts, b: buyAvg, s: sellAvg });
+      // Обрезаем до MAX_POINTS
+      if(hist.length > MAX_POINTS) hist = hist.slice(hist.length - MAX_POINTS);
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(hist)); } catch(e){}
+      return hist;
+    }
+
+    // Рисуем мини-график на canvas
+    function drawChart(history){
+      var canvas = document.getElementById('rate-chart');
+      if(!canvas || !canvas.getContext) return;
+
+      // Подгоняем размер под реальные пиксели
+      var rect = canvas.parentElement.getBoundingClientRect();
+      var W = Math.max(rect.width || 160, 160);
+      var H = 28;
+      canvas.width  = W * window.devicePixelRatio;
+      canvas.height = H * window.devicePixelRatio;
+      canvas.style.width  = W + 'px';
+      canvas.style.height = H + 'px';
+
+      var ctx = canvas.getContext('2d');
+      ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+      ctx.clearRect(0, 0, W, H);
+
+      if(history.length < 2) return;
+
+      // Берём только последние 96 точек (8ч) для наглядности
+      var pts = history.slice(-96);
+      var buys  = pts.map(function(p){ return p.b; }).filter(function(v){ return v != null; });
+      var sells = pts.map(function(p){ return p.s; }).filter(function(v){ return v != null; });
+      var allVals = buys.concat(sells);
+      if(!allVals.length) return;
+
+      var minV = Math.min.apply(null, allVals);
+      var maxV = Math.max.apply(null, allVals);
+      var range = maxV - minV || 1;
+
+      function toY(v){ return H - 2 - ((v - minV) / range) * (H - 4); }
+      function toX(i){ return (i / (pts.length - 1)) * W; }
+
+      // Рисуем линию buy (зелёная)
+      ctx.beginPath();
+      ctx.strokeStyle = '#34d399';
+      ctx.lineWidth = 1.5;
+      var started = false;
+      pts.forEach(function(p, i){
+        if(p.b == null) return;
+        if(!started){ ctx.moveTo(toX(i), toY(p.b)); started=true; }
+        else ctx.lineTo(toX(i), toY(p.b));
+      });
+      ctx.stroke();
+
+      // Рисуем линию sell (красная)
+      ctx.beginPath();
+      ctx.strokeStyle = '#f87171';
+      ctx.lineWidth = 1.5;
+      started = false;
+      pts.forEach(function(p, i){
+        if(p.s == null) return;
+        if(!started){ ctx.moveTo(toX(i), toY(p.s)); started=true; }
+        else ctx.lineTo(toX(i), toY(p.s));
+      });
+      ctx.stroke();
+    }
+
+    // Форматирование числа
+    function fmtRate(v){
+      if(v == null) return '—';
+      return v.toLocaleString('es-AR', {minimumFractionDigits:2, maximumFractionDigits:2});
+    }
+
+    // Возраст данных
+    function ageLabel(ts){
+      var diff = Math.floor(Date.now()/1000 - ts);
+      if(diff < 5)  return 'сейчас';
+      if(diff < 60) return diff + 'с';
+      return Math.floor(diff/60) + 'м';
+    }
+
+    var buyEl  = document.getElementById('rate-buy');
+    var sellEl = document.getElementById('rate-sell');
+    var ageEl  = document.getElementById('rate-age');
+    var widget = document.getElementById('rate-widget');
+
+    // Показываем сохранённые данные мгновенно при загрузке
+    var hist = loadHistory();
+    if(hist.length){
+      var last = hist[hist.length-1];
+      if(buyEl)  buyEl.textContent  = fmtRate(last.b);
+      if(sellEl) sellEl.textContent = fmtRate(last.s);
+      drawChart(hist);
+    }
+
+    var _loading = false;
+
+    function fetchRate(){
+      if(_loading) return;
+      _loading = true;
+      if(ageEl) ageEl.textContent = '...';
+
+      fetch('/api/bybit-rate')
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          _loading = false;
+          if(d.error){
+            if(ageEl) ageEl.textContent = '⚠';
+            return;
+          }
+          var buy  = d.buy_avg;
+          var sell = d.sell_avg;
+          var ts   = d.ts || Math.floor(Date.now()/1000);
+
+          if(buyEl)  buyEl.textContent  = fmtRate(buy);
+          if(sellEl) sellEl.textContent = fmtRate(sell);
+          if(ageEl)  ageEl.textContent  = ageLabel(ts);
+
+          // Цвет изменения
+          var hist = loadHistory();
+          if(hist.length && buy != null){
+            var prev = hist[hist.length-1].b;
+            buyEl.style.color  = buy  > prev ? '#6ee7b7' : buy  < prev ? '#fca5a5' : '#34d399';
+            sellEl.style.color = sell > (hist[hist.length-1].s||sell) ? '#fca5a5' : '#f87171';
+          }
+
+          // Сохраняем и перерисовываем
+          var updated = pushHistory(buy, sell, ts);
+          drawChart(updated);
+        })
+        .catch(function(){
+          _loading = false;
+          if(ageEl) ageEl.textContent = '⚠';
+        });
+    }
+
+    // Клик — принудительное обновление
+    if(widget) widget.addEventListener('click', function(){ fetchRate(); });
+
+    // Первый запрос
+    fetchRate();
+
+    // Обновление каждую минуту
+    setInterval(fetchRate, 60000);
+
+    // Обновляем возраст каждые 15 сек
+    setInterval(function(){
+      var hist = loadHistory();
+      if(hist.length && ageEl){
+        ageEl.textContent = ageLabel(hist[hist.length-1].ts);
+      }
+    }, 15000);
+
+  })();
+  </script>
 </body>
 </html>
