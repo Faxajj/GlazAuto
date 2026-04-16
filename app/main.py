@@ -1316,6 +1316,86 @@ async def windows_delete(slug: str):
     return RedirectResponse(url="/windows?success=deleted", status_code=302)
 
 
+# ---------------------------------------------------------------------------
+# Виджет курса USDT/ARS — Bybit P2P
+# ---------------------------------------------------------------------------
+
+# Кэш чтобы не спамить внешний API
+_rate_cache: dict = {"ts": 0, "data": None}
+_RATE_CACHE_TTL = 60  # секунд
+
+async def _fetch_bybit_p2p() -> dict:
+    """Получает топ-10 объявлений Bybit P2P USDT/ARS (buy + sell),
+    считает среднюю цену по каждой стороне."""
+    import httpx, statistics
+
+    async def fetch_side(side: str) -> list:
+        url = "https://api2.bybit.com/fiat/otc/item/online"
+        payload = {
+            "tokenId": "USDT",
+            "currencyId": "ARS",
+            "payment": [],
+            "side": "0" if side == "buy" else "1",  # 0=buy, 1=sell
+            "size": "10",
+            "page": "1",
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(url, json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
+        items = (data.get("result") or {}).get("items") or []
+        prices = []
+        for item in items[:10]:
+            try:
+                prices.append(float(item["price"]))
+            except Exception:
+                pass
+        return prices
+
+    buy_prices, sell_prices = await asyncio.gather(
+        fetch_side("buy"),
+        fetch_side("sell"),
+    )
+
+    buy_avg  = round(statistics.mean(buy_prices),  2) if buy_prices  else None
+    sell_avg = round(statistics.mean(sell_prices), 2) if sell_prices else None
+    buy_best  = min(buy_prices)  if buy_prices  else None
+    sell_best = max(sell_prices) if sell_prices else None
+
+    return {
+        "buy_avg":   buy_avg,
+        "sell_avg":  sell_avg,
+        "buy_best":  buy_best,
+        "sell_best": sell_best,
+        "buy_count":  len(buy_prices),
+        "sell_count": len(sell_prices),
+        "ts": int(time.time()),
+    }
+
+
+@app.get("/api/bybit-rate")
+async def api_bybit_rate():
+    """Возвращает текущий курс USDT/ARS с Bybit P2P.
+    Кэшируется на 60 секунд."""
+    global _rate_cache
+    now = time.time()
+    if _rate_cache["data"] and (now - _rate_cache["ts"]) < _RATE_CACHE_TTL:
+        return JSONResponse({**_rate_cache["data"], "cached": True})
+    try:
+        data = await _fetch_bybit_p2p()
+        _rate_cache = {"ts": now, "data": data}
+        return JSONResponse({**data, "cached": False})
+    except Exception as e:
+        # Возвращаем кэш если есть, иначе ошибку
+        if _rate_cache["data"]:
+            return JSONResponse({**_rate_cache["data"], "cached": True, "stale": True})
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
