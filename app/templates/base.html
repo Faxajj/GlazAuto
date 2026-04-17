@@ -17,7 +17,10 @@
       <div id="rate-widget" style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:0.4rem 0.85rem;font-size:0.8rem;cursor:pointer;user-select:none;min-width:160px" title="USDT/ARS — Bybit P2P. Нажми для обновления">
         <div style="color:#475569;font-size:0.7rem;margin-bottom:0.1rem;display:flex;justify-content:space-between;align-items:center">
           <span>USDT/ARS · Bybit P2P</span>
-          <span id="rate-age" style="color:#334155"></span>
+          <div style="display:flex;align-items:center;gap:0.4rem">
+            <span id="rate-age" style="color:#334155"></span>
+            <a href="/rates" title="Открыть полный график" style="color:#475569;text-decoration:none;font-size:0.85rem;line-height:1;padding:0 2px" onclick="event.stopPropagation()">☰</a>
+          </div>
         </div>
         <div style="display:flex;align-items:center;gap:0.5rem">
           <span id="rate-buy"  style="color:#34d399;font-weight:700;font-size:0.92rem">—</span>

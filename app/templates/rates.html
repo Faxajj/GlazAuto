@@ -1,0 +1,416 @@
+{% extends "base.html" %}
+{% block title %}Курс USDT/ARS — Banks Dashboard{% endblock %}
+
+{% block content %}
+<section class="card" style="padding:1.5rem">
+
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;margin-bottom:1.5rem">
+    <div>
+      <h2 style="margin:0;font-size:1.2rem">📈 USDT / ARS</h2>
+      <p style="margin:0.25rem 0 0;color:#475569;font-size:0.8rem">Bybit P2P · Средняя по топ-10 · Время МСК (UTC+3)</p>
+    </div>
+    <div style="display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap">
+      <div>
+        <div style="font-size:0.7rem;color:#475569;margin-bottom:0.1rem">Текущий курс</div>
+        <div id="cur-price" style="font-size:1.6rem;font-weight:700;color:#34d399;font-variant-numeric:tabular-nums">—</div>
+      </div>
+      <div>
+        <div style="font-size:0.7rem;color:#475569;margin-bottom:0.1rem">Изменение за 24ч</div>
+        <div id="cur-change" style="font-size:1rem;font-weight:600;color:#64748b">—</div>
+      </div>
+      <div>
+        <div style="font-size:0.7rem;color:#475569;margin-bottom:0.1rem">Мин / Макс</div>
+        <div id="cur-minmax" style="font-size:0.9rem;color:#94a3b8;font-variant-numeric:tabular-nums">— / —</div>
+      </div>
+      <button id="btn-refresh" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;border-radius:8px;padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">↻ Обновить</button>
+    </div>
+  </div>
+
+  <!-- Кнопки периода -->
+  <div style="display:flex;gap:0.4rem;margin-bottom:1rem" id="period-btns">
+    <button class="period-btn active" data-hours="3">3ч</button>
+    <button class="period-btn" data-hours="6">6ч</button>
+    <button class="period-btn" data-hours="12">12ч</button>
+    <button class="period-btn" data-hours="24">24ч</button>
+    <button class="period-btn" data-hours="0">Всё</button>
+  </div>
+
+  <!-- Канвас графика -->
+  <div style="position:relative;width:100%;height:360px;background:#0a1628;border-radius:12px;overflow:hidden;border:1px solid #1e293b">
+    <canvas id="main-chart" style="display:block;width:100%;height:100%"></canvas>
+    <!-- Тултип -->
+    <div id="chart-tooltip" style="display:none;position:absolute;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:0.5rem 0.75rem;font-size:0.8rem;pointer-events:none;z-index:10;white-space:nowrap">
+      <div id="tt-time" style="color:#64748b;margin-bottom:0.2rem"></div>
+      <div id="tt-price" style="color:#34d399;font-weight:700;font-size:0.95rem"></div>
+    </div>
+    <!-- Пустое состояние -->
+    <div id="chart-empty" style="display:none;position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#334155">
+      <div style="font-size:2rem;margin-bottom:0.5rem">📊</div>
+      <div style="font-size:0.9rem">Данные накапливаются...</div>
+      <div style="font-size:0.75rem;margin-top:0.3rem;color:#1e3a5f">График появится через несколько минут</div>
+    </div>
+  </div>
+
+  <!-- Подпись осей -->
+  <div style="display:flex;justify-content:space-between;margin-top:0.4rem;font-size:0.7rem;color:#334155;padding:0 4px">
+    <span id="axis-left">←</span>
+    <span id="axis-right">→</span>
+  </div>
+
+  <p style="margin:1rem 0 0;font-size:0.75rem;color:#334155;text-align:center">
+    История сохраняется в браузере · обновляется каждую минуту · точка = 1 минута
+  </p>
+</section>
+
+<style>
+.period-btn {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  color: #64748b;
+  border-radius: 6px;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  font-size: 0.8rem;
+  transition: all 0.15s;
+}
+.period-btn:hover { border-color: #334155; color: #94a3b8; }
+.period-btn.active { background: #1e293b; border-color: #0ea5e9; color: #e2e8f0; }
+</style>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function(){
+  var STORAGE_KEY = 'usdt_ars_history';
+  var MSK_OFFSET  = 3 * 3600; // UTC+3
+
+  // ── Утилиты ──────────────────────────────────────────────────────────────
+
+  function loadHistory(){
+    try { var r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : []; }
+    catch(e){ return []; }
+  }
+
+  function fmtPrice(v){
+    if(v == null) return '—';
+    return v.toLocaleString('es-AR', {minimumFractionDigits:2, maximumFractionDigits:2});
+  }
+
+  // Timestamp → "HH:MM" по МСК
+  function fmtTimeMSK(ts){
+    var d = new Date((ts + MSK_OFFSET) * 1000);
+    var h = d.getUTCHours().toString().padStart(2,'0');
+    var m = d.getUTCMinutes().toString().padStart(2,'0');
+    return h + ':' + m;
+  }
+
+  // Timestamp → "ДД.ММ HH:MM" по МСК
+  function fmtDateTimeMSK(ts){
+    var d = new Date((ts + MSK_OFFSET) * 1000);
+    var day  = d.getUTCDate().toString().padStart(2,'0');
+    var mon  = (d.getUTCMonth()+1).toString().padStart(2,'0');
+    var h    = d.getUTCHours().toString().padStart(2,'0');
+    var m    = d.getUTCMinutes().toString().padStart(2,'0');
+    return day+'.'+mon+' '+h+':'+m+' МСК';
+  }
+
+  // ── Состояние ─────────────────────────────────────────────────────────────
+
+  var activeHours = 3; // текущий выбранный период
+  var canvas  = document.getElementById('main-chart');
+  var tooltip = document.getElementById('chart-tooltip');
+  var ttTime  = document.getElementById('tt-time');
+  var ttPrice = document.getElementById('tt-price');
+  var empty   = document.getElementById('chart-empty');
+
+  // ── Выбор периода ─────────────────────────────────────────────────────────
+
+  document.querySelectorAll('.period-btn').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      document.querySelectorAll('.period-btn').forEach(function(b){ b.classList.remove('active'); });
+      btn.classList.add('active');
+      activeHours = parseInt(btn.getAttribute('data-hours')) || 0;
+      render();
+    });
+  });
+
+  // ── Фильтрация истории по периоду ─────────────────────────────────────────
+
+  function filterHistory(hist){
+    if(!activeHours || !hist.length) return hist;
+    var cutoff = (Date.now()/1000) - activeHours * 3600;
+    return hist.filter(function(p){ return p.ts >= cutoff; });
+  }
+
+  // ── Обновление верхней статистики ─────────────────────────────────────────
+
+  function updateStats(pts){
+    var curEl    = document.getElementById('cur-price');
+    var changeEl = document.getElementById('cur-change');
+    var mmEl     = document.getElementById('cur-minmax');
+
+    if(!pts.length){
+      curEl.textContent = '—';
+      changeEl.textContent = '—';
+      mmEl.textContent = '— / —';
+      return;
+    }
+
+    // Используем sell_avg как основной курс (цена продавцов = курс покупки)
+    var vals = pts.map(function(p){ return p.s || p.b; }).filter(function(v){ return v != null; });
+    if(!vals.length) return;
+
+    var cur  = vals[vals.length - 1];
+    var first = vals[0];
+    var minV = Math.min.apply(null, vals);
+    var maxV = Math.max.apply(null, vals);
+    var diff  = cur - first;
+    var diffPct = first ? (diff / first * 100) : 0;
+
+    curEl.textContent = fmtPrice(cur) + ' ARS';
+    curEl.style.color = diff >= 0 ? '#34d399' : '#f87171';
+
+    var sign = diff >= 0 ? '+' : '';
+    changeEl.textContent = sign + fmtPrice(diff) + ' (' + sign + diffPct.toFixed(2) + '%)';
+    changeEl.style.color = diff >= 0 ? '#34d399' : '#f87171';
+
+    mmEl.textContent = fmtPrice(minV) + ' / ' + fmtPrice(maxV);
+  }
+
+  // ── Рисуем график ─────────────────────────────────────────────────────────
+
+  function render(){
+    var allHist = loadHistory();
+    var pts     = filterHistory(allHist);
+
+    // Берём sell_avg (курс продавцов) как основную линию
+    var vals = pts.map(function(p){ return p.s != null ? p.s : p.b; });
+
+    updateStats(pts);
+
+    if(!canvas || !canvas.getContext) return;
+
+    // Размер
+    var W = canvas.parentElement.clientWidth  || 800;
+    var H = canvas.parentElement.clientHeight || 360;
+    var DPR = window.devicePixelRatio || 1;
+    canvas.width  = W * DPR;
+    canvas.height = H * DPR;
+    canvas.style.width  = W + 'px';
+    canvas.style.height = H + 'px';
+
+    var ctx = canvas.getContext('2d');
+    ctx.scale(DPR, DPR);
+    ctx.clearRect(0, 0, W, H);
+
+    // Пустой экран
+    if(pts.length < 2){
+      if(empty) empty.style.display = 'flex';
+      return;
+    }
+    if(empty) empty.style.display = 'none';
+
+    var PAD_L = 72, PAD_R = 16, PAD_T = 20, PAD_B = 36;
+    var CW = W - PAD_L - PAD_R;
+    var CH = H - PAD_T - PAD_B;
+
+    var nonNull = vals.filter(function(v){ return v != null; });
+    var minV = Math.min.apply(null, nonNull);
+    var maxV = Math.max.apply(null, nonNull);
+    var range = maxV - minV || 1;
+    // Отступ 10% по Y для красоты
+    minV -= range * 0.1;
+    maxV += range * 0.1;
+    range = maxV - minV;
+
+    function toX(i){ return PAD_L + (i / (pts.length - 1)) * CW; }
+    function toY(v){ return PAD_T + CH - ((v - minV) / range) * CH; }
+
+    // ── Сетка горизонтальная ──
+    ctx.strokeStyle = '#1e293b';
+    ctx.lineWidth = 1;
+    var gridLines = 5;
+    for(var g = 0; g <= gridLines; g++){
+      var gy = PAD_T + (g / gridLines) * CH;
+      ctx.beginPath(); ctx.moveTo(PAD_L, gy); ctx.lineTo(W - PAD_R, gy); ctx.stroke();
+      // Метки цен
+      var priceLabel = maxV - (g / gridLines) * range;
+      ctx.fillStyle = '#334155';
+      ctx.font = '10px monospace';
+      ctx.textAlign = 'right';
+      ctx.fillText(fmtPrice(priceLabel), PAD_L - 6, gy + 4);
+    }
+
+    // ── Сетка вертикальная + метки времени ──
+    var timeSteps = Math.min(6, pts.length - 1);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#334155';
+    ctx.font = '10px sans-serif';
+    for(var t = 0; t <= timeSteps; t++){
+      var idx = Math.round((t / timeSteps) * (pts.length - 1));
+      var tx  = PAD_L + (idx / (pts.length - 1)) * CW;
+      ctx.strokeStyle = '#1a2740';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(tx, PAD_T); ctx.lineTo(tx, PAD_T + CH); ctx.stroke();
+      ctx.fillText(fmtTimeMSK(pts[idx].ts), tx, H - PAD_B + 16);
+    }
+
+    // Подписи осей
+    var axL = document.getElementById('axis-left');
+    var axR = document.getElementById('axis-right');
+    if(axL) axL.textContent = fmtDateTimeMSK(pts[0].ts);
+    if(axR) axR.textContent = fmtDateTimeMSK(pts[pts.length-1].ts);
+
+    // ── Заливка под линией ──
+    ctx.beginPath();
+    var firstValid = true;
+    for(var i = 0; i < pts.length; i++){
+      if(vals[i] == null) continue;
+      var px = toX(i), py = toY(vals[i]);
+      if(firstValid){ ctx.moveTo(px, py); firstValid = false; }
+      else ctx.lineTo(px, py);
+    }
+    // Закрываем фигуру вниз
+    ctx.lineTo(toX(pts.length-1), PAD_T + CH);
+    ctx.lineTo(PAD_L, PAD_T + CH);
+    ctx.closePath();
+    var grad = ctx.createLinearGradient(0, PAD_T, 0, PAD_T + CH);
+    grad.addColorStop(0, 'rgba(14,165,233,0.18)');
+    grad.addColorStop(1, 'rgba(14,165,233,0.01)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // ── Основная линия ──
+    ctx.beginPath();
+    ctx.strokeStyle = '#0ea5e9';
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    firstValid = true;
+    for(var i = 0; i < pts.length; i++){
+      if(vals[i] == null) continue;
+      var px = toX(i), py = toY(vals[i]);
+      if(firstValid){ ctx.moveTo(px, py); firstValid = false; }
+      else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+
+    // ── Точка последнего значения ──
+    var lastIdx = vals.length - 1;
+    while(lastIdx > 0 && vals[lastIdx] == null) lastIdx--;
+    if(vals[lastIdx] != null){
+      var lx = toX(lastIdx), ly = toY(vals[lastIdx]);
+      ctx.beginPath();
+      ctx.arc(lx, ly, 4, 0, Math.PI*2);
+      ctx.fillStyle = '#0ea5e9';
+      ctx.fill();
+      ctx.strokeStyle = '#0f172a';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // ── Тултип при наведении ──
+    canvas._pts  = pts;
+    canvas._vals = vals;
+    canvas._meta = { PAD_L:PAD_L, PAD_R:PAD_R, PAD_T:PAD_T, PAD_B:PAD_B, CW:CW, CH:CH, W:W, H:H };
+  }
+
+  // ── Тултип ───────────────────────────────────────────────────────────────
+
+  if(canvas){
+    canvas.addEventListener('mousemove', function(e){
+      var pts  = canvas._pts;
+      var vals = canvas._vals;
+      var meta = canvas._meta;
+      if(!pts || pts.length < 2 || !meta) return;
+
+      var rect = canvas.getBoundingClientRect();
+      var mx   = e.clientX - rect.left;
+
+      var idx = Math.round(((mx - meta.PAD_L) / meta.CW) * (pts.length - 1));
+      idx = Math.max(0, Math.min(pts.length - 1, idx));
+      if(vals[idx] == null) return;
+
+      ttTime.textContent  = fmtDateTimeMSK(pts[idx].ts);
+      ttPrice.textContent = fmtPrice(vals[idx]) + ' ARS';
+
+      // Позиция тултипа
+      var tx = e.clientX - rect.left + 12;
+      var ty = e.clientY - rect.top  - 10;
+      if(tx + 160 > meta.W) tx = tx - 175;
+      tooltip.style.left    = tx + 'px';
+      tooltip.style.top     = ty + 'px';
+      tooltip.style.display = 'block';
+    });
+    canvas.addEventListener('mouseleave', function(){
+      tooltip.style.display = 'none';
+    });
+  }
+
+  // ── Обновление данных ─────────────────────────────────────────────────────
+
+  var STORAGE_KEY_LOCAL = 'usdt_ars_history';
+
+  function pushPoint(d){
+    if(!d || d.error) return;
+    var val = d.sell_avg || d.buy_avg;
+    if(val == null) return;
+    var ts  = d.ts || Math.floor(Date.now()/1000);
+    var hist = loadHistory();
+    var lastTs = hist.length ? hist[hist.length-1].ts : 0;
+    if(ts - lastTs < 55) return; // не дублируем
+    hist.push({ ts: ts, b: d.buy_avg, s: d.sell_avg });
+    if(hist.length > 1440) hist = hist.slice(hist.length - 1440);
+    try { localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify(hist)); } catch(e){}
+  }
+
+  var _loading = false;
+  function fetchAndRender(){
+    if(_loading) return;
+    _loading = true;
+    fetch('/api/bybit-rate')
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        _loading = false;
+        pushPoint(d);
+        render();
+        // Обновляем текущую цену в виджете хедера тоже
+        var buyEl  = document.getElementById('rate-buy');
+        var sellEl = document.getElementById('rate-sell');
+        if(buyEl  && d.buy_avg)  buyEl.textContent  = fmtPrice(d.buy_avg);
+        if(sellEl && d.sell_avg) sellEl.textContent = fmtPrice(d.sell_avg);
+      })
+      .catch(function(){ _loading = false; render(); });
+  }
+
+  // Первый рендер из кэша, потом запрос
+  render();
+  fetchAndRender();
+
+  // Обновление каждую минуту
+  setInterval(fetchAndRender, 60000);
+
+  // Кнопка обновить
+  var refreshBtn = document.getElementById('btn-refresh');
+  if(refreshBtn) refreshBtn.addEventListener('click', function(){
+    refreshBtn.textContent = '⟳';
+    refreshBtn.disabled = true;
+    fetch('/api/bybit-rate')
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        pushPoint(d);
+        render();
+        refreshBtn.textContent = '↻ Обновить';
+        refreshBtn.disabled = false;
+      })
+      .catch(function(){
+        refreshBtn.textContent = '↻ Обновить';
+        refreshBtn.disabled = false;
+      });
+  });
+
+  // Перерисовка при ресайзе окна
+  window.addEventListener('resize', function(){ render(); });
+
+})();
+</script>
+{% endblock %}
