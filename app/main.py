@@ -1322,7 +1322,7 @@ async def windows_delete(slug: str):
 
 # Кэш чтобы не спамить внешний API
 _rate_cache: dict = {"ts": 0, "data": None}
-_RATE_CACHE_TTL = 60  # секунд
+_RATE_CACHE_TTL = 540  # 9 минут — обновление каждые 10 мин
 
 async def _fetch_bybit_p2p() -> dict:
     """Получает топ-10 объявлений Bybit P2P USDT/ARS (buy + sell),
