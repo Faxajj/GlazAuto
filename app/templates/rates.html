@@ -386,8 +386,8 @@
   render();
   fetchAndRender();
 
-  // Обновление каждую минуту
-  setInterval(fetchAndRender, 60000);
+  // Обновление каждые 10 минут
+  setInterval(fetchAndRender, 600000);
 
   // Кнопка обновить
   var refreshBtn = document.getElementById('btn-refresh');
