@@ -1396,6 +1396,22 @@ async def api_bybit_rate():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/rates", response_class=HTMLResponse)
+async def rates_page(request: Request):
+    """Страница с полноценным графиком курса USDT/ARS."""
+    groups = accounts_by_window()
+    return templates.TemplateResponse("rates.html", {
+        "request":      request,
+        "window_list":  get_window_list(),
+        "groups":       groups,
+        "accounts":     list_accounts(),
+        "account_id":   None,
+        "selected":     None,
+        "window_slug":  None,
+        "current_user": _current_user(request),
+    })
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
