@@ -240,6 +240,13 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_exp
             ON sessions(exp);
+        CREATE TABLE IF NOT EXISTS rate_history (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        INTEGER NOT NULL,
+            buy_avg   REAL,
+            sell_avg  REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rate_history_ts ON rate_history(ts DESC);
         """)
         conn.commit()
         _run_migrations(conn)
@@ -586,3 +593,39 @@ def increment_account_withdraw_count(account_id: int) -> int:
 
 def is_account_withdraw_limit_reached(account_id: int) -> bool:
     return get_account_withdraw_count(account_id) >= DAILY_WITHDRAW_LIMIT
+
+
+# ---------------------------------------------------------------------------
+# История курса USDT/ARS
+# ---------------------------------------------------------------------------
+
+def save_rate_point(buy_avg: float, sell_avg: float, ts: int) -> None:
+    """Сохраняет точку курса. Не дублирует если прошло менее 55 секунд."""
+    with _get_conn() as conn:
+        last = conn.execute(
+            "SELECT ts FROM rate_history ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        if last and (ts - int(last["ts"])) < 55:
+            return
+        conn.execute(
+            "INSERT INTO rate_history (ts, buy_avg, sell_avg) VALUES (?, ?, ?)",
+            (ts, buy_avg, sell_avg),
+        )
+        # Чистим старше 48 часов
+        conn.execute(
+            "DELETE FROM rate_history WHERE ts < ?",
+            (ts - 48 * 3600,),
+        )
+        conn.commit()
+
+
+def get_rate_history(hours: int = 24) -> list:
+    """Возвращает историю курса за последние N часов."""
+    import time as _time
+    since = int(_time.time()) - hours * 3600
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT ts, buy_avg, sell_avg FROM rate_history WHERE ts >= ? ORDER BY ts ASC",
+            (since,),
+        ).fetchall()
+    return [{"ts": r["ts"], "b": r["buy_avg"], "s": r["sell_avg"]} for r in rows]
