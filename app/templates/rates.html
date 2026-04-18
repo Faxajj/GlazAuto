@@ -81,14 +81,28 @@
 {% block extra_js %}
 <script>
 (function(){
-  var STORAGE_KEY = 'usdt_ars_history';
   var MSK_OFFSET  = 3 * 3600; // UTC+3
 
-  // ── Утилиты ──────────────────────────────────────────────────────────────
+  // ── Серверная история (основная) + localStorage (резерв) ─────────────────
+  var STORAGE_KEY = 'usdt_ars_history';
 
-  function loadHistory(){
+  function loadLocalHistory(){
     try { var r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : []; }
     catch(e){ return []; }
+  }
+
+  // Текущая история (с сервера)
+  var _serverHistory = [];
+
+  function loadHistory(){
+    // Объединяем серверную и локальную, дедупликация по ts
+    var combined = _serverHistory.slice();
+    var serverTs = new Set(combined.map(function(p){ return p.ts; }));
+    loadLocalHistory().forEach(function(p){
+      if(!serverTs.has(p.ts)) combined.push(p);
+    });
+    combined.sort(function(a,b){ return a.ts - b.ts; });
+    return combined;
   }
 
   function fmtPrice(v){
@@ -130,7 +144,7 @@
       document.querySelectorAll('.period-btn').forEach(function(b){ b.classList.remove('active'); });
       btn.classList.add('active');
       activeHours = parseInt(btn.getAttribute('data-hours')) || 0;
-      render();
+      fetchServerHistory(activeHours || 48);
     });
   });
 
@@ -348,19 +362,28 @@
 
   // ── Обновление данных ─────────────────────────────────────────────────────
 
-  var STORAGE_KEY_LOCAL = 'usdt_ars_history';
-
-  function pushPoint(d){
+  function pushLocalPoint(d){
+    // Дублируем в localStorage как резерв
     if(!d || d.error) return;
-    var val = d.sell_avg || d.buy_avg;
-    if(val == null) return;
     var ts  = d.ts || Math.floor(Date.now()/1000);
-    var hist = loadHistory();
+    var hist = loadLocalHistory();
     var lastTs = hist.length ? hist[hist.length-1].ts : 0;
-    if(ts - lastTs < 55) return; // не дублируем
+    if(ts - lastTs < 55) return;
     hist.push({ ts: ts, b: d.buy_avg, s: d.sell_avg });
     if(hist.length > 1440) hist = hist.slice(hist.length - 1440);
-    try { localStorage.setItem(STORAGE_KEY_LOCAL, JSON.stringify(hist)); } catch(e){}
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(hist)); } catch(e){}
+  }
+
+  // Загружаем серверную историю
+  function fetchServerHistory(hours){
+    hours = hours || (activeHours || 24);
+    return fetch('/api/rate-history?hours=' + hours)
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(d.history) _serverHistory = d.history;
+        render();
+      })
+      .catch(function(){});
   }
 
   var _loading = false;
@@ -371,8 +394,9 @@
       .then(function(r){ return r.json(); })
       .then(function(d){
         _loading = false;
-        pushPoint(d);
-        render();
+        pushLocalPoint(d);
+        // Перезагружаем историю с сервера
+        fetchServerHistory(48);
         // Обновляем текущую цену в виджете хедера тоже
         var buyEl  = document.getElementById('rate-buy');
         var sellEl = document.getElementById('rate-sell');
@@ -382,12 +406,14 @@
       .catch(function(){ _loading = false; render(); });
   }
 
-  // Первый рендер из кэша, потом запрос
-  render();
+  // Первый рендер — загружаем историю с сервера сразу
+  fetchServerHistory(48);
   fetchAndRender();
 
   // Обновление каждые 10 минут
-  setInterval(fetchAndRender, 600000);
+  setInterval(function(){
+    fetchServerHistory(48);
+  }, 600000);
 
   // Кнопка обновить
   var refreshBtn = document.getElementById('btn-refresh');
