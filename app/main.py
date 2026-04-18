@@ -51,6 +51,8 @@ from app.database import (
     update_window as db_update_window,
     delete_window as db_delete_window,
     window_exists,
+    save_rate_point,
+    get_rate_history,
 )
 from app.drivers import (
     BANK_TYPES,
@@ -528,6 +530,39 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(AuthMiddleware)
+
+
+# ---------------------------------------------------------------------------
+# Фоновый сбор курса USDT/ARS каждые 10 минут
+# ---------------------------------------------------------------------------
+
+async def _rate_collector_loop():
+    """Фоновая задача — собирает курс Bybit P2P каждые 10 минут в БД.
+    Работает независимо от браузера и открытых страниц."""
+    # Первый запрос через 5 сек после старта
+    await asyncio.sleep(5)
+    while True:
+        try:
+            data = await _fetch_bybit_p2p()
+            if data and not data.get("error"):
+                save_rate_point(
+                    buy_avg  = data.get("buy_avg")  or 0,
+                    sell_avg = data.get("sell_avg") or 0,
+                    ts       = data.get("ts") or int(time.time()),
+                )
+                # Обновляем кэш
+                global _rate_cache
+                _rate_cache = {"ts": time.time(), "data": data}
+                logger.info("rate collected: buy=%.2f sell=%.2f",
+                            data.get("buy_avg", 0), data.get("sell_avg", 0))
+        except Exception as e:
+            logger.warning("rate collector error: %s", e)
+        await asyncio.sleep(600)  # 10 минут
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_rate_collector_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -1394,6 +1429,14 @@ async def api_bybit_rate():
         if _rate_cache["data"]:
             return JSONResponse({**_rate_cache["data"], "cached": True, "stale": True})
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/rate-history")
+async def api_rate_history(hours: int = 24):
+    """История курса из БД за последние N часов (макс 48)."""
+    hours = min(max(hours, 1), 48)
+    hist = get_rate_history(hours)
+    return JSONResponse({"history": hist, "count": len(hist)})
 
 
 @app.get("/rates", response_class=HTMLResponse)
