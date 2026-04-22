@@ -6,11 +6,14 @@ import base64
 import json
 import logging
 import secrets
+import statistics
 import time
 import traceback
 from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import quote
+
+import httpx
 
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -1066,10 +1069,7 @@ async def create_auto_withdraw(
         return RedirectResponse(url="/", status_code=302)
     total = _parse_amount(total_limit)
     chunk = _parse_amount(chunk_amount)
-    try:
-        min_bal = float((min_balance or "0").replace(" ", "").replace(".", "").replace(",", "."))
-    except ValueError:
-        min_bal = 0.0
+    min_bal = _parse_amount(min_balance) or 0.0
     if not total or not chunk or chunk > total or not cvu.strip():
         return RedirectResponse(url=f"/?account_id={account_id}&error=invalid_auto_rule", status_code=302)
     add_auto_withdraw_rule(account_id, cvu.strip(), total, chunk, min_bal)
@@ -1268,8 +1268,12 @@ async def receipt(request: Request, account_id: int, transaction_id: str = ""):
     is_outgoing = "output" in tx_type.lower() or "out" in tx_type.lower() or \
                   (transference or {}).get("title", "").lower().startswith("enviaste")
     amount_val = (transference or {}).get("amount")
+    try:
+        amount_num = float(amount_val) if amount_val is not None else None
+    except (TypeError, ValueError):
+        amount_num = None
     amount_display = (
-        f"-{amount_val}" if (is_outgoing and amount_val is not None and float(amount_val) > 0)
+        f"-{amount_val}" if (is_outgoing and amount_num is not None and amount_num > 0)
         else (amount_val if amount_val is not None else "")
     )
 
@@ -1284,16 +1288,16 @@ async def receipt(request: Request, account_id: int, transaction_id: str = ""):
     })
 
 
-@app.get("/account/{account_id}/discover", response_class=HTMLResponse)
-async def discover(request: Request, account_id: int, destination: str = ""):
+@app.get("/account/{account_id}/discover")
+async def discover(account_id: int, destination: str = ""):
     acc = get_account(account_id)
     if not acc or acc["bank_type"] != "personalpay" or not destination.strip():
-        return HTMLResponse(content="{}", media_type="application/json")
+        return JSONResponse({})
     try:
         data = discover_beneficiary(acc["bank_type"], acc["credentials"], destination)
-        return HTMLResponse(content=json.dumps(data, ensure_ascii=False), media_type="application/json")
+        return JSONResponse(data)
     except Exception as e:
-        return HTMLResponse(content=json.dumps({"error": str(e)}), media_type="application/json")
+        return JSONResponse({"error": str(e)})
 
 
 # ---------------------------------------------------------------------------
@@ -1362,8 +1366,6 @@ _RATE_CACHE_TTL = 540  # 9 минут — обновление каждые 10 �
 async def _fetch_bybit_p2p() -> dict:
     """Получает топ-10 объявлений Bybit P2P USDT/ARS (buy + sell),
     считает среднюю цену по каждой стороне."""
-    import httpx, statistics
-
     async def fetch_side(side: str) -> list:
         url = "https://api2.bybit.com/fiat/otc/item/online"
         payload = {
