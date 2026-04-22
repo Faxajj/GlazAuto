@@ -61,8 +61,8 @@
       <textarea id="credentials_json" name="credentials_json" rows="14" class="textarea-json">{{ account.credentials | tojson(indent=2) }}</textarea>
       <p class="form-hint">Измените <strong>auth_token</strong> или <strong>device_id</strong>, если токен истёк. Сохраните валидный JSON.</p>
     </div>
-    <button type="submit" class="btn-primary">Сохранить</button>
-    <a href="/?account_id={{ account.id }}" class="btn-secondary">Отмена</a>
+    <button type="submit" class="btn-primary-lg" style="margin-top:0.75rem">💾 Сохранить</button>
+    <a href="/?account_id={{ account.id }}" class="btn-secondary" style="display:block;text-align:center;margin-top:0.5rem;margin-left:0">Отмена</a>
   </form>
 </section>
 {% endblock %}

@@ -4,15 +4,18 @@
   <meta charset="UTF-8" />
   <title>{% block title %}Banks Dashboard{% endblock %}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="/static/style.css?v=8" />
+  <link rel="stylesheet" href="/static/style.css?v=9" />
 </head>
 <body>
   <header class="header">
-    <div>
-      <h1>Banks Dashboard</h1>
-      <p class="header-sub">Несколько аккаунтов — переключение в один клик</p>
+    <div style="display:flex;align-items:center;gap:0.75rem">
+      <button class="sidebar-toggle-btn" id="sidebar-toggle-btn" aria-label="Открыть меню">☰</button>
+      <div>
+        <h1>Banks Dashboard</h1>
+        <p class="header-sub">Несколько аккаунтов — переключение в один клик</p>
+      </div>
     </div>
-    <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap">
+    <div style="display:flex;align-items:center;gap:0.5rem;flex-wrap:wrap">
       <!-- Виджет курса USDT/ARS Bybit P2P -->
       <div id="rate-widget" style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:0.4rem 0.85rem;font-size:0.8rem;cursor:pointer;user-select:none;min-width:160px" title="USDT/ARS — Bybit P2P. Нажми для обновления">
         <div style="color:#475569;font-size:0.7rem;margin-bottom:0.1rem;display:flex;justify-content:space-between;align-items:center">
@@ -41,9 +44,11 @@
     </div>
   </header>
 
+  <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
   <div class="layout">
     {% block sidebar %}
-    <aside class="sidebar">
+    <aside class="sidebar" id="sidebar">
+      <button class="sidebar-close-btn" id="sidebar-close-btn" aria-label="Закрыть меню">✕</button>
       <p class="sidebar-hint">Группы можно сворачивать — нажми на название.</p>
       <nav class="nav-accounts">
         <a href="/" class="nav-item nav-item-all {% if not account_id and not (window_slug|default(none)) %}active{% endif %}">
@@ -197,6 +202,34 @@
           });
           // Клик на чекбокс не должен триггерить переход по ссылке
           cb.addEventListener('click', function(e){ e.stopPropagation(); });
+        });
+
+        // ── Mobile sidebar ───────────────────────────────────────────────
+        var sidebarEl  = document.getElementById('sidebar');
+        var backdropEl = document.getElementById('sidebar-backdrop');
+        var toggleBtn  = document.getElementById('sidebar-toggle-btn');
+        var closeBtn   = document.getElementById('sidebar-close-btn');
+
+        function openSidebar() {
+          if (sidebarEl)  sidebarEl.classList.add('sidebar--open');
+          if (backdropEl) backdropEl.classList.add('visible');
+          document.body.style.overflow = 'hidden';
+        }
+        function closeSidebar() {
+          if (sidebarEl)  sidebarEl.classList.remove('sidebar--open');
+          if (backdropEl) backdropEl.classList.remove('visible');
+          document.body.style.overflow = '';
+        }
+
+        if (toggleBtn)  toggleBtn.addEventListener('click', openSidebar);
+        if (closeBtn)   closeBtn.addEventListener('click', closeSidebar);
+        if (backdropEl) backdropEl.addEventListener('click', closeSidebar);
+
+        // Закрываем при переходе на другой аккаунт
+        document.querySelectorAll('.profile-card, .nav-item, .nav-window-title-link').forEach(function(el) {
+          el.addEventListener('click', function() {
+            if (window.innerWidth <= 768) closeSidebar();
+          });
         });
 
         // Кнопки плавающей панели — вешаем через делегирование на document,

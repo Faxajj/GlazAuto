@@ -4,29 +4,24 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Вход — Banks Dashboard</title>
-  <link rel="stylesheet" href="/static/style.css?v=6" />
+  <link rel="stylesheet" href="/static/style.css?v=9" />
 </head>
 <body>
   <main class="login-wrap">
     <section class="card login-card">
-      <h2>Авторизация</h2>
-      <p class="form-hint">Регистрация отключена. Доступ выдаётся администратором.</p>
-      <div class="alert alert-warning">
-        Не знаете логин и пароль? Получите учётные данные у администратора проекта.
-        Самостоятельной регистрации на сайте нет.
-      </div>
-      <p class="form-hint">Регистрация отключена. Доступ выдается администратором.</p>
-      {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+      <h2 style="margin-bottom:0.25rem">Banks Dashboard</h2>
+      <p class="form-hint" style="margin-bottom:1.25rem">Доступ выдаётся администратором.</p>
+      {% if error %}<div class="alert alert-error" style="margin-bottom:1rem">{{ error }}</div>{% endif %}
       <form method="post" action="/login" class="form">
         <div class="form-row">
           <label for="username">Логин</label>
-          <input id="username" name="username" type="text" autocomplete="username" required />
+          <input id="username" name="username" type="text" autocomplete="username" required autofocus />
         </div>
         <div class="form-row">
           <label for="password">Пароль</label>
           <input id="password" name="password" type="password" autocomplete="current-password" required />
         </div>
-        <button type="submit" class="btn-primary">Войти</button>
+        <button type="submit" class="btn-primary-lg" style="margin-top:0.75rem">Войти</button>
       </form>
     </section>
   </main>

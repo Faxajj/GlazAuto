@@ -213,6 +213,28 @@
   </div>
   <p class="balance" id="balance-value" style="min-height:2rem">—</p>
   <p class="meta" id="balance-meta" style="color:#64748b;font-size:0.85rem">загружается...</p>
+
+  {# ── Прогресс-бар лимита выводов ── #}
+  {% set _pct = [(account_withdraw_count / daily_limit * 100)|int, 100]|min %}
+  {% set _left = daily_limit - account_withdraw_count %}
+  <div style="margin-top:0.875rem" id="limit-bar-section">
+    <div class="limit-bar-wrap">
+      <div id="limit-bar-fill"
+           class="limit-bar-fill {% if _pct >= 100 %}limit-bar-fill--danger{% elif _pct >= 80 %}limit-bar-fill--warn{% else %}limit-bar-fill--ok{% endif %}"
+           style="width:{{ _pct }}%"></div>
+    </div>
+    <div class="limit-counter {% if _pct >= 100 %}danger{% elif _pct >= 80 %}warn{% endif %}" id="limit-counter-row">
+      <span title="Количество выводов за сегодня (сброс в 09:30 МСК)">
+        Выводов сегодня: <strong id="limit-used">{{ account_withdraw_count }}</strong> / {{ daily_limit }}
+      </span>
+      {% if _left > 0 %}
+        <span>Осталось: <strong id="limit-remaining">{{ _left }}</strong></span>
+      {% else %}
+        <span style="color:#f87171;font-weight:600">Лимит исчерпан</span>
+      {% endif %}
+    </div>
+  </div>
+
   <div id="balance-error-box" style="display:none"></div>
 </section>
 
@@ -253,7 +275,9 @@
       <label for="bank">Банк получателя</label>
       <input id="bank" name="bank" type="text" />
     </div>
-    <button type="submit" class="btn-primary" {% if account_limit_reached %}disabled title="Лимит выводов достигнут"{% endif %}>Вывести</button>
+    <button type="submit" class="btn-primary-lg" {% if account_limit_reached %}disabled title="Лимит выводов достигнут"{% endif %}>
+      💸 Вывести
+    </button>
   </form>
   {% else %}
   <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="personalpay" data-limit-reached="{{ 1 if account_limit_reached else 0 }}">
@@ -265,7 +289,9 @@
       <label for="amount">Сумма (ARS) *</label>
       <input id="amount" name="amount" type="text" inputmode="decimal" required />
     </div>
-    <button type="submit" class="btn-primary" {% if account_limit_reached %}disabled title="Лимит выводов достигнут"{% endif %}>Вывести</button>
+    <button type="submit" class="btn-primary-lg" {% if account_limit_reached %}disabled title="Лимит выводов достигнут"{% endif %}>
+      💸 Вывести
+    </button>
   </form>
   {% endif %}
 </section>
@@ -311,7 +337,7 @@
       <input id="auto-min-balance" name="min_balance" type="text" placeholder="0" />
       <span class="form-hint" style="margin-top:4px">Оставьте пустым — выводить всегда.</span>
     </div>
-    <button type="submit" class="btn-primary">Добавить правило</button>
+    <button type="submit" class="btn-primary-lg" style="margin-top:0.25rem">✚ Добавить правило</button>
   </form>
 
   {% if auto_rules %}
@@ -439,6 +465,25 @@ function loadBalance(force){
         if(balEl) balEl.textContent = balText;
         if(metaEl) metaEl.textContent = metaText;
         if(errBox) errBox.style.display='none';
+
+        // Обновляем прогресс-бар лимита из свежих данных
+        if(typeof d.account_withdraw_count === 'number' && typeof d.account_withdraw_limit === 'number') {
+          var used  = d.account_withdraw_count;
+          var limit = d.account_withdraw_limit;
+          var pct   = Math.min(100, Math.round(used / limit * 100));
+          var left  = limit - used;
+          var barEl = document.getElementById('limit-bar-fill');
+          var usedEl = document.getElementById('limit-used');
+          var leftEl = document.getElementById('limit-remaining');
+          var rowEl  = document.getElementById('limit-counter-row');
+          if(barEl) {
+            barEl.style.width = pct + '%';
+            barEl.className = 'limit-bar-fill ' + (pct >= 100 ? 'limit-bar-fill--danger' : pct >= 80 ? 'limit-bar-fill--warn' : 'limit-bar-fill--ok');
+          }
+          if(usedEl)  usedEl.textContent = used;
+          if(leftEl)  leftEl.textContent = left;
+          if(rowEl)   rowEl.className = 'limit-counter' + (pct >= 100 ? ' danger' : pct >= 80 ? ' warn' : '');
+        }
 
         // Кешируем для мгновенного показа при следующей загрузке страницы
         try { sessionStorage.setItem(_balCacheKey, JSON.stringify({text: balText, meta: metaText})); } catch(e){}
@@ -596,7 +641,7 @@ document.querySelectorAll('.js-run-rule').forEach(function(btn){
 // ─────────────────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────────────────
-function fmtARS(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : String(v||0); }
+function fmtARS(v){ return fmt(v); }
 
 function showToast(msg, type){
   var t=document.createElement('div');
