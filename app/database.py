@@ -599,8 +599,36 @@ def is_account_withdraw_limit_reached(account_id: int) -> bool:
 # История курса USDT/ARS
 # ---------------------------------------------------------------------------
 
+def _rate_window_start_ts() -> int:
+    """Возвращает unix-timestamp начала текущего 24-часового окна курса.
+
+    Окно идёт с 07:30 МСК сегодня до 07:30 МСК завтра.
+    До 07:30 МСК считаем, что окно началось вчера в 07:30 МСК.
+    """
+    msk = timezone(timedelta(hours=3))
+    now = datetime.now(msk)
+    cutoff = now.replace(hour=7, minute=30, second=0, microsecond=0)
+    if now < cutoff:
+        cutoff -= timedelta(days=1)
+    return int(cutoff.timestamp())
+
+
+def cleanup_rate_history() -> int:
+    """Удаляет точки курса, накопленные до начала текущего 24-часового окна.
+    Возвращает количество удалённых строк.
+    Вызывается автоматически из save_rate_point и раз в день в 07:30 МСК."""
+    cutoff_ts = _rate_window_start_ts()
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM rate_history WHERE ts < ?", (cutoff_ts,)
+        )
+        conn.commit()
+    return cur.rowcount
+
+
 def save_rate_point(buy_avg: float, sell_avg: float, ts: int) -> None:
-    """Сохраняет точку курса. Не дублирует если прошло менее 55 секунд."""
+    """Сохраняет точку курса. Не дублирует если прошло менее 55 секунд.
+    При каждом сохранении удаляет данные до начала текущего 24-часового окна (07:30 МСК)."""
     with _get_conn() as conn:
         last = conn.execute(
             "SELECT ts FROM rate_history ORDER BY ts DESC LIMIT 1"
@@ -611,10 +639,11 @@ def save_rate_point(buy_avg: float, sell_avg: float, ts: int) -> None:
             "INSERT INTO rate_history (ts, buy_avg, sell_avg) VALUES (?, ?, ?)",
             (ts, buy_avg, sell_avg),
         )
-        # Чистим старше 48 часов
+        # Чистим всё до начала текущего 24-часового окна (07:30 МСК)
+        cutoff_ts = _rate_window_start_ts()
         conn.execute(
             "DELETE FROM rate_history WHERE ts < ?",
-            (ts - 48 * 3600,),
+            (cutoff_ts,),
         )
         conn.commit()
 
