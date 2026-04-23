@@ -1110,6 +1110,36 @@ body {
   font-size: 0.87rem;
 }
 
+/* ── Разделитель дат в истории ────────────────────── */
+.tx-date-separator {
+  list-style: none;
+  padding: 0.5rem 0 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #475569;
+  border-bottom: 1px solid #1e293b;
+  margin-top: 0.25rem;
+}
+
+/* ── Пагинация истории ────────────────────────────── */
+#tx-pagination {
+  gap: 0.35rem;
+}
+#tx-pagination button {
+  min-width: 2rem;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.82rem;
+}
+
+/* ── Поиск в истории ──────────────────────────────── */
+#tx-search:focus {
+  outline: none;
+  border-color: #38bdf8;
+  box-shadow: 0 0 0 2px rgba(56,189,248,0.2);
+}
+
 button[disabled],
 .btn-primary[disabled] {
   cursor: not-allowed;
