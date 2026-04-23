@@ -59,8 +59,25 @@
       <p class="form-hint">Текущее значение из credentials показано здесь.</p>
     </div>
 
-    {# ── Refresh Token (только AstroPay) ── #}
+    {# ── AstroPay: вставка свежих заголовков ── #}
     {% if account.bank_type == 'astropay' %}
+    <div class="form-row">
+      <label for="ap_raw_headers">Вставить новые заголовки из HTTP Toolkit (опционально)</label>
+      <textarea id="ap_raw_headers" rows="10" class="textarea-json"
+                placeholder="Вставь сюда заголовки из HTTP Toolkit чтобы обновить auth_token и другие поля.
+Пример:
+Authorization:
+Bearer Mg-zFd63YgHoGqHrwMMhyFUNVl4tMvABrn9maUZzLQO7
+AMP-Device-ID:
+55cc8790-0b1b-43b1-81ec-92e774020873R
+..."></textarea>
+      <p class="form-hint">
+        HTTP Toolkit → запрос к <code>mapi.astropaycard.com</code> → вкладка
+        <strong>Request → Headers</strong> → выдели всё и скопируй сюда.
+        Поля в JSON ниже обновятся автоматически.
+      </p>
+    </div>
+
     <div class="form-row">
       <label for="ap_refresh_token">Refresh Token</label>
       <input id="ap_refresh_token" type="text"
@@ -68,8 +85,8 @@
              placeholder="lCbVz-FCg3EJS1XGuUit3ft19nqZBFogmagFOLN8sUI3"
              style="font-family:monospace" />
       <p class="form-hint">
-        Найти в HTTP Toolkit: <code>POST /v4/auth/refresh</code> →
-        <strong>REQUEST BODY</strong> → поле <code>"refresh_token"</code>
+        HTTP Toolkit → запрос <code>POST /v4/auth/refresh</code> →
+        <strong>Request Body</strong> → поле <code>"refresh_token"</code>.
       </p>
     </div>
     {% endif %}
@@ -81,7 +98,8 @@
       {% if account.bank_type == 'astropay' %}
       <p class="form-hint">
         Обновляй <strong>auth_token</strong> когда истечёт сессия.
-        Остальные поля (amp_device_id, aifa, asid и др.) — постоянные, не меняются.
+        Остальные поля (amp_device_id, aifa, asid и др.) — постоянные.
+        При вставке заголовков выше — поля обновятся здесь автоматически.
       </p>
       {% else %}
       <p class="form-hint">Измените <strong>auth_token</strong> или <strong>device_id</strong>, если токен истёк.</p>
@@ -96,15 +114,70 @@
 {% if account.bank_type == 'astropay' %}
 <script>
 (function(){
-  var form     = document.getElementById('edit-account-form');
-  var credJson = document.getElementById('credentials_json');
-  var refreshEl= document.getElementById('ap_refresh_token');
+  var form         = document.getElementById('edit-account-form');
+  var credJson     = document.getElementById('credentials_json');
+  var refreshEl    = document.getElementById('ap_refresh_token');
+  var apRawHeaders = document.getElementById('ap_raw_headers');
+
+  // Маппинг заголовков → ключи credentials
+  var HEADER_MAP = {
+    'authorization':  'auth_token',
+    'amp-device-id':  'amp_device_id',
+    'amp-session-id': 'amp_session_id',
+    'aifa':           'aifa',
+    'asid':           'asid',
+    'state-token':    'state_token',
+    'discover-token': 'discover_token',
+    'app-version':    'app_version',
+    'device-info':    'device_info'
+  };
+
+  function parseRawHeaders(text) {
+    var result = {};
+    var lines = text.split('\n');
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i].trim();
+      if (!line) { i++; continue; }
+      if (line.slice(-1) === ':') {
+        var name = line.slice(0, -1).trim();
+        var key = HEADER_MAP[name.toLowerCase()];
+        var value = (lines[i + 1] || '').trim();
+        if (key && value) {
+          result[key] = value;
+          i += 2;
+          continue;
+        }
+      }
+      i++;
+    }
+    return result;
+  }
+
+  function syncAPHeaders() {
+    var raw = apRawHeaders.value;
+    if (!raw.trim()) return;
+    var parsed = parseRawHeaders(raw);
+    try {
+      var existing = {};
+      try { existing = JSON.parse(credJson.value || '{}'); } catch(e) {}
+      var merged = Object.assign({}, existing, parsed);
+      credJson.value = JSON.stringify(merged, null, 2);
+    } catch(e) {}
+  }
+
+  apRawHeaders.addEventListener('input', syncAPHeaders);
+  apRawHeaders.addEventListener('paste', function(){ setTimeout(syncAPHeaders, 0); });
 
   form.addEventListener('submit', function(){
+    // Синхронизируем заголовки если есть
+    syncAPHeaders();
+    // Вставляем refresh_token
     var refreshVal = refreshEl ? refreshEl.value.trim() : '';
-    if(!refreshVal) return;
+    if (!refreshVal) return;
     try {
-      var creds = JSON.parse(credJson.value || '{}');
+      var creds = {};
+      try { creds = JSON.parse(credJson.value || '{}'); } catch(e) {}
       creds.refresh_token = refreshVal;
       credJson.value = JSON.stringify(creds, null, 2);
     } catch(e) {}
