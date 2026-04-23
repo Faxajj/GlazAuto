@@ -9,7 +9,7 @@ import secrets
 import statistics
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from urllib.parse import quote
 
@@ -56,6 +56,7 @@ from app.database import (
     window_exists,
     save_rate_point,
     get_rate_history,
+    cleanup_rate_history,
 )
 from app.drivers import (
     BANK_TYPES,
@@ -117,10 +118,27 @@ templates.env.filters["ars"]    = lambda value, decimals=2: _format_ars(value, d
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Расширяемый список CVU-префиксов, освобождённых от лимита выводов.
+# Логика: переводы между картами одного банка (PP→PP, AP→AP) — внутренние.
+# Чтобы добавить новый банк — просто впишите его CVU-префикс в этот frozenset.
+# ---------------------------------------------------------------------------
+_EXEMPT_CVU_PREFIXES: frozenset = frozenset({
+    "00000765",  # Personal Pay  (внутренние карты PP)
+    "00001775",  # AstroPay      (внутренние карты AP)
+})
+
+
+def _is_limit_exempt(destination: str) -> bool:
+    """Возвращает True если CVU получателя освобождён от лимита 15 выводов.
+    Охватывает переводы между картами одного банка (PP→PP, AP→AP)."""
+    dest = (destination or "").strip()
+    return any(dest.startswith(prefix) for prefix in _EXEMPT_CVU_PREFIXES)
+
+
+# Обратная совместимость — старое имя функции оставлено как псевдоним.
 def _is_pp_internal_cvu(destination: str) -> bool:
-    """Возвращает True если получатель — внутренняя карта Personal Pay (префикс 00000765).
-    Для таких переводов лимиты выводов не применяются."""
-    return (destination or "").strip().startswith("00000765")
+    return _is_limit_exempt(destination)
 
 
 def _format_ars(value, decimals: int = 2) -> str:
@@ -323,6 +341,12 @@ def _get_nested(obj: dict, *path: str) -> Optional[str]:
     return s if s else None
 
 
+def _join_name(*parts) -> Optional[str]:
+    """Объединяет части имени (имя, фамилия), убирает пустые."""
+    result = " ".join(p.strip() for p in parts if p and str(p).strip())
+    return result if result else None
+
+
 def _find_32char_hex_id(obj) -> Optional[str]:
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -380,31 +404,69 @@ def _normalize_activity(act: dict) -> dict:
         else:
             date_str = str(date_raw)[:19]
 
-    tx_type = (
+    # ── Определение направления транзакции ──────────────────────────────────
+    # Поддерживаем форматы PP и AstroPay (TRANSFER_SENT / TRANSFER_RECEIVED)
+    tx_type_raw = (
         attrs.get("transactionType") or attrs.get("type")
         or act.get("transactionType") or act.get("type") or ""
-    ).lower()
-    title_lower = (title or "").lower()
-    is_outgoing = (
-        "output" in tx_type or "out" in tx_type or "outgoing" in tx_type
-        or "enviaste" in title_lower or "envío" in title_lower
-        or "transferencia enviada" in title_lower
     )
+    tx_type = tx_type_raw.lower()
+    title_lower = (title or "").lower()
+
+    # Явные флаги "входящий" и "исходящий" из разных API
+    _OUTGOING_TYPES = {
+        "transfer_sent", "send", "output", "outgoing", "withdrawal",
+        "debit", "salida", "envio", "pago",
+    }
+    _INCOMING_TYPES = {
+        "transfer_received", "receive", "input", "incoming", "deposit",
+        "credit", "entrada", "cobro",
+    }
+
+    is_outgoing: bool
+    if any(t in tx_type for t in _OUTGOING_TYPES):
+        is_outgoing = True
+    elif any(t in tx_type for t in _INCOMING_TYPES):
+        is_outgoing = False
+    else:
+        # Fallback по заголовку/описанию (персональный пей, старый формат)
+        is_outgoing = (
+            "enviaste" in title_lower
+            or "envío" in title_lower
+            or "transferencia enviada" in title_lower
+            or "out" in tx_type
+        )
 
     inner = act.get("transference") if isinstance(act.get("transference"), dict) else act
+
+    # ── Имя и фамилия отправителя ────────────────────────────────────────────
+    # AstroPay вкладывает данные в origin / destination объекты транзакции
+    origin_obj = act.get("origin") or act.get("sender_info") or {}
+    dest_obj   = act.get("destination") or act.get("recipient_info") or {}
 
     sender = (
         attrs.get("remitente") or attrs.get("sender") or attrs.get("originName") or attrs.get("senderName")
         or act.get("remitente") or act.get("sender") or act.get("from")
+        # AstroPay: origin.name / origin.first_name
+        or (_join_name(origin_obj.get("first_name"), None) if origin_obj else None)
         or _find_in_details(act, "remitente", "titular", "origen", "sender", "nombre", "envía", "envia")
         or _find_in_details(inner, "remitente", "titular", "origen", "sender", "nombre", "envía", "envia")
         or _get_nested(inner, "transactionData", "origin", "holder")
         or _find_in_dict(act, "remitente", "sender", "originName", "holder")
         or _find_in_dict(inner, "remitente", "sender", "originName", "holder")
     )
+    sender_lastname = (
+        origin_obj.get("last_name") or origin_obj.get("lastName") or origin_obj.get("apellido")
+        or attrs.get("senderLastName") or attrs.get("sender_last_name")
+        or act.get("senderLastName") or act.get("sender_last_name")
+        or _find_in_dict(act, "senderLastName", "sender_last_name", want_number=False)
+    )
+
     recipient = (
         attrs.get("destinatario") or attrs.get("recipient") or attrs.get("recipientName")
         or act.get("destinatario") or act.get("recipient") or act.get("to")
+        # AstroPay: destination.name / destination.first_name
+        or (_join_name(dest_obj.get("first_name"), None) if dest_obj else None)
         or _find_in_details(act, "destinatario", "beneficiario", "recipient", "nombre", "recibe")
         or _find_in_details(inner, "destinatario", "beneficiario", "recipient", "nombre", "recibe")
         or _get_nested(inner, "transactionData", "destination", "holder")
@@ -412,13 +474,26 @@ def _normalize_activity(act: dict) -> dict:
         or _find_in_dict(act, "destinatario", "recipient", "beneficiary", "label", "holder")
         or _find_in_dict(inner, "destinatario", "recipient", "beneficiary", "label", "holder")
     )
-    sender    = sender.strip()    if isinstance(sender, str)    else None
-    recipient = recipient.strip() if isinstance(recipient, str) else None
+    recipient_lastname = (
+        dest_obj.get("last_name") or dest_obj.get("lastName") or dest_obj.get("apellido")
+        or attrs.get("recipientLastName") or attrs.get("recipient_last_name")
+        or act.get("recipientLastName") or act.get("recipient_last_name")
+        or _find_in_dict(act, "recipientLastName", "recipient_last_name", want_number=False)
+    )
+
+    sender           = sender.strip()           if isinstance(sender, str)           else None
+    sender_lastname  = sender_lastname.strip()  if isinstance(sender_lastname, str)  else None
+    recipient        = recipient.strip()        if isinstance(recipient, str)        else None
+    recipient_lastname = recipient_lastname.strip() if isinstance(recipient_lastname, str) else None
 
     return {
         "id": aid, "title": title, "receipt_id": receipt_id,
         "amount": amount, "date_str": date_str,
-        "is_outgoing": is_outgoing, "sender": sender, "recipient": recipient,
+        "is_outgoing": is_outgoing,
+        "sender": sender,
+        "sender_lastname": sender_lastname,
+        "recipient": recipient,
+        "recipient_lastname": recipient_lastname,
         "_raw": act,
     }
 
@@ -541,11 +616,25 @@ app.add_middleware(AuthMiddleware)
 
 async def _rate_collector_loop():
     """Фоновая задача — собирает курс Bybit P2P каждые 10 минут в БД.
-    Работает независимо от браузера и открытых страниц."""
+    Работает независимо от браузера и открытых страниц.
+    Ежедневно в 07:30 МСК удаляет данные вне текущего 24-часового окна."""
     # Первый запрос через 5 сек после старта
     await asyncio.sleep(5)
+    _msk = timezone(timedelta(hours=3))
+    _last_cleanup_date: Optional[str] = None
+
     while True:
         try:
+            # ── Ежедневная очистка истории курса в 07:30 МСК ──────────────
+            now_msk = datetime.now(_msk)
+            today_key = now_msk.date().isoformat()
+            window_start = now_msk.replace(hour=7, minute=30, second=0, microsecond=0)
+            if now_msk >= window_start and _last_cleanup_date != today_key:
+                deleted = cleanup_rate_history()
+                _last_cleanup_date = today_key
+                logger.info("rate history cleanup at 07:30 MSK: removed %d rows", deleted)
+
+            # ── Сбор курса ────────────────────────────────────────────────
             data = await _fetch_bybit_p2p()
             if data and not data.get("error"):
                 save_rate_point(
@@ -553,7 +642,6 @@ async def _rate_collector_loop():
                     sell_avg = data.get("sell_avg") or 0,
                     ts       = data.get("ts") or int(time.time()),
                 )
-                # Обновляем кэш
                 global _rate_cache
                 _rate_cache = {"ts": time.time(), "data": data}
                 logger.info("rate collected: buy=%.2f sell=%.2f",
@@ -583,9 +671,9 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
         update_auto_withdraw_progress(rule["id"], last_error="Некорректная сумма", is_active=False)
         return False, "Некорректная сумма"
 
-    # Лимиты не применяются для внутренних карт PP (префикс 00000765)
+    # Лимиты не применяются для внутренних переводов (PP→PP, AP→AP)
     cvu = rule.get("cvu", "")
-    if not _is_pp_internal_cvu(cvu):
+    if not _is_limit_exempt(cvu):
         if is_account_withdraw_limit_reached(acc["id"]):
             msg = f"Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT})"
             update_auto_withdraw_progress(rule["id"], last_error=msg)
@@ -612,7 +700,7 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
 
     try:
         if acc["bank_type"] == "universalcoins":
-            raise ValueError("Автовывод поддерживается только для Personal Pay")
+            raise ValueError("Автовывод не поддерживается для UniversalCoins")
         result = driver_withdraw(
             acc["bank_type"], acc["credentials"],
             destination=cvu, amount=chunk, comments="Auto withdraw",
@@ -847,36 +935,107 @@ async def api_account_status(account_id: int):
 
 
 @app.get("/account/{account_id}/activities")
-async def api_activities(account_id: int):
-    """Lazy-load: история операций. Вызывается из JS после рендера страницы."""
+async def api_activities(
+    account_id: int,
+    type:   str = "all",   # all | incoming | outgoing
+    page:   int = 1,       # страница (1-based)
+    limit:  int = 20,      # записей на страницу (макс 100)
+    search: str = "",      # поиск по имени/фамилии
+):
+    """Lazy-load: история операций. Поддерживает PP и AstroPay.
+    Параметры: ?type=all|incoming|outgoing&page=1&limit=20&search=Иванов"""
     acc = get_account(account_id)
     if not acc:
         return JSONResponse({"error": "account not found"}, status_code=404)
-    if acc["bank_type"] != "personalpay":
-        return JSONResponse({"activities": []})
+
+    bank = acc["bank_type"]
+    _SUPPORTED = ("personalpay", "astropay")
+    if bank not in _SUPPORTED:
+        return JSONResponse({"activities": [], "total": 0, "page": 1, "pages": 1})
+
+    # Ограничиваем limit во избежание злоупотреблений
+    limit = max(1, min(limit, 100))
+    page  = max(1, page)
+
     try:
-        data = await asyncio.to_thread(pp_activities_list, acc["credentials"], 0, 30)
-        raw = _extract_activities_raw(data)
+        # ── Загрузка сырых активностей ──────────────────────────────────────
+        if bank == "personalpay":
+            data = await asyncio.to_thread(pp_activities_list, acc["credentials"], 0, 50)
+            raw  = _extract_activities_raw(data)
+        else:  # astropay
+            from app.drivers.astropay import get_activities as ap_get_activities
+            data = await asyncio.to_thread(ap_get_activities, acc["credentials"], 1, 50)
+            raw  = data.get("data") or []
+
+        # ── Нормализация ─────────────────────────────────────────────────────
         activities = []
         for act in (raw if isinstance(raw, list) else []):
             n = _normalize_activity(act)
-            if n:
-                is_outgoing = bool(n.get("is_outgoing"))
-                full_name = (n.get("recipient") if is_outgoing else n.get("sender")) or "Не указано"
-                activities.append({
-                    "id": n.get("id"),
-                    "title": n.get("title"),
-                    "receipt_id": n.get("receipt_id"),
-                    "amount": n.get("amount"),
-                    "date_str": n.get("date_str"),
-                    "is_outgoing": is_outgoing,
-                    "type": "outgoing" if is_outgoing else "incoming",
-                    "sender": n.get("sender"),
-                    "recipient": n.get("recipient"),
-                    "full_name": full_name,
-                })
-        return JSONResponse({"activities": activities})
+            if not n:
+                continue
+            is_outgoing = bool(n.get("is_outgoing"))
+
+            s_name  = n.get("sender") or ""
+            s_last  = n.get("sender_lastname") or ""
+            r_name  = n.get("recipient") or ""
+            r_last  = n.get("recipient_lastname") or ""
+
+            # Полное имя контрагента (кто получил при выводе / кто прислал при поступлении)
+            if is_outgoing:
+                full_parts = [p for p in [r_name, r_last] if p]
+            else:
+                full_parts = [p for p in [s_name, s_last] if p]
+            full_name = " ".join(full_parts) if full_parts else "Не указано"
+
+            activities.append({
+                "id":                n.get("id"),
+                "title":             n.get("title"),
+                "receipt_id":        n.get("receipt_id"),
+                "amount":            n.get("amount"),
+                "date_str":          n.get("date_str"),
+                "is_outgoing":       is_outgoing,
+                "type":              "outgoing" if is_outgoing else "incoming",
+                "sender":            s_name,
+                "sender_lastname":   s_last  or "Не указана",
+                "recipient":         r_name,
+                "recipient_lastname":r_last  or "Не указана",
+                "full_name":         full_name,
+            })
+
+        # ── Фильтр по типу ───────────────────────────────────────────────────
+        if type == "incoming":
+            activities = [a for a in activities if not a["is_outgoing"]]
+        elif type == "outgoing":
+            activities = [a for a in activities if a["is_outgoing"]]
+
+        # ── Поиск по имени / фамилии ─────────────────────────────────────────
+        q = search.strip().lower()
+        if q:
+            def _match(a):
+                haystack = " ".join(filter(None, [
+                    a.get("sender"), a.get("sender_lastname"),
+                    a.get("recipient"), a.get("recipient_lastname"),
+                    a.get("full_name"),
+                ])).lower()
+                return q in haystack
+            activities = [a for a in activities if _match(a)]
+
+        # ── Пагинация ────────────────────────────────────────────────────────
+        total  = len(activities)
+        pages  = max(1, (total + limit - 1) // limit)
+        page   = min(page, pages)
+        offset = (page - 1) * limit
+        paged  = activities[offset : offset + limit]
+
+        return JSONResponse({
+            "activities": paged,
+            "total":  total,
+            "page":   page,
+            "pages":  pages,
+            "limit":  limit,
+        })
     except Exception as e:
+        logger.exception("api_activities error account=%d", account_id)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -929,8 +1088,8 @@ async def multi_withdraw(request: Request):
         acc = get_account(int(acc_id))
         if not acc:
             return {"account_id": acc_id, "label": "?", "ok": False, "error": "Счёт не найден", "tid": None}
-        # Лимиты не применяются для внутренних карт PP (префикс 00000765)
-        if not _is_pp_internal_cvu(destination):
+        # Лимиты не применяются для внутренних переводов (PP→PP, AP→AP)
+        if not _is_limit_exempt(destination):
             if is_account_withdraw_limit_reached(acc["id"]):
                 return {
                     "account_id": acc_id, "label": acc["label"], "ok": False,
@@ -994,8 +1153,8 @@ async def withdraw(
     if not dest:
         return RedirectResponse(url=f"/?account_id={account_id}&error=no_destination", status_code=302)
 
-    # Лимиты не применяются для внутренних карт PP (префикс 00000765)
-    if not _is_pp_internal_cvu(dest):
+    # Лимиты не применяются для внутренних переводов (PP→PP, AP→AP)
+    if not _is_limit_exempt(dest):
         if is_account_withdraw_limit_reached(account_id):
             return RedirectResponse(url=f"/?account_id={account_id}&error=account_limit_reached", status_code=302)
 
@@ -1034,11 +1193,12 @@ async def withdraw(
         return RedirectResponse(url=f"/?account_id={account_id}&error={error_param}", status_code=302)
 
     tid = None
-    if acc["bank_type"] == "personalpay" and isinstance(result, dict):
+    if acc["bank_type"] in ("personalpay", "astropay") and isinstance(result, dict):
         tid = _find_32char_hex_id(result)
         if not tid:
             raw = (
                 result.get("transactionId") or result.get("id")
+                or result.get("transfer_id") or result.get("request_id")
                 or (result.get("transference") or {}).get("id")
                 or (result.get("data") or {}).get("transactionId")
             )
@@ -1135,7 +1295,7 @@ async def add_account_post(
     credentials = _parse_credentials(credentials_json)
     if not credentials and credentials_json.strip():
         return RedirectResponse(url="/add?error=invalid_json", status_code=302)
-    if bank_type == "personalpay":
+    if bank_type in ("personalpay", "astropay"):
         proxy_url = _proxy_from_parts(proxy_host, proxy_port, proxy_user, proxy_password, proxy_type, proxy_raw)
         credentials = _apply_proxy_to_credentials(proxy_url, credentials)
     if not label.strip():
@@ -1184,7 +1344,7 @@ async def edit_account_post(
     credentials = _parse_credentials(credentials_json)
     if not credentials and credentials_json.strip():
         return RedirectResponse(url=f"/account/{account_id}/edit?error=invalid_json", status_code=302)
-    if acc["bank_type"] == "personalpay":
+    if acc["bank_type"] in ("personalpay", "astropay"):
         proxy_url = _proxy_from_parts(proxy_host, proxy_port, proxy_user, proxy_password, proxy_type, proxy_raw)
         credentials = _apply_proxy_to_credentials(proxy_url, credentials)
     if label.strip():
