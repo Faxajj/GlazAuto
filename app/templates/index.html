@@ -280,7 +280,7 @@
     </button>
   </form>
   {% else %}
-  <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="personalpay" data-limit-reached="{{ 1 if account_limit_reached else 0 }}">
+  <form id="withdraw-form" class="form" method="post" action="/account/{{ selected.id }}/withdraw" data-account-label="{{ selected.label }}" data-account-id="{{ selected.id }}" data-bank-type="{{ selected.bank_type }}" data-limit-reached="{{ 1 if account_limit_reached else 0 }}">
     <div class="form-row">
       <label for="destination">Получатель (CVU / псевдоним) *</label>
       <input id="destination" name="destination" type="text" required />
@@ -296,22 +296,37 @@
   {% endif %}
 </section>
 
-{# ── История (lazy) ──────────────────────────────────────── #}
-{% if selected.bank_type == 'personalpay' %}
+{# ── История (lazy) — PP + AstroPay ─────────────────────── #}
+{% if selected.bank_type in ('personalpay', 'astropay') %}
 <section class="card" id="history-section">
-  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:1rem">
+  {# Заголовок + кнопка 24ч #}
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.75rem;margin-bottom:0.75rem">
     <h3 style="margin:0">История операций</h3>
-    <div style="display:flex;gap:0.5rem" id="tx-filters" style="display:none">
+    <button id="tx-btn-24h" class="btn-table btn-open" title="Показать только операции за последние 24 часа">⏱ За 24 ч</button>
+  </div>
+
+  {# Фильтры типа + поиск #}
+  <div id="tx-controls" style="display:none;flex-wrap:wrap;gap:0.5rem;margin-bottom:0.75rem;align-items:center">
+    <div style="display:flex;gap:0.4rem" id="tx-filters">
       <button class="tx-filter-btn active" data-filter="all">Все</button>
       <button class="tx-filter-btn" data-filter="incoming">Приходы</button>
       <button class="tx-filter-btn" data-filter="outgoing">Выводы</button>
     </div>
+    <input id="tx-search" type="text" placeholder="🔍 Поиск по имени / фамилии"
+           style="flex:1;min-width:160px;padding:0.4rem 0.75rem;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:0.875rem" />
   </div>
+
+  {# Загрузка / ошибка #}
   <div id="tx-loading" style="color:#64748b;font-size:0.9rem;padding:1rem 0">
     <span class="balance-spinner">⟳</span> Загружаем историю...
   </div>
-  <ul class="activities-list tx-history" id="tx-list" style="display:none"></ul>
   <div id="tx-error" style="display:none"></div>
+
+  {# Список #}
+  <ul class="activities-list tx-history" id="tx-list" style="display:none"></ul>
+
+  {# Пагинация #}
+  <div id="tx-pagination" style="display:none;align-items:center;justify-content:center;gap:0.5rem;margin-top:0.75rem;flex-wrap:wrap"></div>
 </section>
 {% endif %}
 
@@ -510,57 +525,193 @@ if(refreshBtn) refreshBtn.addEventListener('click', function(){ loadBalance(true
 })();
 
 // ─────────────────────────────────────────────────────────
-// 2. LAZY ИСТОРИЯ
+// 2. ИСТОРИЯ ОПЕРАЦИЙ — пагинация, поиск, фильтры, 24ч
+// Поддерживает personalpay и astropay.
 // ─────────────────────────────────────────────────────────
-if(BANK_TYPE === 'personalpay'){
-  var txLoading = document.getElementById('tx-loading');
-  var txList    = document.getElementById('tx-list');
-  var txError   = document.getElementById('tx-error');
-  var txFilters = document.getElementById('tx-filters');
+var _TX_BANKS = ['personalpay', 'astropay'];
+if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
+  var txLoading  = document.getElementById('tx-loading');
+  var txList     = document.getElementById('tx-list');
+  var txError    = document.getElementById('tx-error');
+  var txControls = document.getElementById('tx-controls');
+  var txPager    = document.getElementById('tx-pagination');
+  var txSearch   = document.getElementById('tx-search');
+  var txBtn24h   = document.getElementById('tx-btn-24h');
 
-  fetch('/account/'+ACCOUNT_ID+'/activities')
-    .then(r=>r.json())
-    .then(function(d){
-      if(txLoading) txLoading.style.display='none';
-      if(d.error){
-        if(txError){ txError.style.display='block'; txError.innerHTML='<p style="color:#f87171">Не удалось загрузить историю: '+d.error+'</p>'; }
-        return;
-      }
-      var acts = d.activities || [];
-      if(!acts.length){
-        if(txList){ txList.style.display='block'; txList.innerHTML='<li style="color:#64748b;padding:0.5rem 0">Нет операций</li>'; }
-        return;
-      }
-      var html = '';
-      acts.forEach(function(act){
-        var cls = act.is_outgoing ? 'outgoing' : 'incoming';
-        var sign = act.is_outgoing ? '−' : '+';
-        var amtStr = act.amount != null ? sign + fmt(act.amount) + ' ARS' : '—';
-        var fio = act.full_name || 'Не указано';
-        var opLabel = act.is_outgoing ? 'Вывод' : 'Поступление';
-        html += '<li class="tx-item" data-type="'+cls+'">' +
-          '<span class="tx-badge tx-'+cls+'">'+opLabel+'</span>' +
-          '<span class="tx-counterparty">ФИО: '+fio+'</span>' +
-          '<span class="tx-date">Время: '+(act.date_str || '—')+'</span>' +
-          '<span class="tx-amount">Сумма: '+amtStr+'</span>' +
-          '</li>';
-      });
-      if(txList){ txList.innerHTML=html; txList.style.display='block'; }
-      if(txFilters) txFilters.style.display='flex';
+  // Состояние
+  var _txState = { type:'all', page:1, limit:20, search:'', only24h:false };
+  var _txSearchTimer = null;
 
-      // Фильтрация
-      document.querySelectorAll('.tx-filter-btn').forEach(function(btn){
-        btn.addEventListener('click',function(){
-          document.querySelectorAll('.tx-filter-btn').forEach(b=>b.classList.remove('active'));
-          btn.classList.add('active');
-          var f = btn.getAttribute('data-filter');
-          document.querySelectorAll('#tx-list .tx-item').forEach(function(item){
-            item.style.display = (f==='all' || item.getAttribute('data-type')===f) ? '' : 'none';
-          });
+  // ── 24ч — unix timestamp 24 часа назад
+  function _is24hRecent(dateStr){
+    if(!dateStr) return false;
+    // dateStr формат "ДД.ММ.ГГГГ ЧЧ:ММ" или ISO
+    var ts;
+    // Попробуем "DD.MM.YYYY HH:MM"
+    var m = dateStr.match(/^(\d{2})\.(\d{2})\.(\d{4})\s(\d{2}):(\d{2})/);
+    if(m){
+      ts = Date.UTC(+m[3], +m[2]-1, +m[1], +m[4], +m[5]) / 1000;
+    } else {
+      ts = Date.parse(dateStr) / 1000;
+    }
+    return !isNaN(ts) && ts >= (Date.now()/1000 - 86400);
+  }
+
+  // ── Отрисовка одной записи
+  function _renderItem(act){
+    var cls    = act.is_outgoing ? 'outgoing' : 'incoming';
+    var sign   = act.is_outgoing ? '−' : '+';
+    var amtStr = act.amount != null ? sign + fmt(act.amount) + ' ARS' : '—';
+    var label  = act.is_outgoing ? 'ВЫВОД' : 'ПОСТУПЛЕНИЕ';
+    var fio    = act.full_name || 'Не указано';
+    // Показываем: Имя Фамилия + фамилию по отдельности если есть
+    var lastSuffix = '';
+    if(act.is_outgoing && act.recipient_lastname && act.recipient_lastname !== 'Не указана'){
+      lastSuffix = ' <span style="color:#94a3b8;font-size:0.8rem">(' + act.recipient_lastname + ')</span>';
+    } else if(!act.is_outgoing && act.sender_lastname && act.sender_lastname !== 'Не указана'){
+      lastSuffix = ' <span style="color:#94a3b8;font-size:0.8rem">(' + act.sender_lastname + ')</span>';
+    }
+    return '<li class="tx-item" data-type="'+cls+'">' +
+      '<span class="tx-badge tx-'+cls+'">'+label+'</span>' +
+      '<span class="tx-counterparty">'+fio+lastSuffix+'</span>' +
+      '<span class="tx-date">'+(act.date_str || '—')+'</span>' +
+      '<span class="tx-amount">'+amtStr+'</span>' +
+      '</li>';
+  }
+
+  // ── Загрузка данных с сервера
+  function loadActivities(){
+    if(txLoading) txLoading.style.display='block';
+    if(txList)    txList.style.display='none';
+    if(txError)   txError.style.display='none';
+    if(txPager)   txPager.style.display='none';
+
+    var params = new URLSearchParams({
+      type:  _txState.type,
+      page:  _txState.page,
+      limit: _txState.limit,
+      search:_txState.search,
+    });
+    fetch('/account/'+ACCOUNT_ID+'/activities?'+params.toString())
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if(txLoading) txLoading.style.display='none';
+        if(d.error){
+          if(txError){
+            txError.style.display='block';
+            txError.innerHTML='<p style="color:#f87171;padding:0.5rem 0">Не удалось загрузить историю: '+d.error+'</p>';
+          }
+          return;
+        }
+        if(txControls) txControls.style.display='flex';
+
+        var acts = d.activities || [];
+
+        // Если включён фильтр «только 24ч» — фильтруем на клиенте
+        if(_txState.only24h){
+          acts = acts.filter(function(a){ return _is24hRecent(a.date_str); });
+        }
+
+        if(!acts.length){
+          if(txList){
+            txList.style.display='block';
+            txList.innerHTML='<li style="color:#64748b;padding:0.75rem 0">Нет операций</li>';
+          }
+          return;
+        }
+
+        // Рендер записей, группировка по дате
+        var html='', lastDate='';
+        acts.forEach(function(act){
+          var datePart = act.date_str ? act.date_str.substring(0,10) : '';
+          if(datePart && datePart !== lastDate){
+            html += '<li class="tx-date-separator">'+datePart+'</li>';
+            lastDate = datePart;
+          }
+          html += _renderItem(act);
         });
+        if(txList){ txList.innerHTML=html; txList.style.display='block'; }
+
+        // Пагинация
+        _renderPager(d.page, d.pages, d.total);
+      })
+      .catch(function(err){
+        if(txLoading) txLoading.style.display='none';
+        if(txError){
+          txError.style.display='block';
+          txError.innerHTML='<p style="color:#f87171">Ошибка сети при загрузке истории.</p>';
+        }
       });
-    })
-    .catch(function(){ if(txLoading) txLoading.style.display='none'; });
+  }
+
+  // ── Пагинация
+  function _renderPager(cur, total, totalItems){
+    if(!txPager) return;
+    if(total <= 1){ txPager.style.display='none'; return; }
+    txPager.style.display='flex';
+    var html = '<span style="color:#64748b;font-size:0.82rem">Всего: '+totalItems+'</span> ';
+    html += '<button class="btn-table" id="tx-pg-prev" '+(cur<=1?'disabled':'')+'>‹ Назад</button>';
+    for(var i=1;i<=total;i++){
+      if(i===cur){
+        html += '<button class="btn-table btn-open" style="font-weight:700" disabled>'+i+'</button>';
+      } else if(Math.abs(i-cur)<=2 || i===1 || i===total){
+        html += '<button class="btn-table tx-pg-num" data-pg="'+i+'">'+i+'</button>';
+      } else if(Math.abs(i-cur)===3){
+        html += '<span style="color:#64748b;padding:0 4px">…</span>';
+      }
+    }
+    html += '<button class="btn-table" id="tx-pg-next" '+(cur>=total?'disabled':'')+'>Вперёд ›</button>';
+    txPager.innerHTML = html;
+
+    var prev = document.getElementById('tx-pg-prev');
+    var next = document.getElementById('tx-pg-next');
+    if(prev) prev.addEventListener('click',function(){ _txState.page--; loadActivities(); });
+    if(next) next.addEventListener('click',function(){ _txState.page++; loadActivities(); });
+    txPager.querySelectorAll('.tx-pg-num').forEach(function(b){
+      b.addEventListener('click',function(){
+        _txState.page = parseInt(b.getAttribute('data-pg'),10);
+        loadActivities();
+      });
+    });
+  }
+
+  // ── Переключатели типа (Все / Приходы / Выводы)
+  document.querySelectorAll('.tx-filter-btn').forEach(function(btn){
+    btn.addEventListener('click',function(){
+      document.querySelectorAll('.tx-filter-btn').forEach(function(b){ b.classList.remove('active'); });
+      btn.classList.add('active');
+      _txState.type = btn.getAttribute('data-filter');
+      _txState.page = 1;
+      loadActivities();
+    });
+  });
+
+  // ── Поиск (с дебаунсом 400мс)
+  if(txSearch){
+    txSearch.addEventListener('input',function(){
+      clearTimeout(_txSearchTimer);
+      _txSearchTimer = setTimeout(function(){
+        _txState.search = txSearch.value.trim();
+        _txState.page = 1;
+        loadActivities();
+      }, 400);
+    });
+  }
+
+  // ── Кнопка «За 24 ч»
+  if(txBtn24h){
+    txBtn24h.addEventListener('click',function(){
+      _txState.only24h = !_txState.only24h;
+      txBtn24h.textContent = _txState.only24h ? '⏱ Все даты' : '⏱ За 24 ч';
+      txBtn24h.style.background = _txState.only24h ? '#0ea5e9' : '';
+      txBtn24h.style.color = _txState.only24h ? '#fff' : '';
+      _txState.page = 1;
+      loadActivities();
+    });
+  }
+
+  // ── Первый запуск
+  loadActivities();
 }
 
 // ─────────────────────────────────────────────────────────

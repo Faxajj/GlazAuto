@@ -69,28 +69,35 @@
     </div>
     <div class="form-row">
       <label for="credentials_json">Credentials (JSON) *</label>
-      <textarea id="credentials_json" name="credentials_json" rows="18" class="textarea-json" placeholder='UniversalCoins — нужны логин, пароль и PIN:
+      <textarea id="credentials_json" name="credentials_json" rows="22" class="textarea-json" placeholder='UniversalCoins:
 {
   "username": "email@example.com",
   "password": "пароль",
   "pin": "123456"
 }
 
-Personal Pay — два варианта:
-
-1) Токен из ОТВЕТА на POST /authority/v4/login:
-   В перехватчике открой этот запрос → вкладка Response/Body → в JSON найди tokens.idToken (или id_token). Скопируй значение (eyJ...) и вставь сюда просто токен или:
-   { "auth_token": "eyJ..." }
-
-2) Данные из ТЕЛА ЗАПРОСА (логина) — тогда дашборд сам будет логиниться:
-   deviceId, username, password, pushNotifications.deviceToken из запроса:
+Personal Pay — токен из ответа на POST /authority/v4/login:
 {
-  "device_id": "178DC6C7-C43C-4DCC-B3BC-DBFAAA0F8FD2",
-  "username": "5f5f6a02-ecf4-4666-8940-25d17927da4f",
-  "password": "69d625f0569f43ab4aea21",
-  "push_device_token": "d-sZXA9CQ06RiJVpsWr03c:APA91b..."
+  "auth_token": "eyJ...",
+  "device_id":  "178DC6C7-C43C-4DCC-B3BC-DBFAAA0F8FD2"
+}
+
+AstroPay — токен из ответа на /v4/auth/signIn/resolution:
+{
+  "auth_token":     "Bearer eyJ...",
+  "refresh_token":  "1ZMuRaq...",
+  "amp_device_id":  "5e0e7e61-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "amp_session_id": "177662xxxxxxxxx",
+  "aifa":           "82ddb8a7-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "asid":           "4b9a05c2-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "state_token":    "2bf42e10...",
+  "discover_token": "AAAAAAAA..."
 }'></textarea>
-      <p class="form-hint"><strong>Токен</strong> лежит в заголовке Authorization любого запроса к personalpay.dev после входа. Если получаешь <strong>403 Forbidden</strong>, добавь в JSON <strong>device_id</strong> (можно вставить даже полный <code>x-fraud-paygilant-session-id</code> — дашборд сам выделит device_id). Прокси теперь заполняй отдельными полями выше (тип/host/port/login/password).</p>
+      <p class="form-hint">
+        <strong>Personal Pay:</strong> заголовок Authorization в запросах к personalpay.dev.<br>
+        <strong>AstroPay:</strong> перехвати ответ <code>POST /v4/auth/signIn/resolution</code> — в поле <code>session</code> будут <code>access_token</code> и <code>refresh_token</code>. Заголовки устройства (AMP-Device-ID и др.) скопируй из любого запроса к mapi.astropaycard.com.<br>
+        Прокси заполняй отдельными полями выше (тип / host / port / login / password).
+      </p>
     </div>
     <button type="submit" class="btn-primary-lg" style="margin-top:0.75rem">✚ Добавить аккаунт</button>
     <a href="/" class="btn-secondary" style="display:block;text-align:center;margin-top:0.5rem;margin-left:0">Отмена</a>
