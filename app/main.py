@@ -365,9 +365,78 @@ def _find_32char_hex_id(obj) -> Optional[str]:
     return None
 
 
+def _normalize_astropay_activity(act: dict) -> dict:
+    """Нормализует запись активности в формате AstroPay v3/activities."""
+    aid   = act.get("activity_id") or act.get("reference_id") or act.get("id")
+    title = (act.get("title") or act.get("description") or str(aid or "Операция")).strip()
+
+    # Сумма и направление
+    main_amount = act.get("main_amount") or {}
+    amount_raw  = main_amount.get("amount")
+    amount      = None
+    is_outgoing = False
+    if amount_raw is not None:
+        try:
+            fval        = float(amount_raw)
+            amount      = abs(fval)
+            is_outgoing = fval < 0
+        except (TypeError, ValueError):
+            pass
+    else:
+        # Резервный вариант по иконке ресурса
+        icon        = (act.get("resource") or {}).get("value") or ""
+        is_outgoing = "up" in icon.lower()
+
+    # Дата (миллисекунды)
+    date_raw = act.get("date")
+    date_str = None
+    if date_raw:
+        try:
+            ts       = int(date_raw)
+            date_str = datetime.utcfromtimestamp(
+                ts / 1000 if ts > 1e12 else ts
+            ).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            date_str = str(date_raw)
+
+    # receipt_id из компонента ACTIONS_COMPONENT → VIEW_RECEIPT
+    receipt_id = None
+    for comp in (act.get("components") or []):
+        meta = comp.get("metadata") or {}
+        for action in (meta.get("actions") or []):
+            if action.get("action_type") == "VIEW_RECEIPT":
+                receipt_id = (action.get("action_metadata") or {}).get("reference_id")
+                break
+        if receipt_id:
+            break
+    if not receipt_id:
+        receipt_id = _find_32char_hex_id(act)
+
+    # Контрагент: title — это полное имя (APELLIDO NOMBRE)
+    sender    = title if not is_outgoing else None
+    recipient = title if is_outgoing     else None
+
+    return {
+        "id":                aid,
+        "title":             title,
+        "receipt_id":        receipt_id,
+        "amount":            amount,
+        "date_str":          date_str,
+        "is_outgoing":       is_outgoing,
+        "sender":            sender,
+        "sender_lastname":   None,
+        "recipient":         recipient,
+        "recipient_lastname":None,
+        "_raw":              act,
+    }
+
+
 def _normalize_activity(act: dict) -> dict:
     if not isinstance(act, dict):
         return {}
+    # AstroPay-формат: есть activity_id или main_amount
+    if "activity_id" in act or "main_amount" in act:
+        return _normalize_astropay_activity(act)
     attrs = act.get("attributes") or act
     aid = act.get("id") or act.get("transactionId") or attrs.get("id") or attrs.get("transactionId")
     title = (
