@@ -234,12 +234,12 @@ def get_balance(credentials: dict) -> dict:
     }
 
 
-def get_activities(credentials: dict, page: int = 1, size: int = 30) -> dict:
-    """История операций ARS."""
+def get_activities(credentials: dict, page: int = 1, size: int = 50) -> dict:
+    """История операций."""
     s = _session(credentials)
     resp = s.get(
         f"{BASE_URL}/v3/activities",
-        params={"page": page, "size": size, "currency": "ARS"},
+        params={"page": page, "size": size},
         timeout=HTTP_TIMEOUT,
     )
     if resp.status_code == 401:
@@ -248,7 +248,29 @@ def get_activities(credentials: dict, page: int = 1, size: int = 30) -> dict:
             s = _session(credentials)
             resp = s.get(
                 f"{BASE_URL}/v3/activities",
-                params={"page": page, "size": size, "currency": "ARS"},
+                params={"page": page, "size": size},
+                timeout=HTTP_TIMEOUT,
+            )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_receipt(credentials: dict, reference_id: str) -> dict:
+    """
+    Получить PDF-чек по reference_id из активности.
+    Возвращает {"file_resource": "https://...", "file_name": "..."}
+    """
+    s = _session(credentials)
+    resp = s.get(
+        f"{BASE_URL}/v1/wallet/schemeTransfer/invoice/{reference_id}",
+        timeout=HTTP_TIMEOUT,
+    )
+    if resp.status_code == 401:
+        new_token = _handle_401(credentials)
+        if new_token:
+            s = _session(credentials)
+            resp = s.get(
+                f"{BASE_URL}/v1/wallet/schemeTransfer/invoice/{reference_id}",
                 timeout=HTTP_TIMEOUT,
             )
     resp.raise_for_status()
@@ -259,59 +281,79 @@ def create_withdraw(
     credentials: dict,
     destination: str,
     amount: float,
-    comments: str = "Varios",
+    comments: str = "",
 ) -> dict:
     """
-    Вывод средств.
-    destination — CVU или alias получателя
-    amount      — сумма в ARS
+    Вывод средств на CVU / alias.
+    Шаг 1: GET summary — резолвит получателя и возвращает target_user.
+    Шаг 2: POST schemeTransfer/cvu — выполняет перевод.
     """
     s = _session(credentials)
 
-    # Шаг 1 — резолвим получателя
-    resolve_resp = s.post(
-        f"{BASE_URL}/v1/transfers/send/resolve",
-        json={"destination": destination, "currency": "ARS", "amount": str(amount)},
-        timeout=HTTP_TIMEOUT,
-    )
-    if resolve_resp.status_code == 401:
+    # ── Шаг 1: резолвим получателя через summary ────────────────────────────
+    def _do_summary(session):
+        return session.get(
+            f"{BASE_URL}/v1/wallet/schemeTransfer/cvu/summary",
+            params={
+                "origin_currency": "ARS",
+                "origin_amount":   float(amount),
+                "target_currency": "ARS",
+                "target_account":  destination,
+            },
+            timeout=HTTP_TIMEOUT,
+        )
+
+    summary_resp = _do_summary(s)
+    if summary_resp.status_code == 401:
         new_token = _handle_401(credentials)
         if new_token:
             s = _session(credentials)
-            resolve_resp = s.post(
-                f"{BASE_URL}/v1/transfers/send/resolve",
-                json={"destination": destination, "currency": "ARS", "amount": str(amount)},
-                timeout=HTTP_TIMEOUT,
-            )
-    if resolve_resp.status_code == 422:
-        raise ValueError(f"Ошибка резолвинга получателя: {resolve_resp.json()}")
-    resolve_resp.raise_for_status()
-    resolve_data = resolve_resp.json()
+            summary_resp = _do_summary(s)
 
-    transfer_id = (
-        resolve_data.get("transfer_id") or
-        resolve_data.get("id") or
-        resolve_data.get("request_id") or ""
-    )
+    if summary_resp.status_code in (400, 404, 422):
+        try:
+            err = summary_resp.json()
+            msg = err.get("message") or err.get("error") or str(err)
+        except Exception:
+            msg = summary_resp.text or str(summary_resp.status_code)
+        raise ValueError(f"Получатель не найден: {msg}")
+    summary_resp.raise_for_status()
 
-    # Шаг 2 — подтверждаем
+    summary    = summary_resp.json().get("summary") or {}
+    target_user = summary.get("target_user")
+    if not target_user:
+        raise ValueError("Не удалось получить данные получателя (пустой summary)")
+
+    # ── Шаг 2: выполняем перевод ─────────────────────────────────────────────
     payload = {
-        "destination": destination,
-        "currency":    "ARS",
-        "amount":      str(amount),
-        "description": comments,
+        "comments":        comments,
+        "origin_amount":   float(amount),
+        "origin_currency": "ARS",
+        "target_amount":   float(summary.get("target_amount") or amount),
+        "target_currency": "ARS",
+        "target_user":     target_user,
     }
-    if transfer_id:
-        payload["transfer_id"] = transfer_id
 
-    confirm_resp = s.post(
-        f"{BASE_URL}/v1/transfers/send/confirm",
-        json=payload,
-        timeout=HTTP_TIMEOUT,
-    )
-    if confirm_resp.status_code in (422, 400):
-        err = confirm_resp.json()
-        msg = err.get("message") or err.get("error") or str(err)
+    def _do_transfer(session):
+        return session.post(
+            f"{BASE_URL}/v1/wallet/schemeTransfer/cvu",
+            json=payload,
+            timeout=HTTP_TIMEOUT,
+        )
+
+    transfer_resp = _do_transfer(s)
+    if transfer_resp.status_code == 401:
+        new_token = _handle_401(credentials)
+        if new_token:
+            s = _session(credentials)
+            transfer_resp = _do_transfer(s)
+
+    if transfer_resp.status_code in (400, 422):
+        try:
+            err = transfer_resp.json()
+            msg = err.get("message") or err.get("error") or str(err)
+        except Exception:
+            msg = transfer_resp.text or str(transfer_resp.status_code)
         raise ValueError(f"Ошибка перевода: {msg}")
-    confirm_resp.raise_for_status()
-    return confirm_resp.json()
+    transfer_resp.raise_for_status()
+    return transfer_resp.json()
