@@ -10,7 +10,7 @@
   <div class="alert alert-error">Credentials должны быть валидным JSON.</div>
   {% endif %}
 
-  <form method="post" action="/account/{{ account.id }}/edit" class="form">
+  <form method="post" action="/account/{{ account.id }}/edit" class="form" id="edit-account-form">
     <div class="form-row">
       <label for="window">Окно (группа)</label>
       <select id="window" name="window">
@@ -21,19 +21,21 @@
       <p class="form-hint">Или укажите новый кабинет вручную (например: <code>glaz7</code>).</p>
       <input id="window_custom" name="window_custom" type="text" placeholder="Новый slug кабинета (опционально)" />
     </div>
+
     <div class="form-row">
       <label for="label">Название (как показывать в списке) *</label>
       <input id="label" name="label" type="text" required value="{{ account.label }}" />
     </div>
+
     <div class="form-row">
-      <label for="proxy_type">Прокси (опционально, для Personal Pay)</label>
+      <label for="proxy_type">Прокси (опционально)</label>
       <select id="proxy_type" name="proxy_type">
         <option value="socks5h" {% if proxy_type == 'socks5h' %}selected{% endif %}>SOCKS5h (рекомендовано)</option>
-        <option value="socks5" {% if proxy_type == 'socks5' %}selected{% endif %}>SOCKS5</option>
-        <option value="http" {% if proxy_type == 'http' %}selected{% endif %}>HTTP</option>
-        <option value="https" {% if proxy_type == 'https' %}selected{% endif %}>HTTPS</option>
+        <option value="socks5"  {% if proxy_type == 'socks5'  %}selected{% endif %}>SOCKS5</option>
+        <option value="http"    {% if proxy_type == 'http'    %}selected{% endif %}>HTTP</option>
+        <option value="https"   {% if proxy_type == 'https'   %}selected{% endif %}>HTTPS</option>
       </select>
-      <p class="form-hint">Заполни отдельные поля (IP/Port/Login/Password). При необходимости можно вставить всё одной строкой ниже.</p>
+      <p class="form-hint">Заполни отдельные поля (IP/Port/Login/Password).</p>
     </div>
     <div class="form-row">
       <label for="proxy_host">Proxy Host/IP</label>
@@ -56,13 +58,59 @@
       <input id="proxy_raw" name="proxy_raw" type="text" value="{{ proxy_raw }}" placeholder="135.106.40.29:63137:smY9hX1m:6vrTNk8q" />
       <p class="form-hint">Текущее значение из credentials показано здесь.</p>
     </div>
+
+    {# ── Refresh Token (только AstroPay) ── #}
+    {% if account.bank_type == 'astropay' %}
+    <div class="form-row">
+      <label for="ap_refresh_token">Refresh Token</label>
+      <input id="ap_refresh_token" type="text"
+             value="{{ account.credentials.get('refresh_token', '') }}"
+             placeholder="lCbVz-FCg3EJS1XGuUit3ft19nqZBFogmagFOLN8sUI3"
+             style="font-family:monospace" />
+      <p class="form-hint">
+        Найти в HTTP Toolkit: <code>POST /v4/auth/refresh</code> →
+        <strong>REQUEST BODY</strong> → поле <code>"refresh_token"</code>
+      </p>
+    </div>
+    {% endif %}
+
+    {# ── Credentials JSON ── #}
     <div class="form-row">
       <label for="credentials_json">Credentials (JSON) *</label>
       <textarea id="credentials_json" name="credentials_json" rows="14" class="textarea-json">{{ account.credentials | tojson(indent=2) }}</textarea>
-      <p class="form-hint">Измените <strong>auth_token</strong> или <strong>device_id</strong>, если токен истёк. Сохраните валидный JSON.</p>
+      {% if account.bank_type == 'astropay' %}
+      <p class="form-hint">
+        Обновляй <strong>auth_token</strong> когда истечёт сессия.
+        Остальные поля (amp_device_id, aifa, asid и др.) — постоянные, не меняются.
+      </p>
+      {% else %}
+      <p class="form-hint">Измените <strong>auth_token</strong> или <strong>device_id</strong>, если токен истёк.</p>
+      {% endif %}
     </div>
+
     <button type="submit" class="btn-primary-lg" style="margin-top:0.75rem">💾 Сохранить</button>
     <a href="/?account_id={{ account.id }}" class="btn-secondary" style="display:block;text-align:center;margin-top:0.5rem;margin-left:0">Отмена</a>
   </form>
 </section>
+
+{% if account.bank_type == 'astropay' %}
+<script>
+(function(){
+  var form     = document.getElementById('edit-account-form');
+  var credJson = document.getElementById('credentials_json');
+  var refreshEl= document.getElementById('ap_refresh_token');
+
+  form.addEventListener('submit', function(){
+    var refreshVal = refreshEl ? refreshEl.value.trim() : '';
+    if(!refreshVal) return;
+    try {
+      var creds = JSON.parse(credJson.value || '{}');
+      creds.refresh_token = refreshVal;
+      credJson.value = JSON.stringify(creds, null, 2);
+    } catch(e) {}
+  });
+})();
+</script>
+{% endif %}
+
 {% endblock %}

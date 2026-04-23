@@ -12,7 +12,7 @@
   <div class="alert alert-error">Credentials должны быть валидным JSON.</div>
   {% endif %}
 
-  <form method="post" action="/add" class="form">
+  <form method="post" action="/add" class="form" id="add-account-form">
     <div class="form-row">
       <label for="window">Окно (группа) *</label>
       <select id="window" name="window">
@@ -23,6 +23,7 @@
       <p class="form-hint">Или укажите новый кабинет вручную (например: <code>glaz7</code>).</p>
       <input id="window_custom" name="window_custom" type="text" placeholder="Новый slug кабинета (опционально)" />
     </div>
+
     <div class="form-row">
       <label for="bank_type">Банк *</label>
       <select id="bank_type" name="bank_type" required>
@@ -32,12 +33,14 @@
         {% endfor %}
       </select>
     </div>
+
     <div class="form-row">
       <label for="label">Название (как показывать в списке) *</label>
-      <input id="label" name="label" type="text" placeholder="Например: UniversalCoins — основной" required />
+      <input id="label" name="label" type="text" placeholder="Например: AstroPay — основной" required />
     </div>
+
     <div class="form-row">
-      <label for="proxy_type">Прокси (опционально, для Personal Pay)</label>
+      <label for="proxy_type">Прокси (опционально, для Personal Pay / AstroPay)</label>
       <select id="proxy_type" name="proxy_type">
         <option value="socks5h" selected>SOCKS5h (рекомендовано)</option>
         <option value="socks5">SOCKS5</option>
@@ -65,42 +68,92 @@
     <div class="form-row">
       <label for="proxy_raw">Или одной строкой (fallback)</label>
       <input id="proxy_raw" name="proxy_raw" type="text" placeholder="135.106.40.29:63137:smY9hX1m:6vrTNk8q" />
-      <p class="form-hint">Поддержка fallback форматов: <code>IP:PORT:USER:PASS</code>, <code>USER:PASS@IP:PORT</code>, <code>socks5h://...</code>. Сохраняется в credentials как <code>proxy/http_proxy/https_proxy</code>.</p>
+      <p class="form-hint">Формат: <code>IP:PORT:USER:PASS</code> или <code>socks5h://user:pass@host:port</code>.</p>
     </div>
-    <div class="form-row">
-      <label for="credentials_json">Credentials (JSON) *</label>
-      <textarea id="credentials_json" name="credentials_json" rows="22" class="textarea-json" placeholder='UniversalCoins:
-{
-  "username": "email@example.com",
-  "password": "пароль",
-  "pin": "123456"
-}
 
-Personal Pay — токен из ответа на POST /authority/v4/login:
-{
-  "auth_token": "eyJ...",
-  "device_id":  "178DC6C7-C43C-4DCC-B3BC-DBFAAA0F8FD2"
-}
-
-AstroPay — токен из ответа на /v4/auth/signIn/resolution:
-{
-  "auth_token":     "Bearer eyJ...",
-  "refresh_token":  "1ZMuRaq...",
-  "amp_device_id":  "5e0e7e61-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "amp_session_id": "177662xxxxxxxxx",
-  "aifa":           "82ddb8a7-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "asid":           "4b9a05c2-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "state_token":    "2bf42e10...",
-  "discover_token": "AAAAAAAA..."
-}'></textarea>
+    {# ── Refresh Token (только AstroPay) ── #}
+    <div id="ap-refresh-row" style="display:none" class="form-row">
+      <label for="ap_refresh_token">Refresh Token *</label>
+      <input id="ap_refresh_token" type="text"
+             placeholder="lCbVz-FCg3EJS1XGuUit3ft19nqZBFogmagFOLN8sUI3"
+             style="font-family:monospace" />
       <p class="form-hint">
-        <strong>Personal Pay:</strong> заголовок Authorization в запросах к personalpay.dev.<br>
-        <strong>AstroPay:</strong> перехвати ответ <code>POST /v4/auth/signIn/resolution</code> — в поле <code>session</code> будут <code>access_token</code> и <code>refresh_token</code>. Заголовки устройства (AMP-Device-ID и др.) скопируй из любого запроса к mapi.astropaycard.com.<br>
-        Прокси заполняй отдельными полями выше (тип / host / port / login / password).
+        Найти в HTTP Toolkit: запрос <code>POST /v4/auth/refresh</code> →
+        вкладка <strong>REQUEST BODY</strong> → поле <code>"refresh_token"</code>
       </p>
     </div>
+
+    {# ── Credentials JSON ── #}
+    <div class="form-row">
+      <label for="credentials_json">Credentials (JSON) *</label>
+      <textarea id="credentials_json" name="credentials_json" rows="14" class="textarea-json"
+                placeholder='Для AstroPay вставь заголовки из HTTP Toolkit:
+{
+  "auth_token":     "Bearer Mg-zFd63...",
+  "amp_device_id":  "55cc8790-0b1b-43b1-81ec-92e774020873R",
+  "amp_session_id": "1776950453082",
+  "aifa":           "74ee594f-7d4b-4737-83cf-08cb5c94cc03",
+  "asid":           "d5af3f98-4832-cc0c-4b45-acd5961c129a",
+  "state_token":    "5e371ad3f40a40de87ad9ff518802cec",
+  "discover_token": "AAAAAAAAAAAAAAAAAAAAAA...",
+  "app_version":    "5.78.0-prod-release",
+  "device_info":    "samsung|SM-M315F|12|5.78.0-prod-release"
+}
+
+Personal Pay:
+{ "auth_token": "eyJ...", "device_id": "178DC6C7-..." }
+
+UniversalCoins:
+{ "username": "email@example.com", "password": "пароль", "pin": "123456" }'></textarea>
+      <p class="form-hint" id="creds-hint-ap" style="display:none">
+        Открой HTTP Toolkit → любой запрос к <code>mapi.astropaycard.com</code> →
+        вкладка <strong>REQUEST → HEADERS</strong> → скопируй все заголовки и составь JSON.
+        Поле <code>auth_token</code> = заголовок <code>Authorization</code>.
+      </p>
+      <p class="form-hint" id="creds-hint-other">
+        Personal Pay: заголовок Authorization из запросов к personalpay.dev.
+      </p>
+    </div>
+
     <button type="submit" class="btn-primary-lg" style="margin-top:0.75rem">✚ Добавить аккаунт</button>
     <a href="/" class="btn-secondary" style="display:block;text-align:center;margin-top:0.5rem;margin-left:0">Отмена</a>
   </form>
 </section>
+
+<script>
+(function(){
+  var bankSel    = document.getElementById('bank_type');
+  var apRow      = document.getElementById('ap-refresh-row');
+  var hintAP     = document.getElementById('creds-hint-ap');
+  var hintOther  = document.getElementById('creds-hint-other');
+  var credJson   = document.getElementById('credentials_json');
+  var form       = document.getElementById('add-account-form');
+
+  function onBankChange(){
+    var isAP = bankSel.value === 'astropay';
+    apRow.style.display    = isAP ? '' : 'none';
+    hintAP.style.display   = isAP ? '' : 'none';
+    hintOther.style.display = isAP ? 'none' : '';
+  }
+
+  bankSel.addEventListener('change', onBankChange);
+  onBankChange();
+
+  // При сабмите — если AstroPay, добавляем refresh_token в JSON
+  form.addEventListener('submit', function(){
+    if(bankSel.value !== 'astropay') return;
+
+    var refreshVal = document.getElementById('ap_refresh_token').value.trim();
+    if(!refreshVal) return;
+
+    try {
+      var creds = JSON.parse(credJson.value || '{}');
+      creds.refresh_token = refreshVal;
+      credJson.value = JSON.stringify(creds);
+    } catch(e) {
+      // JSON невалидный — сервер сам покажет ошибку
+    }
+  });
+})();
+</script>
 {% endblock %}
