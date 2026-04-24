@@ -571,11 +571,16 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
     } else if(!act.is_outgoing && act.sender_lastname && act.sender_lastname !== 'Не указана'){
       lastSuffix = ' <span style="color:#94a3b8;font-size:0.8rem">(' + act.sender_lastname + ')</span>';
     }
+    var receiptBtn = '';
+    if(act.receipt_id){
+      receiptBtn = '<button class="btn-receipt" onclick="openReceipt('+ACCOUNT_ID+',\''+act.receipt_id+'\')" title="Показать чек">📄</button>';
+    }
     return '<li class="tx-item" data-type="'+cls+'">' +
       '<span class="tx-badge tx-'+cls+'">'+label+'</span>' +
       '<span class="tx-counterparty">'+fio+lastSuffix+'</span>' +
       '<span class="tx-date">'+(act.date_str || '—')+'</span>' +
       '<span class="tx-amount">'+amtStr+'</span>' +
+      receiptBtn +
       '</li>';
   }
 
@@ -835,8 +840,74 @@ function showWithdrawConfirm(dest, amt, recipientName, onConfirm){
   overlay.addEventListener('click', function(e){ if(e.target===overlay) cancel_it(); });
 }
 
+// ─────────────────────────────────────────────────────────
+// ЧЕКИ — openReceipt(accountId, ref)
+// AP → PDF в новой вкладке; PP → модальное окно с деталями
+// ─────────────────────────────────────────────────────────
+function openReceipt(accountId, ref){
+  var modal = document.getElementById('receipt-modal');
+  var body  = document.getElementById('receipt-modal-body');
+  if(!modal || !body) return;
+
+  body.innerHTML = '<p style="text-align:center;color:#94a3b8">⏳ Загружаем чек…</p>';
+  modal.style.display = 'flex';
+
+  fetch('/account/'+accountId+'/receipt?ref='+encodeURIComponent(ref))
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(d.error){
+        body.innerHTML = '<p class="alert alert-error">'+d.error+'</p>';
+        return;
+      }
+      if(d.type === 'pdf' && d.url){
+        modal.style.display = 'none';
+        window.open(d.url, '_blank');
+        return;
+      }
+      if(d.type === 'details'){
+        var fmt2 = function(v){ return v != null ? Number(v).toLocaleString('es-AR',{minimumFractionDigits:2}) : '—'; };
+        var rows = [
+          ['Подтверждение', d.confirmation_id || '—'],
+          ['Сумма',         d.amount != null ? fmt2(d.amount)+' '+(d.currency||'ARS') : '—'],
+          ['Дата',          d.date ? d.date.replace('T',' ').substring(0,19) : '—'],
+          ['Статус',        d.state || '—'],
+          ['Отправитель',   d.sender || '—'],
+          ['CBU отправителя', d.sender_cbu || '—'],
+          ['Получатель (alias)', d.recipient_alias || '—'],
+          ['CBU получателя', d.recipient_cbu || '—'],
+          ['ID операции',   d.transaction_id || '—'],
+        ];
+        var html = '<table style="width:100%;border-collapse:collapse;font-size:0.9rem">';
+        rows.forEach(function(r){
+          html += '<tr><td style="padding:0.35rem 0.5rem;color:#94a3b8;white-space:nowrap">'+r[0]+'</td>'
+               +  '<td style="padding:0.35rem 0.5rem;font-family:monospace;word-break:break-all">'+r[1]+'</td></tr>';
+        });
+        html += '</table>';
+        body.innerHTML = html;
+        return;
+      }
+      body.innerHTML = '<pre style="font-size:0.8rem;overflow:auto">'+JSON.stringify(d,null,2)+'</pre>';
+    })
+    .catch(function(e){
+      body.innerHTML = '<p class="alert alert-error">'+String(e)+'</p>';
+    });
+}
+
 })();
 </script>
+
+{# ── Модальное окно чека ── #}
+<div id="receipt-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9000;align-items:center;justify-content:center;padding:1rem">
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:0.75rem;max-width:540px;width:100%;padding:1.25rem 1.5rem;max-height:85vh;overflow-y:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <strong style="font-size:1rem">📄 Чек</strong>
+      <button onclick="document.getElementById('receipt-modal').style.display='none'"
+              style="background:none;border:none;color:#94a3b8;font-size:1.25rem;cursor:pointer;line-height:1">✕</button>
+    </div>
+    <div id="receipt-modal-body"></div>
+  </div>
+</div>
+
 {% endif %}
 
 {% endblock %}
