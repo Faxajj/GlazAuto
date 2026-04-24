@@ -50,32 +50,23 @@ def _norm_creds(creds: dict) -> dict:
 
 
 def _base_headers(c: dict) -> dict:
-    # User-Agent как в приложении — без замены %20 на пробел
-    ua = (c["user_agent"] or "Personal%20Pay/2.0.1074 CFNetwork/3826.600.41 Darwin/24.6.0").strip()
-
-    # x-app-os: определяем из User-Agent чтобы не было противоречия.
-    # Если явно задано в credentials — используем его.
-    _explicit_os = (c.get("app_os") or "").strip()
-    if _explicit_os:
-        app_os = _explicit_os
-    elif "darwin" in ua.lower() or "cfnetwork" in ua.lower() or "ios" in ua.lower():
-        app_os = "ios"
-    else:
-        app_os = "android"
-
-    headers = {
-        "Accept":           "application/json, text/plain, */*",
-        "Accept-Language":  "ru",
-        "Content-Type":     "application/json",
-        "x-app-version":    c["app_version"],
-        "x-app-os":         app_os,
-        # Старый формат (оставляем для совместимости)
-        "appversion":       c["app_version"],
-        "osversion":        c["os_version"],
-        "useragent":        c["useragent_device"],
-        "User-Agent":       ua,
+    """Заголовки точно как в оригинальном приложении PersonalPay (OkHttp 4.12, Android).
+    Взяты из HAR-перехвата. Лишние заголовки убраны — PP их не шлёт."""
+    return {
+        "accept":           "application/json, text/plain, */*",
+        "x-app-version":    c.get("app_version") or "2.0.1074",
+        "x-app-os":         "android",
+        "User-Agent":       "okhttp/4.12.0",
+        "Accept-Encoding":  "gzip",
+        "Connection":       "Keep-Alive",
     }
-    return headers
+
+
+def _post_headers(c: dict) -> dict:
+    """Заголовки для POST запросов (добавляется Content-Type)."""
+    h = _base_headers(c)
+    h["Content-Type"] = "application/json"
+    return h
 
 
 def _paygilant_id(device_id: str) -> str:
@@ -125,7 +116,7 @@ def _get_token(session: requests.Session, c: dict) -> tuple:
     if not all([c.get("device_id"), c.get("username"), c.get("password"), c.get("push_device_token")]):
         raise ValueError("Заполни device_id, username, password, push_device_token или задай auth_token")
     paygilant = _paygilant_id(c["device_id"])
-    headers = _base_headers(c) | {"x-fraud-paygilant-session-id": paygilant}
+    headers = _post_headers(c) | {"x-fraud-paygilant-session-id": paygilant}
     payload = {
         "deviceId": c["device_id"],
         "username": c["username"],
@@ -274,7 +265,7 @@ def create_withdraw(
     c = _norm_creds(credentials)
     session = _session(c)
     token, paygilant = _get_token(session, c)
-    headers = _base_headers(c) | {
+    headers = _post_headers(c) | {
         "Authorization": token,
         "x-fraud-paygilant-session-id": paygilant,
     }
@@ -325,7 +316,7 @@ def get_transference_details(credentials: dict, transaction_id: str) -> dict:
     session = _session(c)
     token, paygilant = _get_token(session, c)
     tid = transaction_id.strip()
-    headers = _base_headers(c) | {
+    headers = _post_headers(c) | {
         "Authorization": token,
         "x-fraud-paygilant-session-id": paygilant,
         "x-body-version": "2",
