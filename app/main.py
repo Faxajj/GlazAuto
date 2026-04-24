@@ -399,18 +399,19 @@ def _normalize_astropay_activity(act: dict) -> dict:
         except Exception:
             date_str = str(date_raw)
 
-    # receipt_id из компонента ACTIONS_COMPONENT → VIEW_RECEIPT
+    # receipt_id — только из VIEW_RECEIPT action (настоящий reference_id для /invoice/...)
+    # Fallback на activity_id убран: он вызывает 401 на инвойс-эндпоинте
     receipt_id = None
     for comp in (act.get("components") or []):
         meta = comp.get("metadata") or {}
         for action in (meta.get("actions") or []):
             if action.get("action_type") == "VIEW_RECEIPT":
-                receipt_id = (action.get("action_metadata") or {}).get("reference_id")
+                rid = (action.get("action_metadata") or {}).get("reference_id")
+                if rid:
+                    receipt_id = rid
                 break
         if receipt_id:
             break
-    if not receipt_id:
-        receipt_id = _find_32char_hex_id(act)
 
     # Контрагент: title — это полное имя (APELLIDO NOMBRE)
     sender    = title if not is_outgoing else None
@@ -486,7 +487,9 @@ def _normalize_activity(act: dict) -> dict:
         attrs.get("transactionType") or attrs.get("type")
         or act.get("transactionType") or act.get("type") or ""
     )
-    tx_type = tx_type_raw.lower()
+    # Нормализуем тип: убираем подчёркивания и дефисы для надёжного сравнения
+    # bank_output_transfer → bankoutputtransfer, COMMIT_OUTER → commitouter
+    tx_type = tx_type_raw.lower().replace("_", "").replace("-", "")
     title_lower = (title or "").lower()
 
     # Явные флаги "входящий" и "исходящий" из разных API
