@@ -38,10 +38,11 @@ def _norm_creds(creds: dict) -> dict:
         "push_device_token": (creds.get("push_device_token") or "").strip(),
         "auth_token": (creds.get("auth_token") or "").strip(),
         "pin_hash": (creds.get("pin_hash") or "").strip(),
-        "app_version": (creds.get("app_version") or "2.0.1070").strip(),
+        "app_version": (creds.get("app_version") or "2.0.1074").strip(),
+        "app_os": (creds.get("app_os") or creds.get("x_app_os") or "android").strip(),
         "os_version": (creds.get("os_version") or "18.6.2").strip(),
         "useragent_device": (creds.get("useragent_device") or "Apple iPhone 15 Pro Max, iOS/18.6.2").strip(),
-        "user_agent": (creds.get("user_agent") or "Personal%20Pay/2.0.1070 CFNetwork/3826.600.41 Darwin/24.6.0").strip(),
+        "user_agent": (creds.get("user_agent") or "Personal%20Pay/2.0.1074 CFNetwork/3826.600.41 Darwin/24.6.0").strip(),
         "proxy": (creds.get("proxy") or "").strip(),
         "http_proxy": (creds.get("http_proxy") or "").strip(),
         "https_proxy": (creds.get("https_proxy") or "").strip(),
@@ -50,15 +51,19 @@ def _norm_creds(creds: dict) -> dict:
 
 def _base_headers(c: dict) -> dict:
     # User-Agent как в приложении — без замены %20 на пробел
-    ua = (c["user_agent"] or "Personal%20Pay/2.0.1070 CFNetwork/3826.600.41 Darwin/24.6.0").strip()
+    ua = (c["user_agent"] or "Personal%20Pay/2.0.1074 CFNetwork/3826.600.41 Darwin/24.6.0").strip()
     return {
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "ru",
-        "Content-Type": "application/json",
-        "appversion": c["app_version"],
-        "osversion": c["os_version"],
-        "useragent": c["useragent_device"],
-        "User-Agent": ua,
+        "Accept":           "application/json, text/plain, */*",
+        "Accept-Language":  "es-AR",
+        "Content-Type":     "application/json",
+        # Новый формат заголовков (актуальный, с x-)
+        "x-app-version":    c["app_version"],
+        "x-app-os":         c.get("app_os") or "android",
+        # Старый формат (оставляем для совместимости)
+        "appversion":       c["app_version"],
+        "osversion":        c["os_version"],
+        "useragent":        c["useragent_device"],
+        "User-Agent":       ua,
     }
 
 
