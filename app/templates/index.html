@@ -542,19 +542,30 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
   var _txState = { type:'all', page:1, limit:20, search:'', only24h:false };
   var _txSearchTimer = null;
 
-  // ── 24ч — unix timestamp 24 часа назад
+  // ── Граница окна 07:30 МСК (= 04:30 UTC) ────────────────────────────
+  function _windowStartTs(){
+    var now = new Date();
+    // 07:30 МСК = 04:30 UTC
+    var todayBound = new Date(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 4, 30, 0, 0
+    ));
+    // Если сейчас ещё до 07:30 МСК — граница вчера в 07:30
+    if(now < todayBound) todayBound = new Date(todayBound.getTime() - 86400000);
+    return Math.floor(todayBound.getTime() / 1000);
+  }
+
+  // ── Попадает ли запись в окно 07:30 МСК вчера — 07:30 МСК сегодня
   function _is24hRecent(dateStr){
     if(!dateStr) return false;
-    // dateStr формат "ДД.ММ.ГГГГ ЧЧ:ММ" или ISO
     var ts;
-    // Попробуем "DD.MM.YYYY HH:MM"
+    // Формат "ДД.ММ.ГГГГ ЧЧ:ММ" (UTC от сервера)
     var m = dateStr.match(/^(\d{2})\.(\d{2})\.(\d{4})\s(\d{2}):(\d{2})/);
     if(m){
       ts = Date.UTC(+m[3], +m[2]-1, +m[1], +m[4], +m[5]) / 1000;
     } else {
       ts = Date.parse(dateStr) / 1000;
     }
-    return !isNaN(ts) && ts >= (Date.now()/1000 - 86400);
+    return !isNaN(ts) && ts >= _windowStartTs();
   }
 
   // ── Отрисовка одной записи
@@ -572,7 +583,7 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
       lastSuffix = ' <span style="color:#94a3b8;font-size:0.8rem">(' + act.sender_lastname + ')</span>';
     }
     var receiptBtn = '';
-    if(act.receipt_id){
+    if(act.receipt_id && act.is_outgoing){
       receiptBtn = '<button class="btn-receipt" onclick="openReceipt('+ACCOUNT_ID+',\''+act.receipt_id+'\')" title="Показать чек">📄</button>';
     }
     return '<li class="tx-item" data-type="'+cls+'">' +

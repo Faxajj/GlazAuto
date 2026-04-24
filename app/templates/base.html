@@ -399,14 +399,28 @@
   <script>
   // ── USDT/ARS Rate Widget ────────────────────────────────────────────────
   (function(){
-    var STORAGE_KEY = 'usdt_ars_history';
+    var STORAGE_KEY = 'usdt_ars_history_v2'; // v2 — сбрасываем старый кэш
     var MAX_POINTS  = 288; // 24ч по 1 точке в 5 мин = 288 точек
 
-    // Загружаем историю из localStorage
+    // Граница окна 07:30 МСК (= 04:30 UTC) в виде unix timestamp
+    function _windowStartTs(){
+      var now = new Date();
+      var b = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 4, 30, 0, 0));
+      if(now < b) b = new Date(b.getTime() - 86400000);
+      return Math.floor(b.getTime() / 1000);
+    }
+
+    // Загружаем историю из localStorage, автоматически вычищая данные вне окна
     function loadHistory(){
       try {
         var raw = localStorage.getItem(STORAGE_KEY);
-        return raw ? JSON.parse(raw) : [];
+        var hist = raw ? JSON.parse(raw) : [];
+        var wStart = _windowStartTs();
+        var filtered = hist.filter(function(p){ return p.ts >= wStart; });
+        if(filtered.length !== hist.length){
+          try { localStorage.setItem(STORAGE_KEY, JSON.stringify(filtered)); } catch(e){}
+        }
+        return filtered;
       } catch(e){ return []; }
     }
 
@@ -501,14 +515,48 @@
     var ageEl  = document.getElementById('rate-age');
     var widget = document.getElementById('rate-widget');
 
-    // Показываем сохранённые данные мгновенно при загрузке
-    var hist = loadHistory();
+    // Показываем сохранённые данные мгновенно (только если они актуальны — в текущем окне)
+    var hist = loadHistory(); // уже профильтровано _windowStartTs()
     if(hist.length){
       var last = hist[hist.length-1];
       if(buyEl)  buyEl.textContent  = fmtRate(last.b);
       if(sellEl) sellEl.textContent = fmtRate(last.s);
+      if(ageEl)  ageEl.textContent  = ageLabel(last.ts);
       drawChart(hist);
     }
+
+    // Грузим историю с сервера (DB уже обрезана по 07:30 МСК) — заполняет пробелы
+    function _bootstrapServerHistory(){
+      fetch('/api/rate-history?hours=24')
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+          var pts = d.history || [];
+          if(!pts.length) return;
+          // Мержим серверные точки в localStorage
+          var local = loadHistory();
+          var localTs = {};
+          local.forEach(function(p){ localTs[p.ts] = true; });
+          var added = false;
+          pts.forEach(function(p){
+            if(!localTs[p.ts]){
+              local.push({ ts: p.ts, b: p.buy_avg, s: p.sell_avg });
+              added = true;
+            }
+          });
+          if(added){
+            local.sort(function(a,b){ return a.ts - b.ts; });
+            if(local.length > MAX_POINTS) local = local.slice(local.length - MAX_POINTS);
+            try { localStorage.setItem(STORAGE_KEY, JSON.stringify(local)); } catch(e){}
+            drawChart(local);
+            var lastPt = local[local.length-1];
+            if(buyEl && lastPt.b != null)  buyEl.textContent  = fmtRate(lastPt.b);
+            if(sellEl && lastPt.s != null) sellEl.textContent = fmtRate(lastPt.s);
+            if(ageEl)  ageEl.textContent  = ageLabel(lastPt.ts);
+          }
+        })
+        .catch(function(){});
+    }
+    _bootstrapServerHistory();
 
     var _loading = false;
 
