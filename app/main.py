@@ -1740,6 +1740,30 @@ async def _fetch_bybit_p2p() -> dict:
     }
 
 
+@app.get("/api/debug-pp-headers/{account_id}")
+async def api_debug_pp_headers(account_id: int):
+    """Диагностика: показывает точные заголовки которые сервер отправляет в PersonalPay."""
+    acc = get_account(account_id)
+    if not acc or acc["bank_type"] != "personalpay":
+        return JSONResponse({"error": "PP account not found"}, status_code=404)
+    try:
+        from app.drivers.personalpay import _norm_creds, _base_headers, _paygilant_id, _get_token, _session
+        c = _norm_creds(acc["credentials"])
+        s = _session(c)
+        token, paygilant = _get_token(s, c)
+        headers = _base_headers(c)
+        headers["Authorization"] = token[:20] + "…[TRUNCATED]"
+        headers["x-fraud-paygilant-session-id"] = paygilant
+        return JSONResponse({
+            "headers_sent": headers,
+            "device_id": c.get("device_id") or "(EMPTY — нет device_id в credentials!)",
+            "app_version": c.get("app_version"),
+            "user_agent": c.get("user_agent"),
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @app.get("/api/bybit-rate")
 async def api_bybit_rate():
     """Возвращает текущий курс USDT/ARS с Bybit P2P.
