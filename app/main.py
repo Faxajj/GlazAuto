@@ -444,9 +444,16 @@ def _normalize_activity(act: dict) -> dict:
         or act.get("title") or act.get("description")
         or str(aid or "Операция")
     )
-    receipt_id = _find_32char_hex_id(act)
+    # receipt_id: для PP — transactionId (36-символьный hex); для остальных — ищем 32-символьный hex
+    receipt_id = (
+        act.get("transactionId") or attrs.get("transactionId")
+        or _find_32char_hex_id(act)
+    )
 
-    amount = attrs.get("amount") or attrs.get("monto") or act.get("amount") or act.get("monto")
+    # PP: amount может быть объектом {"value": 5000, "status": "positive", "currencySymbol": "+"}
+    _raw_amount = attrs.get("amount") or attrs.get("monto") or act.get("amount") or act.get("monto")
+    _amount_obj: dict = _raw_amount if isinstance(_raw_amount, dict) else {}
+    amount = _amount_obj.get("value") if _amount_obj else _raw_amount
     if amount is not None:
         try:
             amount = float(amount)
@@ -498,13 +505,32 @@ def _normalize_activity(act: dict) -> dict:
     elif any(t in tx_type for t in _INCOMING_TYPES):
         is_outgoing = False
     else:
-        # Fallback по заголовку/описанию (персональный пей, старый формат)
-        is_outgoing = (
-            "enviaste" in title_lower
-            or "envío" in title_lower
-            or "transferencia enviada" in title_lower
-            or "out" in tx_type
-        )
+        # PP: amount.status = "positive"/"negative" или currencySymbol = "+"/"-"
+        _amt_status = (_amount_obj.get("status") or "").lower()
+        _amt_symbol = (_amount_obj.get("currencySymbol") or "").strip()
+        if _amt_status == "negative" or _amt_symbol == "-":
+            is_outgoing = True
+        elif _amt_status == "positive" or _amt_symbol == "+":
+            is_outgoing = False
+        else:
+            # Fallback по заголовку/описанию
+            is_outgoing = (
+                "enviaste" in title_lower
+                or "envío" in title_lower
+                or "transferencia enviada" in title_lower
+                or "out" in tx_type
+            )
+
+    # PP: description = "de NOMBRE" (входящий) или "a NOMBRE" / "para NOMBRE" (исходящий)
+    _desc_raw = (attrs.get("description") or act.get("description") or "").strip()
+    _desc_lower = _desc_raw.lower()
+    _desc_name: Optional[str] = None
+    if _desc_lower.startswith("de "):
+        _desc_name = _desc_raw[3:].strip()
+    elif _desc_lower.startswith("para "):
+        _desc_name = _desc_raw[5:].strip()
+    elif _desc_lower.startswith("a ") and len(_desc_raw) > 2:
+        _desc_name = _desc_raw[2:].strip()
 
     inner = act.get("transference") if isinstance(act.get("transference"), dict) else act
 
@@ -516,6 +542,8 @@ def _normalize_activity(act: dict) -> dict:
     sender = (
         attrs.get("remitente") or attrs.get("sender") or attrs.get("originName") or attrs.get("senderName")
         or act.get("remitente") or act.get("sender") or act.get("from")
+        # PP: "de NOMBRE" в description → отправитель при входящей
+        or (_desc_name if not is_outgoing else None)
         # AstroPay: origin.name / origin.first_name
         or (_join_name(origin_obj.get("first_name"), None) if origin_obj else None)
         or _find_in_details(act, "remitente", "titular", "origen", "sender", "nombre", "envía", "envia")
@@ -534,6 +562,8 @@ def _normalize_activity(act: dict) -> dict:
     recipient = (
         attrs.get("destinatario") or attrs.get("recipient") or attrs.get("recipientName")
         or act.get("destinatario") or act.get("recipient") or act.get("to")
+        # PP: "a NOMBRE" / "para NOMBRE" в description → получатель при исходящей
+        or (_desc_name if is_outgoing else None)
         # AstroPay: destination.name / destination.first_name
         or (_join_name(dest_obj.get("first_name"), None) if dest_obj else None)
         or _find_in_details(act, "destinatario", "beneficiario", "recipient", "nombre", "recibe")
@@ -1001,6 +1031,55 @@ async def api_account_status(account_id: int):
         "is_limit_reached": count >= DAILY_WITHDRAW_LIMIT,
         "is_near_limit": count >= (DAILY_WITHDRAW_LIMIT - 1),
     })
+
+
+@app.get("/account/{account_id}/receipt")
+async def api_receipt(account_id: int, ref: str = ""):
+    """Возвращает информацию о чеке по ID транзакции.
+    PP  → {"type":"details", "confirmation_id":..., "amount":..., ...}
+    AP  → {"type":"pdf", "url":"https://files.astropay.com/..."}
+    """
+    acc = get_account(account_id)
+    if not acc:
+        return JSONResponse({"error": "account not found"}, status_code=404)
+    if not ref:
+        return JSONResponse({"error": "ref required"}, status_code=400)
+    bank = acc["bank_type"]
+    try:
+        if bank == "astropay":
+            from app.drivers.astropay import get_receipt as ap_get_receipt
+            data = await asyncio.to_thread(ap_get_receipt, acc["credentials"], ref)
+            pdf_url = data.get("file_resource") or data.get("file_path") or ""
+            return JSONResponse({"type": "pdf", "url": pdf_url})
+
+        elif bank == "personalpay":
+            from app.drivers.personalpay import get_transference_details
+            data = await asyncio.to_thread(get_transference_details, acc["credentials"], ref)
+            t    = data.get("transference") or data
+            td   = t.get("transactionData") or {}
+            orig = td.get("origin") or {}
+            dest = td.get("destination") or {}
+            sd   = t.get("stateDetail") or {}
+            return JSONResponse({
+                "type":            "details",
+                "transaction_id":  t.get("id") or ref,
+                "confirmation_id": t.get("confirmationId") or "",
+                "amount":          t.get("amount"),
+                "currency":        (t.get("currency") or {}).get("iso4217") or "ARS",
+                "date":            t.get("confirmationDate") or t.get("created") or "",
+                "state":           sd.get("message") or t.get("state") or "",
+                "sender":          orig.get("holder") or "",
+                "sender_cbu":      orig.get("cbu") or "",
+                "recipient_alias": dest.get("label") or "",
+                "recipient_cbu":   dest.get("cbu") or "",
+            })
+
+        else:
+            return JSONResponse({"error": "not supported"}, status_code=400)
+
+    except Exception as e:
+        logger.exception("api_receipt error account=%d ref=%s", account_id, ref)
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/account/{account_id}/activities")
