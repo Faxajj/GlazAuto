@@ -1140,6 +1140,25 @@ body {
   box-shadow: 0 0 0 2px rgba(56,189,248,0.2);
 }
 
+/* ── Кнопка чека в строке истории ────────────────── */
+.btn-receipt {
+  background: none;
+  border: 1px solid #334155;
+  border-radius: 0.35rem;
+  color: #94a3b8;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.1rem 0.35rem;
+  margin-left: 0.4rem;
+  line-height: 1.4;
+  flex-shrink: 0;
+  transition: border-color 0.15s, color 0.15s;
+}
+.btn-receipt:hover {
+  border-color: #38bdf8;
+  color: #38bdf8;
+}
+
 button[disabled],
 .btn-primary[disabled] {
   cursor: not-allowed;
