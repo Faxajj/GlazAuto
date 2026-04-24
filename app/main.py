@@ -513,12 +513,17 @@ def _normalize_activity(act: dict) -> dict:
     elif any(t in tx_type for t in _INCOMING_TYPES):
         is_outgoing = False
     else:
-        # PP: amount.status = "positive"/"negative" или currencySymbol = "+"/"-"
-        _amt_status = (_amount_obj.get("status") or "").lower()
+        # PP: currencySymbol = "-" → вывод, "+" → приход
+        # ВАЖНО: amount.status всегда "positive" даже для выводов — не использовать для направления!
         _amt_symbol = (_amount_obj.get("currencySymbol") or "").strip()
-        if _amt_status == "negative" or _amt_symbol == "-":
+        _amt_status = (_amount_obj.get("status") or "").lower()
+        if _amt_symbol == "-":
             is_outgoing = True
-        elif _amt_status == "positive" or _amt_symbol == "+":
+        elif _amt_symbol == "+":
+            is_outgoing = False
+        elif _amt_status == "negative":
+            is_outgoing = True
+        elif _amt_status == "positive":
             is_outgoing = False
         else:
             # Fallback по заголовку/описанию
@@ -1076,23 +1081,91 @@ async def api_receipt(account_id: int, ref: str = ""):
         elif bank == "personalpay":
             from app.drivers.personalpay import get_transference_details
             data = await asyncio.to_thread(get_transference_details, acc["credentials"], ref)
-            t    = data.get("transference") or data
+            t  = data.get("transference") or data
+            sd = t.get("stateDetail") or {}
+
+            # ── Читаем массив details (label/value пары от PP API) ──────────
+            # Реальные лейблы из PP API (x-body-version: 2)
+            label_ru = {
+                "fecha":             "Fecha",
+                "hora":              "Hora",
+                "envía":             "Envía",
+                "envia":             "Envía",
+                "recibe":            "Recibe",
+                "desde":             "Desde",
+                "cuil/cuit":         "CUIL/CUIT",
+                "banco/billetera":   "Banco/Billetera",
+                "cbu/cvu":           "CBU/CVU",
+                "nº de la operación":"Nº operación",
+                "coelsaid":          "CoelsaID",
+                "monto":             "Monto",
+                "amount":            "Monto",
+                "estado":            "Estado",
+                "state":             "Estado",
+                "date":              "Fecha",
+                "remitente":         "Envía",
+                "destinatario":      "Recibe",
+                "id":                "ID operación",
+                "confirmacion":      "Confirmación",
+            }
+            skip_labels = {"utr"}
+            rows = []
+            seen = set()
+            for d in (t.get("details") or []):
+                if not isinstance(d, dict):
+                    continue
+                lbl_raw = (d.get("label") or d.get("key") or "").strip()
+                val = str(d.get("value") or d.get("displayValue") or "").strip()
+                if not val or lbl_raw.lower() in skip_labels:
+                    continue
+                lbl_show = label_ru.get(lbl_raw.lower()) or lbl_raw
+                key = (lbl_show + "|" + val)
+                if key in seen:
+                    continue
+                seen.add(key)
+                rows.append({"label": lbl_show, "value": val})
+
+            # ── Добавляем поля верхнего уровня если details пустой ──────────
             td   = t.get("transactionData") or {}
             orig = td.get("origin") or {}
             dest = td.get("destination") or {}
-            sd   = t.get("stateDetail") or {}
+
+            def _add(lbl, val):
+                if val and (lbl + "|" + str(val)) not in seen:
+                    rows.append({"label": lbl, "value": str(val)})
+
+            amount_raw = t.get("amount")
+            currency   = (t.get("currency") or {}).get("iso4217") or "ARS"
+            if amount_raw is not None:
+                try:
+                    amt_fmt = f"{float(amount_raw):,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+                    _add("Monto", f"{amt_fmt} {currency}")
+                except Exception:
+                    _add("Monto", f"{amount_raw} {currency}")
+
+            _add("Estado",        sd.get("message") or t.get("state") or "")
+            _add("Fecha",         t.get("confirmationDate") or t.get("created") or t.get("date") or "")
+            _add("Confirmación",  t.get("confirmationId") or "")
+            _add("Remitente",     orig.get("holder") or "")
+            _add("Cuenta origen", orig.get("cbu") or "")
+            _add("Destinatario",  dest.get("label") or dest.get("holder") or "")
+            _add("CVU destino",   dest.get("cbu") or "")
+            _add("ID",            t.get("id") or ref)
+
+            # Если всё равно пусто — показываем сырые данные из ответа PP
+            if not rows:
+                for k, v in t.items():
+                    if k.startswith("_") or isinstance(v, (dict, list)):
+                        continue
+                    if v is not None and str(v).strip():
+                        rows.append({"label": k, "value": str(v)})
+                if not rows:
+                    rows.append({"label": "ID транзакции", "value": ref})
+
             return JSONResponse({
-                "type":            "details",
-                "transaction_id":  t.get("id") or ref,
-                "confirmation_id": t.get("confirmationId") or "",
-                "amount":          t.get("amount"),
-                "currency":        (t.get("currency") or {}).get("iso4217") or "ARS",
-                "date":            t.get("confirmationDate") or t.get("created") or "",
-                "state":           sd.get("message") or t.get("state") or "",
-                "sender":          orig.get("holder") or "",
-                "sender_cbu":      orig.get("cbu") or "",
-                "recipient_alias": dest.get("label") or "",
-                "recipient_cbu":   dest.get("cbu") or "",
+                "type":  "rows",
+                "rows":  rows,
+                "title": sd.get("message") or t.get("state") or "Чек",
             })
 
         else:
