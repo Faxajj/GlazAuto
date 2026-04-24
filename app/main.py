@@ -493,10 +493,15 @@ def _normalize_activity(act: dict) -> dict:
     _OUTGOING_TYPES = {
         "transfer_sent", "send", "output", "outgoing", "withdrawal",
         "debit", "salida", "envio", "pago",
+        # PersonalPay outgoing types
+        "bankoutputtransfer", "outertransfer", "externaloutput",
+        "transferout", "cashout", "commitmain", "commitouter",
     }
     _INCOMING_TYPES = {
         "transfer_received", "receive", "input", "incoming", "deposit",
         "credit", "entrada", "cobro",
+        # PersonalPay incoming types
+        "bankinputtransfer", "externalinput", "transferin", "cashin",
     }
 
     is_outgoing: bool
@@ -1001,7 +1006,19 @@ async def api_balance(account_id: int):
         code = "bank_unavailable"
         if any(x in low for x in ("proxyerror", "proxy", "tunnel connection failed", "cannot connect to proxy")):
             code = "bank_unavailable"
-        elif any(x in low for x in ("401", "403", "token", "unauthorized", "forbidden", "jwt")):
+        elif "401" in low or "unauthorized" in low:
+            code = "token_expired"
+        elif "403" in low or "forbidden" in low:
+            # 403 с живым токеном — чаще всего неверный device_id или x-fraud-paygilant-session-id
+            code = "token_expired"
+            err = (
+                "403 Forbidden — токен отклонён банком. "
+                "Возможные причины: (1) Вставьте свежий auth_token из HTTP Toolkit. "
+                "(2) Добавьте в credentials поле x_fraud_paygilant_session_id "
+                "(скопируйте заголовок x-fraud-paygilant-session-id из любого запроса в приложении). "
+                f"Оригинал ошибки: {err}"
+            )
+        elif any(x in low for x in ("token", "jwt", "истёк", "expired")):
             code = "token_expired"
         return JSONResponse({
             "error": err,
@@ -1009,7 +1026,8 @@ async def api_balance(account_id: int):
                 code,
                 details=err,
                 suggestion=(
-                    "Откройте настройки карты и обновите токен, затем повторите обновление баланса."
+                    "Откройте настройки карты и обновите auth_token. "
+                    "Если токен свежий — также скопируйте x-fraud-paygilant-session-id из HTTP Toolkit."
                     if code == "token_expired"
                     else "Проверьте настройки прокси/сети и повторите через 1–2 минуты."
                 ),
