@@ -870,9 +870,21 @@ window.openReceipt = function(accountId, ref){
         body.innerHTML = '<p class="alert alert-error">'+d.error+'</p>';
         return;
       }
-      if(d.type === 'pdf' && d.url){
-        modal.style.display = 'none';
-        window.open(d.url, '_blank');
+      if(d.type === 'pdf'){
+        if(d.url){
+          body.innerHTML =
+            '<div style="text-align:center;padding:1.25rem 0">' +
+            '<p style="font-size:0.95rem;color:#94a3b8;margin-bottom:1rem">Чек сформирован</p>' +
+            '<a href="'+d.url+'" target="_blank" rel="noopener" '+
+               'style="display:inline-block;padding:0.65rem 1.5rem;background:#0ea5e9;color:#fff;'+
+               'border-radius:8px;text-decoration:none;font-weight:600;font-size:0.95rem">'+
+               '📄 Открыть PDF-чек</a>' +
+            '<p style="font-size:0.78rem;color:#64748b;margin-top:0.75rem">'+
+               'Если ссылка не открывается — разрешите всплывающие окна в браузере</p>' +
+            '</div>';
+        } else {
+          body.innerHTML = '<p style="color:#f87171;padding:0.5rem 0">PDF-ссылка недоступна. Попробуйте позже.</p>';
+        }
         return;
       }
       if(d.type === 'details'){
