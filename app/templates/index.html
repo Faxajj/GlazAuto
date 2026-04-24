@@ -911,8 +911,6 @@ window.openReceipt = function(accountId, ref){
         // Сохраняем строки для печати
         window._ppReceiptRows = rows;
         window._ppPrintReceipt = function(){
-          var w = window.open('','_blank','width=430,height=860');
-          if(!w){ alert('Разрешите всплывающие окна для печати'); return; }
           var rr = window._ppReceiptRows || [];
 
           // Поиск значения по лейблу
@@ -926,12 +924,25 @@ window.openReceipt = function(accountId, ref){
             return '';
           }
 
-          // Форматируем сумму как в PP: 1400000 → main="1.400.000" cents="00"
+          // Форматируем сумму как в PP: "$ 830.000,00" → main="830.000" cents="00"
+          // Формат аргентинский: точка — разделитель тысяч, запятая — десятичная
           function _fmtAmt(raw){
-            var s=(raw||'').toString().replace(/[^\d]/g,'');
-            var n=parseInt(s||'0',10);
+            var s=(raw||'').toString().trim();
+            // Оставляем только цифры, точки и запятые
+            s=s.replace(/[^0-9.,]/g,'').trim();
+            var cents='00';
+            // Ищем десятичную запятую: последняя запятая с ровно 2 цифрами после неё
+            var commaIdx=s.lastIndexOf(',');
+            if(commaIdx!==-1 && s.length-commaIdx===3){
+              cents=s.slice(commaIdx+1);
+              s=s.slice(0,commaIdx);
+            }
+            // Убираем разделители тысяч (точки)
+            s=s.replace(/\./g,'');
+            var n=parseInt(s||'0',10)||0;
+            // Форматируем обратно с разделителем тысяч (es-AR использует точку)
             var main=n.toLocaleString('es-AR');
-            return {main:main, cents:'00'};
+            return {main:main, cents:cents};
           }
 
           var amtRaw = _f(['monto','amount']);
@@ -989,8 +1000,17 @@ window.openReceipt = function(accountId, ref){
            +'<script>setTimeout(function(){window.print();},700);<\/script>'
            +'</body></html>';
 
-          w.document.write(html);
-          w.document.close();
+          // Открываем в новой вкладке через Blob URL (не popup)
+          try{
+            var blob=new Blob([html],{type:'text/html'});
+            var blobUrl=URL.createObjectURL(blob);
+            var tab=window.open(blobUrl,'_blank');
+            // Освобождаем URL через 60с (вкладка уже загрузила страницу)
+            setTimeout(function(){URL.revokeObjectURL(blobUrl);},60000);
+            if(!tab){ alert('Разрешите всплывающие окна в настройках браузера'); }
+          }catch(e){
+            alert('Ошибка открытия чека: '+e);
+          }
         };
         return;
       }
