@@ -114,6 +114,27 @@ State-Token:
       </p>
     </div>
 
+    {# ── PersonalPay: вставь заголовки из HTTP Toolkit ── #}
+    <div id="pp-headers-row" style="display:none" class="form-row">
+      <label for="pp_raw_headers">Заголовки из HTTP Toolkit (PersonalPay) *</label>
+      <textarea id="pp_raw_headers" rows="12" class="textarea-json"
+                placeholder="authorization:
+eyJ0eXAiOiJKV1QiLCJraWQiOi...
+x-app-version:
+2.0.1074
+x-app-os:
+android
+x-fraud-paygilant-session-id:
+3ce3d113932942ba_1777028600947
+User-Agent:
+okhttp/4.12.0"></textarea>
+      <p class="form-hint">
+        HTTP Toolkit → запрос к <code>mobile.prod.personalpay.dev</code> → вкладка
+        <strong>Request → Headers</strong> → выдели всё и скопируй сюда.
+        <code>auth_token</code> и <code>device_id</code> заполнятся автоматически.
+      </p>
+    </div>
+
     {# ── Credentials JSON ── #}
     <div class="form-row" id="creds-json-row">
       <label for="credentials_json">Credentials (JSON) *</label>
@@ -141,15 +162,17 @@ UniversalCoins:
   var bankSel      = document.getElementById('bank_type');
   var apHeadersRow = document.getElementById('ap-headers-row');
   var apRefreshRow = document.getElementById('ap-refresh-row');
+  var ppHeadersRow = document.getElementById('pp-headers-row');
   var credsJsonRow = document.getElementById('creds-json-row');
   var hintAP       = document.getElementById('creds-hint-ap');
   var hintOther    = document.getElementById('creds-hint-other');
   var credJson     = document.getElementById('credentials_json');
   var apRawHeaders = document.getElementById('ap_raw_headers');
+  var ppRawHeaders = document.getElementById('pp_raw_headers');
   var form         = document.getElementById('add-account-form');
 
-  // Маппинг: заголовок (lowercase) → ключ credentials
-  var HEADER_MAP = {
+  // ── AstroPay: маппинг заголовков → ключи credentials
+  var AP_HEADER_MAP = {
     'authorization':  'auth_token',
     'amp-device-id':  'amp_device_id',
     'amp-session-id': 'amp_session_id',
@@ -161,18 +184,25 @@ UniversalCoins:
     'device-info':    'device_info'
   };
 
+  // ── PersonalPay: маппинг заголовков → ключи credentials
+  var PP_HEADER_MAP = {
+    'authorization':                 'auth_token',
+    'x-fraud-paygilant-session-id':  'x_fraud_paygilant_session_id',
+    'x-app-version':                 'app_version',
+    'x-app-os':                      'app_os'
+  };
+
   // Парсит формат HTTP Toolkit: строки чередуются «Имя:» / «Значение»
-  function parseRawHeaders(text) {
+  function parseRawHeaders(text, headerMap) {
     var result = {};
     var lines = text.split('\n');
     var i = 0;
     while (i < lines.length) {
       var line = lines[i].trim();
-      if (!line) { i++; continue; }
-      // Строка-заголовок заканчивается на ':'
+      if (!line || line === 'Headers') { i++; continue; }
       if (line.slice(-1) === ':') {
         var name = line.slice(0, -1).trim();
-        var key = HEADER_MAP[name.toLowerCase()];
+        var key = headerMap[name.toLowerCase()];
         var value = (lines[i + 1] || '').trim();
         if (key && value) {
           result[key] = value;
@@ -185,11 +215,33 @@ UniversalCoins:
     return result;
   }
 
-  // Обновляет JSON-textarea из вставленных заголовков
+  // Обновляет JSON-textarea из вставленных AP-заголовков
   function syncAPHeaders() {
     var raw = apRawHeaders.value;
     if (!raw.trim()) return;
-    var parsed = parseRawHeaders(raw);
+    var parsed = parseRawHeaders(raw, AP_HEADER_MAP);
+    try {
+      var existing = {};
+      try { existing = JSON.parse(credJson.value || '{}'); } catch(e) {}
+      var merged = Object.assign({}, existing, parsed);
+      credJson.value = JSON.stringify(merged, null, 2);
+    } catch(e) {}
+  }
+
+  // Обновляет JSON-textarea из вставленных PP-заголовков
+  function syncPPHeaders() {
+    var raw = ppRawHeaders.value;
+    if (!raw.trim()) return;
+    var parsed = parseRawHeaders(raw, PP_HEADER_MAP);
+    // Из x_fraud_paygilant_session_id автоматически вытаскиваем device_id
+    var paygilant = parsed['x_fraud_paygilant_session_id'] || '';
+    if (paygilant) {
+      parsed['device_id'] = paygilant.split('_')[0].trim();
+    }
+    // auth_token: убираем «Bearer » если вставили с ним
+    if (parsed['auth_token'] && parsed['auth_token'].toUpperCase().startsWith('BEARER ')) {
+      parsed['auth_token'] = parsed['auth_token'].slice(7).trim();
+    }
     try {
       var existing = {};
       try { existing = JSON.parse(credJson.value || '{}'); } catch(e) {}
@@ -200,11 +252,13 @@ UniversalCoins:
 
   function onBankChange() {
     var isAP = bankSel.value === 'astropay';
+    var isPP = bankSel.value === 'personalpay';
     apHeadersRow.style.display = isAP ? '' : 'none';
     apRefreshRow.style.display = isAP ? '' : 'none';
-    hintAP.style.display       = isAP ? '' : 'none';
-    hintOther.style.display    = isAP ? 'none' : '';
-    if (isAP) {
+    ppHeadersRow.style.display = isPP ? '' : 'none';
+    hintAP.style.display       = (isAP || isPP) ? '' : 'none';
+    hintOther.style.display    = (isAP || isPP) ? 'none' : '';
+    if (isAP || isPP) {
       credJson.placeholder = 'Заполнится автоматически из заголовков выше.\nМожно также вставить/исправить вручную.';
     } else {
       credJson.placeholder = 'Personal Pay:\n{ "auth_token": "eyJ...", "device_id": "178DC6C7-..." }\n\nUniversalCoins:\n{ "username": "email@example.com", "password": "пароль", "pin": "123456" }';
@@ -214,21 +268,26 @@ UniversalCoins:
   bankSel.addEventListener('change', onBankChange);
   apRawHeaders.addEventListener('input', syncAPHeaders);
   apRawHeaders.addEventListener('paste', function(){ setTimeout(syncAPHeaders, 0); });
+  ppRawHeaders.addEventListener('input', syncPPHeaders);
+  ppRawHeaders.addEventListener('paste', function(){ setTimeout(syncPPHeaders, 0); });
   onBankChange();
 
-  // При сабмите — вставляем refresh_token в JSON
+  // При сабмите — вставляем refresh_token в JSON (только AstroPay)
   form.addEventListener('submit', function(){
-    if (bankSel.value !== 'astropay') return;
-    // Ещё раз синхронизируем на случай если не было события input
-    syncAPHeaders();
-    var refreshVal = (document.getElementById('ap_refresh_token').value || '').trim();
-    if (!refreshVal) return;
-    try {
-      var creds = {};
-      try { creds = JSON.parse(credJson.value || '{}'); } catch(e) {}
-      creds.refresh_token = refreshVal;
-      credJson.value = JSON.stringify(creds, null, 2);
-    } catch(e) {}
+    if (bankSel.value === 'astropay') {
+      syncAPHeaders();
+      var refreshVal = (document.getElementById('ap_refresh_token').value || '').trim();
+      if (refreshVal) {
+        try {
+          var creds = {};
+          try { creds = JSON.parse(credJson.value || '{}'); } catch(e) {}
+          creds.refresh_token = refreshVal;
+          credJson.value = JSON.stringify(creds, null, 2);
+        } catch(e) {}
+      }
+    } else if (bankSel.value === 'personalpay') {
+      syncPPHeaders();
+    }
   });
 })();
 </script>

@@ -91,6 +91,27 @@ AMP-Device-ID:
     </div>
     {% endif %}
 
+    {# ── PersonalPay: вставка свежих заголовков ── #}
+    {% if account.bank_type == 'personalpay' %}
+    <div class="form-row">
+      <label for="pp_raw_headers">Вставить новые заголовки из HTTP Toolkit (PersonalPay)</label>
+      <textarea id="pp_raw_headers" rows="10" class="textarea-json"
+                placeholder="Вставь сюда заголовки из HTTP Toolkit чтобы обновить токен.
+Пример:
+authorization:
+eyJ0eXAiOiJKV1QiLCJraWQiOi...
+x-fraud-paygilant-session-id:
+3ce3d113932942ba_1777028600947
+x-app-version:
+2.0.1074"></textarea>
+      <p class="form-hint">
+        HTTP Toolkit → запрос к <code>mobile.prod.personalpay.dev</code> → вкладка
+        <strong>Request → Headers</strong> → выдели всё и скопируй сюда.
+        <code>auth_token</code> и <code>device_id</code> обновятся автоматически.
+      </p>
+    </div>
+    {% endif %}
+
     {# ── Credentials JSON ── #}
     <div class="form-row">
       <label for="credentials_json">Credentials (JSON) *</label>
@@ -119,7 +140,6 @@ AMP-Device-ID:
   var refreshEl    = document.getElementById('ap_refresh_token');
   var apRawHeaders = document.getElementById('ap_raw_headers');
 
-  // Маппинг заголовков → ключи credentials
   var HEADER_MAP = {
     'authorization':  'auth_token',
     'amp-device-id':  'amp_device_id',
@@ -132,16 +152,16 @@ AMP-Device-ID:
     'device-info':    'device_info'
   };
 
-  function parseRawHeaders(text) {
+  function parseRawHeaders(text, map) {
     var result = {};
     var lines = text.split('\n');
     var i = 0;
     while (i < lines.length) {
       var line = lines[i].trim();
-      if (!line) { i++; continue; }
+      if (!line || line === 'Headers') { i++; continue; }
       if (line.slice(-1) === ':') {
         var name = line.slice(0, -1).trim();
-        var key = HEADER_MAP[name.toLowerCase()];
+        var key = map[name.toLowerCase()];
         var value = (lines[i + 1] || '').trim();
         if (key && value) {
           result[key] = value;
@@ -157,7 +177,7 @@ AMP-Device-ID:
   function syncAPHeaders() {
     var raw = apRawHeaders.value;
     if (!raw.trim()) return;
-    var parsed = parseRawHeaders(raw);
+    var parsed = parseRawHeaders(raw, HEADER_MAP);
     try {
       var existing = {};
       try { existing = JSON.parse(credJson.value || '{}'); } catch(e) {}
@@ -170,9 +190,7 @@ AMP-Device-ID:
   apRawHeaders.addEventListener('paste', function(){ setTimeout(syncAPHeaders, 0); });
 
   form.addEventListener('submit', function(){
-    // Синхронизируем заголовки если есть
     syncAPHeaders();
-    // Вставляем refresh_token
     var refreshVal = refreshEl ? refreshEl.value.trim() : '';
     if (!refreshVal) return;
     try {
@@ -181,6 +199,73 @@ AMP-Device-ID:
       creds.refresh_token = refreshVal;
       credJson.value = JSON.stringify(creds, null, 2);
     } catch(e) {}
+  });
+})();
+</script>
+{% endif %}
+
+{% if account.bank_type == 'personalpay' %}
+<script>
+(function(){
+  var form         = document.getElementById('edit-account-form');
+  var credJson     = document.getElementById('credentials_json');
+  var ppRawHeaders = document.getElementById('pp_raw_headers');
+
+  var PP_HEADER_MAP = {
+    'authorization':                'auth_token',
+    'x-fraud-paygilant-session-id': 'x_fraud_paygilant_session_id',
+    'x-app-version':                'app_version',
+    'x-app-os':                     'app_os'
+  };
+
+  function parseRawHeaders(text, map) {
+    var result = {};
+    var lines = text.split('\n');
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i].trim();
+      if (!line || line === 'Headers') { i++; continue; }
+      if (line.slice(-1) === ':') {
+        var name = line.slice(0, -1).trim();
+        var key = map[name.toLowerCase()];
+        var value = (lines[i + 1] || '').trim();
+        if (key && value) {
+          result[key] = value;
+          i += 2;
+          continue;
+        }
+      }
+      i++;
+    }
+    return result;
+  }
+
+  function syncPPHeaders() {
+    var raw = ppRawHeaders.value;
+    if (!raw.trim()) return;
+    var parsed = parseRawHeaders(raw, PP_HEADER_MAP);
+    // Автоматически вытаскиваем device_id из paygilant session id
+    var paygilant = parsed['x_fraud_paygilant_session_id'] || '';
+    if (paygilant) {
+      parsed['device_id'] = paygilant.split('_')[0].trim();
+    }
+    // Убираем «Bearer » если вставили с ним
+    if (parsed['auth_token'] && parsed['auth_token'].toUpperCase().startsWith('BEARER ')) {
+      parsed['auth_token'] = parsed['auth_token'].slice(7).trim();
+    }
+    try {
+      var existing = {};
+      try { existing = JSON.parse(credJson.value || '{}'); } catch(e) {}
+      var merged = Object.assign({}, existing, parsed);
+      credJson.value = JSON.stringify(merged, null, 2);
+    } catch(e) {}
+  }
+
+  ppRawHeaders.addEventListener('input', syncPPHeaders);
+  ppRawHeaders.addEventListener('paste', function(){ setTimeout(syncPPHeaders, 0); });
+
+  form.addEventListener('submit', function(){
+    syncPPHeaders();
   });
 })();
 </script>

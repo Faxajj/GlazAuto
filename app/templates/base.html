@@ -539,7 +539,8 @@
           var added = false;
           pts.forEach(function(p){
             if(!localTs[p.ts]){
-              local.push({ ts: p.ts, b: p.buy_avg, s: p.sell_avg });
+              // Сервер возвращает ключи b и s (не buy_avg/sell_avg)
+              local.push({ ts: p.ts, b: p.b, s: p.s });
               added = true;
             }
           });

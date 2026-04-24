@@ -84,10 +84,28 @@
   var MSK_OFFSET  = 3 * 3600; // UTC+3
 
   // ── Серверная история (основная) + localStorage (резерв) ─────────────────
-  var STORAGE_KEY = 'usdt_ars_history';
+  var STORAGE_KEY = 'usdt_ars_history_v2'; // v2 — сбрасываем старый кэш
+
+  // Граница окна 07:30 МСК (= 04:30 UTC)
+  function _windowStartTs(){
+    var now = new Date();
+    var b = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 4, 30, 0, 0));
+    if(now < b) b = new Date(b.getTime() - 86400000);
+    return Math.floor(b.getTime() / 1000);
+  }
 
   function loadLocalHistory(){
-    try { var r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : []; }
+    try {
+      var r = localStorage.getItem(STORAGE_KEY);
+      var hist = r ? JSON.parse(r) : [];
+      // Вычищаем данные вне текущего окна 07:30–07:30
+      var wStart = _windowStartTs();
+      var filtered = hist.filter(function(p){ return p.ts >= wStart; });
+      if(filtered.length !== hist.length){
+        try { localStorage.setItem(STORAGE_KEY, JSON.stringify(filtered)); } catch(e){}
+      }
+      return filtered;
+    }
     catch(e){ return []; }
   }
 
@@ -144,7 +162,7 @@
       document.querySelectorAll('.period-btn').forEach(function(b){ b.classList.remove('active'); });
       btn.classList.add('active');
       activeHours = parseInt(btn.getAttribute('data-hours')) || 0;
-      fetchServerHistory(activeHours || 48);
+      fetchServerHistory(activeHours || 24); // max 24 — не выходим за окно
     });
   });
 
@@ -366,6 +384,8 @@
     // Дублируем в localStorage как резерв
     if(!d || d.error) return;
     var ts  = d.ts || Math.floor(Date.now()/1000);
+    // Не сохраняем точки вне текущего окна
+    if(ts < _windowStartTs()) return;
     var hist = loadLocalHistory();
     var lastTs = hist.length ? hist[hist.length-1].ts : 0;
     if(ts - lastTs < 55) return;
@@ -374,13 +394,17 @@
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(hist)); } catch(e){}
   }
 
-  // Загружаем серверную историю
+  // Загружаем серверную историю (только текущее окно 07:30–07:30)
   function fetchServerHistory(hours){
-    hours = hours || (activeHours || 24);
+    hours = Math.min(hours || activeHours || 24, 24);
     return fetch('/api/rate-history?hours=' + hours)
       .then(function(r){ return r.json(); })
       .then(function(d){
-        if(d.history) _serverHistory = d.history;
+        if(d.history){
+          // Дополнительно фильтруем по окну на клиенте
+          var wStart = _windowStartTs();
+          _serverHistory = d.history.filter(function(p){ return p.ts >= wStart; });
+        }
         render();
       })
       .catch(function(){});
@@ -395,8 +419,7 @@
       .then(function(d){
         _loading = false;
         pushLocalPoint(d);
-        // Перезагружаем историю с сервера
-        fetchServerHistory(48);
+        fetchServerHistory(24);
         // Обновляем текущую цену в виджете хедера тоже
         var buyEl  = document.getElementById('rate-buy');
         var sellEl = document.getElementById('rate-sell');
@@ -407,12 +430,12 @@
   }
 
   // Первый рендер — загружаем историю с сервера сразу
-  fetchServerHistory(48);
+  fetchServerHistory(24);
   fetchAndRender();
 
   // Обновление каждые 10 минут
   setInterval(function(){
-    fetchServerHistory(48);
+    fetchServerHistory(24);
   }, 600000);
 
   // Кнопка обновить
