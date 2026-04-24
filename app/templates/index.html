@@ -855,7 +855,7 @@ function showWithdrawConfirm(dest, amt, recipientName, onConfirm){
 // ЧЕКИ — openReceipt(accountId, ref)
 // AP → PDF в новой вкладке; PP → модальное окно с деталями
 // ─────────────────────────────────────────────────────────
-function openReceipt(accountId, ref){
+window.openReceipt = function(accountId, ref){
   var modal = document.getElementById('receipt-modal');
   var body  = document.getElementById('receipt-modal-body');
   if(!modal || !body) return;
@@ -902,7 +902,7 @@ function openReceipt(accountId, ref){
     .catch(function(e){
       body.innerHTML = '<p class="alert alert-error">'+String(e)+'</p>';
     });
-}
+};
 
 })();
 </script>
