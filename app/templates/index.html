@@ -887,29 +887,114 @@ window.openReceipt = function(accountId, ref){
         }
         return;
       }
-      if(d.type === 'details'){
-        var fmt2 = function(v){ return v != null ? Number(v).toLocaleString('es-AR',{minimumFractionDigits:2}) : '—'; };
-        var rows = [
-          ['Подтверждение', d.confirmation_id || '—'],
-          ['Сумма',         d.amount != null ? fmt2(d.amount)+' '+(d.currency||'ARS') : '—'],
-          ['Дата',          d.date ? d.date.replace('T',' ').substring(0,19) : '—'],
-          ['Статус',        d.state || '—'],
-          ['Отправитель',   d.sender || '—'],
-          ['CBU отправителя', d.sender_cbu || '—'],
-          ['Получатель (alias)', d.recipient_alias || '—'],
-          ['CBU получателя', d.recipient_cbu || '—'],
-          ['ID операции',   d.transaction_id || '—'],
-        ];
-        var html = '<table style="width:100%;border-collapse:collapse;font-size:0.9rem">';
+      if(d.type === 'details' || d.type === 'rows'){
+        var rows = d.rows || [];
+        if(!rows.length){
+          body.innerHTML = '<p style="color:#64748b">Данные чека недоступны.</p>';
+          return;
+        }
+        var tableHtml = '<table style="width:100%;border-collapse:collapse;font-size:0.9rem">';
         rows.forEach(function(r){
-          html += '<tr><td style="padding:0.35rem 0.5rem;color:#94a3b8;white-space:nowrap">'+r[0]+'</td>'
-               +  '<td style="padding:0.35rem 0.5rem;font-family:monospace;word-break:break-all">'+r[1]+'</td></tr>';
+          var lbl = r.label || r[0] || '';
+          var val = r.value || r[1] || '—';
+          tableHtml += '<tr>'
+            + '<td style="padding:0.4rem 0.6rem;color:#94a3b8;white-space:nowrap;vertical-align:top;min-width:120px">'+lbl+'</td>'
+            + '<td style="padding:0.4rem 0.6rem;word-break:break-all;color:#e2e8f0">'+val+'</td>'
+            + '</tr>';
         });
-        html += '</table>';
-        body.innerHTML = html;
+        tableHtml += '</table>';
+        var printBtn = '<div style="text-align:right;margin-top:1rem">'
+          + '<button onclick="window._ppPrintReceipt()" '
+          + 'style="padding:0.5rem 1.1rem;background:#334155;color:#e2e8f0;border:1px solid #475569;'
+          + 'border-radius:8px;cursor:pointer;font-size:0.85rem">🖨 Сохранить как PDF</button></div>';
+        body.innerHTML = tableHtml + printBtn;
+        // Сохраняем строки для печати
+        window._ppReceiptRows = rows;
+        window._ppPrintReceipt = function(){
+          var w = window.open('','_blank','width=430,height=860');
+          if(!w){ alert('Разрешите всплывающие окна для печати'); return; }
+          var rr = window._ppReceiptRows || [];
+
+          // Поиск значения по лейблу
+          function _f(labels){
+            for(var i=0;i<rr.length;i++){
+              var l=(rr[i].label||'').toLowerCase();
+              for(var j=0;j<labels.length;j++){
+                if(l.indexOf(labels[j])!==-1) return rr[i].value||'';
+              }
+            }
+            return '';
+          }
+
+          // Форматируем сумму как в PP: 1400000 → main="1.400.000" cents="00"
+          function _fmtAmt(raw){
+            var s=(raw||'').toString().replace(/[^\d]/g,'');
+            var n=parseInt(s||'0',10);
+            var main=n.toLocaleString('es-AR');
+            return {main:main, cents:'00'};
+          }
+
+          var amtRaw = _f(['monto','amount']);
+          var amt = _fmtAmt(amtRaw);
+
+          // Все строки details[] — выводим в том же порядке что PP
+          var detailRows='';
+          rr.forEach(function(r){
+            if(!r.value) return;
+            detailRows+='<div class="row"><span class="rl">'+r.label+'</span><span class="rv">'+r.value+'</span></div>';
+          });
+
+          var css=
+            '*{box-sizing:border-box;margin:0;padding:0}'
+           +'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;'
+           +'background:#fff;color:#111;max-width:430px;margin:0 auto}'
+           +'.bar{display:flex;align-items:center;justify-content:center;padding:14px 16px;'
+           +'border-bottom:1px solid #eee;position:relative}'
+           +'.bar-title{font-size:17px;font-weight:600}'
+           +'.hero{text-align:center;padding:28px 20px 18px}'
+           +'.hero-ico{width:52px;height:52px;background:#e8f5e9;border-radius:50%;'
+           +'display:inline-flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:12px}'
+           +'.hero-lbl{font-size:15px;font-weight:600;color:#2e7d32;margin-bottom:14px}'
+           +'.hero-amt{font-size:52px;font-weight:700;line-height:1;color:#111;letter-spacing:-2px}'
+           +'.hero-amt sup{font-size:24px;font-weight:700;vertical-align:super;line-height:0;letter-spacing:0}'
+           +'.hero-sym{font-size:38px}'
+           +'.sep{height:1px;background:#f0f0f0}'
+           +'.row{display:flex;justify-content:space-between;align-items:flex-start;'
+           +'padding:13px 20px;border-bottom:1px solid #f5f5f5}'
+           +'.rl{font-size:14px;color:#666;flex-shrink:0;padding-right:12px}'
+           +'.rv{font-size:14px;color:#111;text-align:right;word-break:break-all}'
+           +'.comp{text-align:center;padding:24px 20px;border-top:1px solid #eee}'
+           +'.comp-btn{background:none;border:none;color:#2e7d32;font-size:15px;font-weight:500;'
+           +'cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:6px}'
+           +'.fab{position:fixed;bottom:20px;right:20px;background:#2e7d32;color:#fff;'
+           +'border:none;border-radius:50px;padding:11px 20px;font-size:14px;font-weight:600;'
+           +'cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.22);font-family:inherit}'
+           +'@media print{.fab{display:none}body{max-width:100%}}';
+
+          var html=
+            '<!DOCTYPE html><html><head><meta charset="UTF-8">'
+           +'<meta name="viewport" content="width=device-width,initial-scale=1">'
+           +'<title>Detalle de operación</title>'
+           +'<style>'+css+'</style></head><body>'
+           +'<div class="bar"><span class="bar-title">Detalle de operación</span></div>'
+           +'<div class="hero">'
+           +'<div class="hero-ico">💸</div>'
+           +'<div class="hero-lbl">Enviaste dinero</div>'
+           +'<div class="hero-amt"><span class="hero-sym">$</span>'+amt.main+'<sup>'+amt.cents+'</sup></div>'
+           +'</div>'
+           +'<div class="sep"></div>'
+           +detailRows
+           +'<div class="comp"><button class="comp-btn" onclick="window.print()">📄 Comprobante</button></div>'
+           +'<button class="fab" onclick="window.print()">⬇ Guardar PDF</button>'
+           +'<script>setTimeout(function(){window.print();},700);<\/script>'
+           +'</body></html>';
+
+          w.document.write(html);
+          w.document.close();
+        };
         return;
       }
-      body.innerHTML = '<pre style="font-size:0.8rem;overflow:auto">'+JSON.stringify(d,null,2)+'</pre>';
+      body.innerHTML = '<pre style="font-size:0.8rem;overflow:auto;color:#94a3b8">'+JSON.stringify(d,null,2)+'</pre>';
     })
     .catch(function(e){
       body.innerHTML = '<p class="alert alert-error">'+String(e)+'</p>';
