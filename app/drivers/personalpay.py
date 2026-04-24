@@ -52,19 +52,30 @@ def _norm_creds(creds: dict) -> dict:
 def _base_headers(c: dict) -> dict:
     # User-Agent как в приложении — без замены %20 на пробел
     ua = (c["user_agent"] or "Personal%20Pay/2.0.1074 CFNetwork/3826.600.41 Darwin/24.6.0").strip()
-    return {
+
+    # x-app-os: определяем из User-Agent чтобы не было противоречия.
+    # Если явно задано в credentials — используем его.
+    _explicit_os = (c.get("app_os") or "").strip()
+    if _explicit_os:
+        app_os = _explicit_os
+    elif "darwin" in ua.lower() or "cfnetwork" in ua.lower() or "ios" in ua.lower():
+        app_os = "ios"
+    else:
+        app_os = "android"
+
+    headers = {
         "Accept":           "application/json, text/plain, */*",
-        "Accept-Language":  "es-AR",
+        "Accept-Language":  "ru",
         "Content-Type":     "application/json",
-        # Новый формат заголовков (актуальный, с x-)
         "x-app-version":    c["app_version"],
-        "x-app-os":         c.get("app_os") or "android",
+        "x-app-os":         app_os,
         # Старый формат (оставляем для совместимости)
         "appversion":       c["app_version"],
         "osversion":        c["os_version"],
         "useragent":        c["useragent_device"],
         "User-Agent":       ua,
     }
+    return headers
 
 
 def _paygilant_id(device_id: str) -> str:
