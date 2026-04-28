@@ -1910,10 +1910,13 @@ async def _fetch_bybit_p2p() -> dict:
         logger.debug("Bybit P2P side=%s items=%d prices=%s", side_code, len(items), prices[:3])
         return prices
 
-    # Запрашиваем обе стороны параллельно
+    # Запрашиваем обе стороны параллельно.
+    # Bybit P2P: side="1" → мерчант ПРОДАЁТ USDT вам (вы покупаете, платите ARS) → BUY rate
+    #            side="0" → мерчант ПОКУПАЕТ USDT у вас (вы продаёте, получаете ARS) → SELL rate
+    # Норма: BUY > SELL (вы всегда платите больше, чем получаете).
     buy_prices, sell_prices = await asyncio.gather(
-        fetch_side("0"),   # BUY  — вы покупаете USDT
-        fetch_side("1"),   # SELL — вы продаёте USDT
+        fetch_side("1"),   # BUY  — вы покупаете USDT (мерчант продаёт)
+        fetch_side("0"),   # SELL — вы продаёте USDT (мерчант покупает)
     )
 
     buy_avg  = round(statistics.mean(buy_prices),  2) if buy_prices  else None
