@@ -2,6 +2,10 @@
 Personal Pay API — работа по переданным credentials (dict).
 Прод-версия с безопасными таймаутами.
 """
+import base64
+import hashlib
+import json
+import threading
 import time
 import uuid
 from typing import Optional
@@ -11,6 +15,16 @@ from requests import exceptions as req_exc
 
 
 HTTP_TIMEOUT = (5, 12)  # (connect, read) — даём API время ответить, без лишнего ожидания
+
+# ---------------------------------------------------------------------------
+# Кэш токенов (AstroPay-style авто-обновление через PIN)
+# ---------------------------------------------------------------------------
+_pp_token_cache: dict = {}          # key → {"token": str, "expires_at": float}
+_pp_token_lock = threading.Lock()   # защита кэша от гонок
+_pp_refreshed_tokens: dict = {}     # device_id → new_token, ожидает сохранения в БД
+
+# SHA-256 от дефолтного PIN-кода (используется если pin_hash не задан в credentials)
+_DEFAULT_PIN_HASH = "3bd9fa371342f9d53b917a59430208dca20f2f508e1337dbb4969543508d2c0f"  # PIN: 464646
 
 
 def _norm_creds(creds: dict) -> dict:
@@ -37,7 +51,7 @@ def _norm_creds(creds: dict) -> dict:
         "device_id": device_id,
         "push_device_token": (creds.get("push_device_token") or "").strip(),
         "auth_token": (creds.get("auth_token") or "").strip(),
-        "pin_hash": (creds.get("pin_hash") or "").strip(),
+        "pin_hash": (creds.get("pin_hash") or _DEFAULT_PIN_HASH).strip(),
         "app_version": (creds.get("app_version") or "2.0.1074").strip(),
         "app_os": (creds.get("app_os") or creds.get("x_app_os") or "android").strip(),
         "os_version": (creds.get("os_version") or "18.6.2").strip(),
@@ -73,6 +87,29 @@ def _paygilant_id(device_id: str) -> str:
     return f"{device_id}_{int(time.time() * 1000)}"
 
 
+def _pp_jwt_exp(token: str) -> Optional[float]:
+    """Извлекает поле `exp` из JWT-пейлоада (без верификации подписи)."""
+    try:
+        parts = token.split(".")
+        pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(pad))
+        exp = payload.get("exp")
+        return float(exp) if exp else None
+    except Exception:
+        return None
+
+
+def _pp_account_key(c: dict) -> str:
+    """Ключ кэша: device_id или первые 40 символов токена."""
+    return (c.get("device_id") or c.get("auth_token") or "default")[:40]
+
+
+def consume_refreshed_token(device_id: str) -> Optional[str]:
+    """Извлекает и возвращает свежий токен, полученный при авто-обновлении.
+    Вызывается из main.py чтобы сохранить новый JWT в БД."""
+    return _pp_refreshed_tokens.pop(device_id, None) or _pp_refreshed_tokens.pop((device_id or "")[:40], None)
+
+
 def _session(c: dict) -> requests.Session:
     s = requests.Session()
     # На сервере (Ubuntu/VPS) частая проблема — egress IP датацентра блочится anti-fraud API.
@@ -104,15 +141,14 @@ def _request_with_proxy_fallback(method: str, c: dict, url: str, **kwargs):
             return session2.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
         raise
 
-def _get_token(session: requests.Session, c: dict) -> tuple:
-    """Возвращает (значение для заголовка Authorization, paygilant_session_id).
-    Personal Pay в перехвате шлёт Authorization без 'Bearer ' — только голый JWT. Так и отдаём."""
+def _get_token_direct(c: dict) -> tuple:
+    """Возвращает (token, paygilant) напрямую из credentials — без авто-обновления.
+    Используется внутри PIN-refresh чтобы избежать рекурсии."""
     if c.get("auth_token"):
         token = c["auth_token"].strip()
-        # Убираем Bearer, если пользователь вставил — приложение шлёт только eyJ...
         if token.upper().startswith("BEARER "):
             token = token[7:].strip()
-        return token, _paygilant_id(c["device_id"] or "no_device")
+        return token, _paygilant_id(c.get("device_id") or "no_device")
     if not all([c.get("device_id"), c.get("username"), c.get("password"), c.get("push_device_token")]):
         raise ValueError("Заполни device_id, username, password, push_device_token или задай auth_token")
     paygilant = _paygilant_id(c["device_id"])
@@ -142,6 +178,103 @@ def _get_token(session: requests.Session, c: dict) -> tuple:
     if not token:
         raise RuntimeError("Токен не найден в ответе логина. Задай PP_AUTH_TOKEN из перехвата.")
     return token, paygilant
+
+
+def _do_pin_refresh(c: dict) -> Optional[str]:
+    """Внутренняя функция: PIN-refresh без авто-обновления (без рекурсии через _get_token).
+    Возвращает новый JWT или None."""
+    pin_hash = c.get("pin_hash", "").strip()
+    if not pin_hash:
+        return None
+    try:
+        token, paygilant = _get_token_direct(c)
+        base_hdrs = _base_headers(c) | {
+            "Authorization": token,
+            "x-fraud-paygilant-session-id": paygilant,
+        }
+        post_hdrs = _post_headers(c) | {
+            "Authorization": token,
+            "x-fraud-paygilant-session-id": paygilant,
+        }
+        # Шаг 1 — имитируем возврат в приложение (игнорируем ошибки)
+        try:
+            _request_with_proxy_fallback(
+                "POST", c, f"{c['base_url']}/identity/auth/session/focus/changed",
+                headers=post_hdrs, json={"hasFocus": True},
+            )
+        except Exception:
+            pass
+        # Шаг 2 — валидируем PIN (SHA-256 hex)
+        r_pin = _request_with_proxy_fallback(
+            "POST", c, f"{c['base_url']}/identity/auth/pin/validate",
+            headers=post_hdrs, json={"pin": pin_hash},
+        )
+        if r_pin.status_code not in (200, 201):
+            return None
+        # Шаг 3 — статус сессии (PP может вернуть новый JWT здесь)
+        r_status = _request_with_proxy_fallback(
+            "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
+            headers=base_hdrs,
+        )
+        if r_status.status_code == 200:
+            body = r_status.json()
+            new_token = (
+                body.get("idToken") or body.get("id_token")
+                or body.get("accessToken") or body.get("access_token")
+                or body.get("token") or ""
+            )
+            if new_token and str(new_token).startswith("eyJ"):
+                return str(new_token)
+        return None
+    except Exception:
+        return None
+
+
+def _get_token(session: requests.Session, c: dict) -> tuple:
+    """Возвращает (token, paygilant_session_id) для PP-запросов.
+    Если pin_hash задан и JWT истекает (< 5 мин) — прозрачно обновляет через PIN (как AstroPay).
+    Лок удерживается только для чтения/записи кэша, HTTP-вызовы делаются вне лока."""
+    key = _pp_account_key(c)
+    pin_hash = c.get("pin_hash", "").strip()
+    now = time.time()
+    do_refresh = False
+
+    with _pp_token_lock:
+        cached = _pp_token_cache.get(key)
+        # Свежий кэш — отдаём сразу (без HTTP-запроса)
+        if cached and cached.get("expires_at", 0) > now + 300:
+            return cached["token"], _paygilant_id(c.get("device_id") or "no_device")
+
+        # Кэш устарел или пуст — пробуем инициализировать из credentials
+        raw_token = (c.get("auth_token") or "").strip()
+        if raw_token.upper().startswith("BEARER "):
+            raw_token = raw_token[7:].strip()
+
+        if raw_token:
+            exp = _pp_jwt_exp(raw_token)
+            # Токен ещё свеж — кэшируем и отдаём
+            if exp and exp > now + 300:
+                _pp_token_cache[key] = {"token": raw_token, "expires_at": exp}
+                return raw_token, _paygilant_id(c.get("device_id") or "no_device")
+
+        # Токен истёк/истекает — нужен PIN-refresh (делаем вне лока)
+        do_refresh = bool(pin_hash)
+
+    # HTTP-вызов PIN-refresh вне лока, чтобы не блокировать другие потоки
+    if do_refresh:
+        new_token = _do_pin_refresh(c)
+        if new_token:
+            exp = _pp_jwt_exp(new_token) or (now + 43200)  # 12 ч по умолчанию
+            with _pp_token_lock:
+                _pp_token_cache[key] = {"token": new_token, "expires_at": exp}
+            c["auth_token"] = new_token  # обновляем c in-place
+            # Сигнализируем main.py что нужно сохранить в БД
+            device_id = (c.get("device_id") or "")[:40]
+            _pp_refreshed_tokens[device_id] = new_token
+            return new_token, _paygilant_id(c.get("device_id") or "no_device")
+
+    # PIN не задан или refresh не удался — возвращаем текущий токен как есть
+    return _get_token_direct(c)
 
 
 def get_accounts(credentials: dict) -> dict:
@@ -337,3 +470,84 @@ def get_transference_details(credentials: dict, transaction_id: str) -> dict:
             err = f"{resp.status_code} {getattr(resp, 'reason', '')}" if resp is not None else str(e)
             errors.append(f"{name}: {err}")
     raise RuntimeError("Не удалось получить чек: " + "; ".join(errors))
+
+
+# ---------------------------------------------------------------------------
+# CVU / владелец аккаунта
+# ---------------------------------------------------------------------------
+
+def get_cvu_info(credentials: dict) -> dict:
+    """GET /payments/cashin/b2c-bff-service/cvu — CVU-номер и алиас счёта."""
+    c = _norm_creds(credentials)
+    session = _session(c)
+    token, paygilant = _get_token(session, c)
+    headers = _base_headers(c) | {
+        "Authorization": token,
+        "x-fraud-paygilant-session-id": paygilant,
+    }
+    r = _request_with_proxy_fallback(
+        "GET", c, f"{c['base_url']}/payments/cashin/b2c-bff-service/cvu",
+        headers=headers,
+    )
+    if r.status_code == 304:
+        return {}
+    r.raise_for_status()
+    return r.json()
+
+
+def get_owner_name_from_jwt(auth_token: str) -> Optional[str]:
+    """Пытается извлечь имя владельца из JWT-токена PP (поля given_name / name / family_name)."""
+    token = (auth_token or "").strip()
+    if token.upper().startswith("BEARER "):
+        token = token[7:].strip()
+    if not token.startswith("eyJ") or "." not in token:
+        return None
+    try:
+        parts = token.split(".")
+        pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(pad))
+        # PP кладёт в name UUID или email — не нужно
+        # Реальное ФИО бывает в given_name + family_name
+        given  = (payload.get("given_name") or "").strip()
+        family = (payload.get("family_name") or "").strip()
+        full   = (payload.get("full_name") or payload.get("name") or "").strip()
+
+        # Если family_name выглядит как email — не используем
+        if given and "@" not in given:
+            if family and "@" not in family:
+                return f"{given} {family}"
+            return given
+        if full and "@" not in full and len(full) > 2 and not full.startswith("9ff"):
+            return full
+        return None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# PIN-refresh — обновление сессии через PIN-код
+# ---------------------------------------------------------------------------
+
+def pin_hash_from_pin(pin_code: str) -> str:
+    """SHA-256 PIN-кода в нижнем регистре hex — именно так PP отправляет PIN."""
+    return hashlib.sha256(pin_code.encode()).hexdigest()
+
+
+def refresh_session_with_pin(credentials: dict) -> Optional[str]:
+    """Публичный API: продлевает сессию PP через PIN-валидацию и обновляет кэш токенов.
+    Используется кнопкой «Обновить через PIN» в UI (через /account/{id}/pin-refresh).
+
+    Возвращает новый auth_token если PP выдал его, иначе None.
+    credentials должны содержать "pin_hash" (SHA-256 от PIN-кода).
+    """
+    c = _norm_creds(credentials)
+    if not c.get("pin_hash"):
+        return None
+    new_token = _do_pin_refresh(c)
+    if new_token:
+        key = _pp_account_key(c)
+        now = time.time()
+        exp = _pp_jwt_exp(new_token) or (now + 43200)
+        with _pp_token_lock:
+            _pp_token_cache[key] = {"token": new_token, "expires_at": exp}
+    return new_token
