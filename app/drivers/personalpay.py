@@ -203,21 +203,39 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
         )
         if r_pin.status_code not in (200, 201):
             return None
-        # Шаг 3 — статус сессии (PP может вернуть новый JWT здесь)
-        r_status = _request_with_proxy_fallback(
-            "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
-            headers=base_hdrs,
-        )
-        if r_status.status_code == 200:
-            body = r_status.json()
-            new_token = (
-                body.get("idToken") or body.get("id_token")
-                or body.get("accessToken") or body.get("access_token")
-                or body.get("token") or ""
+        # Шаг 3 — статус сессии
+        # PP продлевает серверную сессию через PIN — новый JWT может не выдаваться.
+        # Если находим JWT в ответе — возвращаем его.
+        # Если нет — возвращаем существующий токен: сервер уже принял сессию как активную.
+        existing_token = token  # токен с которым мы вошли (может быть "просроченным" по exp)
+        try:
+            r_status = _request_with_proxy_fallback(
+                "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
+                headers=base_hdrs,
             )
-            if new_token and str(new_token).startswith("eyJ"):
-                return str(new_token)
-        return None
+            if r_status.status_code == 200:
+                try:
+                    body = r_status.json()
+                except Exception:
+                    body = {}
+                # Ищем новый JWT во всех возможных полях (включая вложенные)
+                data = body.get("data") or body
+                new_token = (
+                    data.get("idToken") or data.get("id_token")
+                    or data.get("accessToken") or data.get("access_token")
+                    or data.get("token")
+                    or body.get("idToken") or body.get("id_token")
+                    or body.get("accessToken") or body.get("access_token")
+                    or body.get("token") or ""
+                )
+                if new_token and str(new_token).startswith("eyJ"):
+                    return str(new_token)
+        except Exception:
+            pass
+
+        # PIN принят → сессия продлена на сервере.
+        # Возвращаем существующий токен — он снова работает (серверный exp сброшен).
+        return existing_token
     except Exception:
         return None
 
