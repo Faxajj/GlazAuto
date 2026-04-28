@@ -67,6 +67,7 @@ from app.drivers import (
 from app.drivers.personalpay import (
     get_activities_list as pp_activities_list,
     get_transference_details as pp_transference_details,
+    consume_refreshed_token as pp_consume_refreshed_token,
 )
 
 # ---------------------------------------------------------------------------
@@ -1007,6 +1008,41 @@ async def api_balance(account_id: int):
         info.pop("raw_accounts", None)
         info["account_withdraw_count"] = get_account_withdraw_count(account_id)
         info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
+
+        # ── Имя владельца (PersonalPay) ──────────────────────────────────────
+        if acc["bank_type"] == "personalpay":
+            from app.drivers.personalpay import get_owner_name_from_jwt, get_cvu_info
+            owner = get_owner_name_from_jwt(acc["credentials"].get("auth_token", ""))
+            if not owner:
+                # Пробуем CVU endpoint — он часто возвращает полное имя владельца
+                try:
+                    cvu_data = await asyncio.to_thread(get_cvu_info, acc["credentials"])
+                    owner = (
+                        cvu_data.get("holder") or cvu_data.get("holderName")
+                        or cvu_data.get("name") or cvu_data.get("fullName")
+                        or cvu_data.get("owner") or ""
+                    )
+                    # Если CVU endpoint вернул CVU - обновим если текущий пустой
+                    if not info.get("cvu_number"):
+                        info["cvu_number"] = cvu_data.get("cvu") or cvu_data.get("number") or ""
+                    if not info.get("cvu_alias"):
+                        info["cvu_alias"] = cvu_data.get("alias") or cvu_data.get("name") or ""
+                except Exception:
+                    pass
+            info["owner_name"] = str(owner).strip() if owner else ""
+
+            # ── Авто-сохранение обновлённого токена (PIN авто-refresh) ─────────
+            device_id = acc["credentials"].get("device_id", "")
+            new_tok = pp_consume_refreshed_token(device_id)
+            if new_tok:
+                new_creds = dict(acc["credentials"])
+                new_creds["auth_token"] = new_tok
+                try:
+                    db_update_account(account_id, credentials=new_creds)
+                    info["token_auto_refreshed"] = True
+                except Exception:
+                    pass
+
         return info
     except Exception as e:
         err = str(e)
@@ -1041,6 +1077,36 @@ async def api_balance(account_id: int):
                 ),
             ),
         }, status_code=500)
+
+
+@app.post("/account/{account_id}/pin-refresh")
+async def api_pin_refresh(account_id: int):
+    """Пробует продлить сессию PersonalPay через PIN-валидацию.
+    Требует поля pin_hash в credentials (SHA-256 от PIN-кода).
+    Если получен новый JWT — сохраняет его в БД и возвращает ok:true."""
+    acc = get_account(account_id)
+    if not acc or acc["bank_type"] != "personalpay":
+        return JSONResponse({"error": "PP account not found"}, status_code=404)
+    creds = acc.get("credentials") or {}
+    if not creds.get("pin_hash"):
+        return JSONResponse({
+            "ok": False,
+            "message": "pin_hash не задан. Добавьте SHA-256 от PIN-кода в credentials."
+        })
+    try:
+        from app.drivers.personalpay import refresh_session_with_pin
+        new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
+        if new_token:
+            new_creds = dict(creds)
+            new_creds["auth_token"] = new_token
+            db_update_account(account_id, credentials=new_creds)
+            return JSONResponse({"ok": True, "message": "Токен обновлён через PIN-валидацию"})
+        return JSONResponse({
+            "ok": False,
+            "message": "PIN принят (сессия продлена), но новый JWT не выдан. Текущий токен остаётся активным."
+        })
+    except Exception as e:
+        return JSONResponse({"ok": False, "message": str(e)}, status_code=500)
 
 
 @app.get("/account/{account_id}/status")
@@ -1204,6 +1270,14 @@ async def api_activities(
         if bank == "personalpay":
             data = await asyncio.to_thread(pp_activities_list, acc["credentials"], 0, 50)
             raw  = _extract_activities_raw(data)
+            # Если во время запроса произошёл авто-refresh токена — сохраняем в БД
+            _new_tok = pp_consume_refreshed_token(acc["credentials"].get("device_id", ""))
+            if _new_tok:
+                try:
+                    _nc = dict(acc["credentials"]); _nc["auth_token"] = _new_tok
+                    db_update_account(account_id, credentials=_nc)
+                except Exception:
+                    pass
         else:  # astropay
             from app.drivers.astropay import get_activities as ap_get_activities
             data = await asyncio.to_thread(ap_get_activities, acc["credentials"], 1, 50)
@@ -1588,6 +1662,16 @@ async def edit_account_post(
         return RedirectResponse(url=f"/account/{account_id}/edit?error=invalid_json", status_code=302)
     if acc["bank_type"] in ("personalpay", "astropay"):
         proxy_url = _proxy_from_parts(proxy_host, proxy_port, proxy_user, proxy_password, proxy_type, proxy_raw)
+        if not proxy_url:
+            # Если в форме прокси не указан — сохраняем старый из credentials
+            # (защита от случайной потери прокси при обновлении токена)
+            old_creds = acc.get("credentials") or {}
+            proxy_url = (
+                old_creds.get("https_proxy")
+                or old_creds.get("http_proxy")
+                or old_creds.get("proxy")
+                or ""
+            )
         credentials = _apply_proxy_to_credentials(proxy_url, credentials)
     if label.strip():
         db_update_account(account_id, label=label.strip())
@@ -1767,49 +1851,82 @@ _RATE_CACHE_TTL = 540  # 9 минут — обновление каждые 10 �
 
 async def _fetch_bybit_p2p() -> dict:
     """Получает топ-10 объявлений Bybit P2P USDT/ARS (buy + sell),
-    считает среднюю цену по каждой стороне."""
-    async def fetch_side(side: str) -> list:
+    считает среднюю цену по каждой стороне.
+
+    Bybit P2P API:
+      side=0 → объявления на ПОКУПКУ USDT (вы покупаете, мерчант продаёт) → BUY rate
+      side=1 → объявления на ПРОДАЖУ USDT (вы продаёте, мерчант покупает) → SELL rate
+    Обычно BUY > SELL (нормальный спред)."""
+
+    _BYBIT_HEADERS = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Origin":  "https://www.bybit.com",
+        "Referer": "https://www.bybit.com/fiat/trade/otc/",
+        "lang": "en",
+    }
+
+    async def fetch_side(side_code: str) -> list:
+        """Возвращает список цен (float) для указанной стороны (0=buy, 1=sell)."""
         url = "https://api2.bybit.com/fiat/otc/item/online"
         payload = {
-            "tokenId": "USDT",
+            "tokenId":    "USDT",
             "currencyId": "ARS",
-            "payment": [],
-            "side": "0" if side == "buy" else "1",  # 0=buy, 1=sell
-            "size": "10",
-            "page": "1",
+            "payment":    [],
+            "side":       side_code,   # строка "0" или "1"
+            "size":       "10",
+            "page":       "1",
+            "amount":     "",
+            "authMaker":  False,
+            "canTrade":   False,
         }
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0",
-        }
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(url, json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.post(url, json=payload, headers=_BYBIT_HEADERS)
             r.raise_for_status()
             data = r.json()
+
+        # Проверяем ret_code (0 = успех у Bybit)
+        ret_code = data.get("ret_code") or data.get("retCode") or 0
+        if ret_code != 0:
+            logger.warning("Bybit P2P side=%s ret_code=%s msg=%s",
+                           side_code, ret_code, data.get("ret_msg") or data.get("retMsg"))
+            return []
+
         items = (data.get("result") or {}).get("items") or []
         prices = []
         for item in items[:10]:
             try:
-                prices.append(float(item["price"]))
+                # price бывает строкой или числом
+                p = float(str(item.get("price") or item.get("Price") or 0).replace(",", "."))
+                if p > 0:
+                    prices.append(p)
             except Exception:
                 pass
+        logger.debug("Bybit P2P side=%s items=%d prices=%s", side_code, len(items), prices[:3])
         return prices
 
+    # Запрашиваем обе стороны параллельно
     buy_prices, sell_prices = await asyncio.gather(
-        fetch_side("buy"),
-        fetch_side("sell"),
+        fetch_side("0"),   # BUY  — вы покупаете USDT
+        fetch_side("1"),   # SELL — вы продаёте USDT
     )
 
     buy_avg  = round(statistics.mean(buy_prices),  2) if buy_prices  else None
     sell_avg = round(statistics.mean(sell_prices), 2) if sell_prices else None
+    # best: самая дешёвая покупка / самая дорогая продажа
     buy_best  = min(buy_prices)  if buy_prices  else None
     sell_best = max(sell_prices) if sell_prices else None
 
     return {
-        "buy_avg":   buy_avg,
-        "sell_avg":  sell_avg,
-        "buy_best":  buy_best,
-        "sell_best": sell_best,
+        "buy_avg":    buy_avg,
+        "sell_avg":   sell_avg,
+        "buy_best":   buy_best,
+        "sell_best":  sell_best,
         "buy_count":  len(buy_prices),
         "sell_count": len(sell_prices),
         "ts": int(time.time()),
@@ -1838,6 +1955,44 @@ async def api_debug_pp_headers(account_id: int):
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/bybit-debug")
+async def api_bybit_debug():
+    """Диагностика: сырой ответ Bybit P2P для обеих сторон (buy/sell).
+    Используй для проверки поля price и структуры ответа."""
+    results = {}
+    async with httpx.AsyncClient(timeout=12) as client:
+        for side_code, label in [("0", "buy"), ("1", "sell")]:
+            try:
+                payload = {
+                    "tokenId": "USDT", "currencyId": "ARS", "payment": [],
+                    "side": side_code, "size": "5", "page": "1",
+                    "amount": "", "authMaker": False, "canTrade": False,
+                }
+                headers = {
+                    "Content-Type": "application/json", "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Origin": "https://www.bybit.com",
+                    "Referer": "https://www.bybit.com/fiat/trade/otc/",
+                    "lang": "en",
+                }
+                r = await client.post("https://api2.bybit.com/fiat/otc/item/online",
+                                      json=payload, headers=headers)
+                data = r.json()
+                items = (data.get("result") or {}).get("items") or []
+                results[label] = {
+                    "status": r.status_code,
+                    "ret_code": data.get("ret_code") or data.get("retCode"),
+                    "item_count": len(items),
+                    "first_3_prices": [
+                        {"price": it.get("price"), "nickName": it.get("nickName")}
+                        for it in items[:3]
+                    ],
+                }
+            except Exception as e:
+                results[label] = {"error": str(e)}
+    return JSONResponse(results)
 
 
 @app.get("/api/bybit-rate")
