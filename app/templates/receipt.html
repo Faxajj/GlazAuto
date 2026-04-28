@@ -1,47 +1,70 @@
 {% extends "base.html" %}
 
-{% block title %}Чек перевода — {{ account.label }}{% endblock %}
+{% block title %}Чек — {{ account.label }}{% endblock %}
 
 {% block content %}
-<section class="card">
-  <h2>Детали перевода (чек)</h2>
-  <p class="meta">Transaction ID: <code>{{ transaction_id }}</code></p>
-  <p><a href="/?account_id={{ account.id }}">← Назад к аккаунту</a></p>
+<section class="card" style="max-width:520px;margin:0 auto">
+  <p style="margin-bottom:1rem"><a href="/?account_id={{ account.id }}">← Назад к аккаунту</a></p>
 
   {% if error %}
   <div class="alert alert-error">
     {{ error }}
     {% if '502' in error or 'Bad Gateway' in error %}
-    <p class="mt"><strong>Почему не открылось:</strong> сейчас передан ID из истории операций (24 символа). Для чека API банка требует <strong>ID банка — 32 символа</strong> (цифры и буквы A–F без дефисов). Его можно взять так: открой этот же чек в приложении Personal Pay → в HTTP Toolkit найди запрос <code>POST .../transference</code> → в теле скопируй значение <code>transactionId</code> (32 символа) и вставь в форму ниже.</p>
+    <p class="mt"><strong>Почему не открылось:</strong> для чека API банка требует <strong>ID банка (32 символа)</strong>. Его можно взять в HTTP Toolkit: <code>POST .../transference</code> → значение <code>transactionId</code>.</p>
     <form method="get" action="/account/{{ account.id }}/receipt" class="receipt-form mt">
       <input type="text" name="transaction_id" placeholder="Вставьте ID операции (32 символа)" class="receipt-input" />
       <button type="submit" class="btn-primary">Показать чек</button>
     </form>
     {% endif %}
   </div>
+
   {% elif transference %}
-  <div class="receipt-box receipt-card">
-    <h3 class="receipt-card-title">{{ receipt_title|default(transference.get('title', 'Чек перевода')) }}</h3>
-    <p class="receipt-amount">$ {{ amount_display|ars if amount_display != '' else transference.get('amount', '')|ars }} <span style="font-size:1rem;font-weight:400;opacity:0.7">ARS</span></p>
-    <dl class="receipt-dl">
+  {# ── PP-style чек ─────────────────────────────────────── #}
+  <div class="pp-receipt">
+
+    {# Логотип #}
+    <div class="pp-receipt__logo">
+      <span class="pp-receipt__logo-icon">⊙</span>
+      <span class="pp-receipt__logo-text">personal<strong>pay</strong></span>
+    </div>
+
+    <div class="pp-receipt__divider"></div>
+
+    {# Заголовок (Enviaste dinero / Recibiste dinero) #}
+    <p class="pp-receipt__title">{{ receipt_title|default(transference.get('title', 'Transferencia')) }}</p>
+
+    {# Сумма — большая, тонкая, с superscript центами #}
+    {% set _amt_raw = transference.get('amount', '') %}
+    {% set _amt_str = (_amt_raw | string | replace('-','') | trim) %}
+    {% if _amt_str %}
+      {% set _fmt = _amt_str | float | ars %}
+      {% set _parts = _fmt.split(',') %}
+    <p class="pp-receipt__amount {{ 'pp-receipt__amount--out' if is_outgoing else 'pp-receipt__amount--in' }}">
+      ${{ _parts[0] }}<sup class="pp-receipt__cents">{{ _parts[1] if _parts|length > 1 else '00' }}</sup>
+    </p>
+    {% endif %}
+
+    <div class="pp-receipt__divider"></div>
+
+    {# Строки чека #}
+    {% if receipt_lines %}
+    <dl class="pp-receipt__dl">
       {% for row in receipt_lines %}
-      <dt>{{ row.label }}</dt>
-      <dd>{{ row.value }}</dd>
+      <div class="pp-receipt__row">
+        <dt class="pp-receipt__label">{{ row.label }}</dt>
+        <dd class="pp-receipt__value">{{ row.value }}</dd>
+      </div>
       {% endfor %}
     </dl>
-    {% if not receipt_lines %}
-    <p class="meta">{{ transference.get('title', '') }}{% if transference.get('subject') %} — {{ transference.subject }}{% endif %}</p>
-    <ul class="receipt-details">
-      {% for d in (transference.get('details') or []) %}
-      <li>{{ d.get('label', '') }}: {{ d.get('value', d) }}</li>
-      {% endfor %}
-    </ul>
     {% endif %}
+
   </div>
-  <details class="receipt-raw">
+
+  <details class="receipt-raw" style="margin-top:1.5rem">
     <summary>Полный ответ API</summary>
     <pre class="code-block">{{ transference | tojson(indent=2) }}</pre>
   </details>
+
   {% else %}
   <p>Нет данных.</p>
   {% endif %}

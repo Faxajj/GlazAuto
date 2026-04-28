@@ -509,7 +509,8 @@ function loadBalance(force){
         }
 
         // Кешируем для мгновенного показа при следующей загрузке страницы
-        try { sessionStorage.setItem(_balCacheKey, JSON.stringify({text: balText, meta: metaText})); } catch(e){}
+        // Используем metaFull (включает owner_name) для корректного отображения
+        try { sessionStorage.setItem(_balCacheKey, JSON.stringify({text: balText, meta: metaFull || metaText})); } catch(e){}
       }
     })
     .catch(function(){
@@ -755,8 +756,9 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
     });
   }
 
-  // ── Первый запуск
-  loadActivities();
+  // ── Первый запуск — с задержкой 2.5 сек чтобы не конкурировать с запросом баланса
+  // (оба идут через прокси на PP API, одновременные запросы вызывают таймауты)
+  setTimeout(function(){ loadActivities(); }, 2500);
 }
 
 // ─────────────────────────────────────────────────────────
