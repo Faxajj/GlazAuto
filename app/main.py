@@ -1100,10 +1100,10 @@ async def api_pin_refresh(account_id: int):
             new_creds = dict(creds)
             new_creds["auth_token"] = new_token
             db_update_account(account_id, credentials=new_creds)
-            return JSONResponse({"ok": True, "message": "Токен обновлён через PIN-валидацию"})
+            return JSONResponse({"ok": True, "message": "Сессия продлена через PIN ✓"})
         return JSONResponse({
             "ok": False,
-            "message": "PIN принят (сессия продлена), но новый JWT не выдан. Текущий токен остаётся активным."
+            "message": "PIN не принят или сессия не продлена. Обновите auth_token вручную."
         })
     except Exception as e:
         return JSONResponse({"ok": False, "message": str(e)}, status_code=500)
