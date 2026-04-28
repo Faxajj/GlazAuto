@@ -1078,32 +1078,41 @@ async def api_balance(account_id: int):
     if not acc:
         return JSONResponse({"error": "account not found"}, status_code=404)
     try:
-        raw = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
-        info = _normalize_balance(raw, acc["bank_type"])
-        info.pop("raw_accounts", None)
-        info["account_withdraw_count"] = get_account_withdraw_count(account_id)
-        info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
-
-        # ── Имя владельца (PersonalPay) ──────────────────────────────────────
         if acc["bank_type"] == "personalpay":
             from app.drivers.personalpay import get_owner_name_from_jwt, get_cvu_info
+            # Запускаем balance и /cvu параллельно — не тратим лишних секунд
+            bal_result, cvu_result = await asyncio.gather(
+                asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"]),
+                asyncio.to_thread(get_cvu_info, acc["credentials"]),
+                return_exceptions=True,
+            )
+            if isinstance(bal_result, Exception):
+                raise bal_result
+            info = _normalize_balance(bal_result, acc["bank_type"])
+            info.pop("raw_accounts", None)
+            info["account_withdraw_count"] = get_account_withdraw_count(account_id)
+            info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
+
+            # /cvu даёт реальный CVU (22 цифры) и алиас — всегда перезаписываем
+            # (financial-accounts возвращает internal id и "Disponible" в name)
             owner = get_owner_name_from_jwt(acc["credentials"].get("auth_token", ""))
-            if not owner:
-                # Пробуем CVU endpoint — он часто возвращает полное имя владельца
-                try:
-                    cvu_data = await asyncio.to_thread(get_cvu_info, acc["credentials"])
+            if not isinstance(cvu_result, Exception) and isinstance(cvu_result, dict):
+                cvu_data = cvu_result
+                real_cvu = (
+                    cvu_data.get("cvu") or cvu_data.get("number")
+                    or cvu_data.get("cbu") or cvu_data.get("accountNumber") or ""
+                )
+                real_alias = cvu_data.get("alias") or cvu_data.get("aliasId") or ""
+                if real_cvu:
+                    info["cvu_number"] = real_cvu
+                if real_alias:
+                    info["cvu_alias"] = real_alias
+                if not owner:
                     owner = (
                         cvu_data.get("holder") or cvu_data.get("holderName")
-                        or cvu_data.get("name") or cvu_data.get("fullName")
-                        or cvu_data.get("owner") or ""
+                        or cvu_data.get("ownerName") or cvu_data.get("fullName")
+                        or cvu_data.get("name") or ""
                     )
-                    # Если CVU endpoint вернул CVU - обновим если текущий пустой
-                    if not info.get("cvu_number"):
-                        info["cvu_number"] = cvu_data.get("cvu") or cvu_data.get("number") or ""
-                    if not info.get("cvu_alias"):
-                        info["cvu_alias"] = cvu_data.get("alias") or cvu_data.get("name") or ""
-                except Exception:
-                    pass
             info["owner_name"] = str(owner).strip() if owner else ""
 
             # ── Авто-сохранение обновлённого токена (PIN авто-refresh) ─────────
@@ -1117,6 +1126,12 @@ async def api_balance(account_id: int):
                     info["token_auto_refreshed"] = True
                 except Exception:
                     pass
+        else:
+            raw = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
+            info = _normalize_balance(raw, acc["bank_type"])
+            info.pop("raw_accounts", None)
+            info["account_withdraw_count"] = get_account_withdraw_count(account_id)
+            info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
 
         return info
     except Exception as e:
@@ -1796,37 +1811,56 @@ async def receipt(request: Request, account_id: int, transaction_id: str = ""):
 
     transference = (data.get("transference") or data) if isinstance(data, dict) else None
     receipt_lines = []
+    # Сохраняем испанские лейблы как в оригинальном PP (1:1 совпадение с чеком PP)
     label_ru = {
-        "fecha": "Дата", "date": "Дата", "monto": "Сумма", "amount": "Сумма",
-        "estado": "Статус", "status": "Статус",
-        "remitente": "Отправитель", "titular": "Отправитель", "origen": "Отправитель",
-        "sender": "Отправитель", "cuenta origen": "Отправитель",
-        "nombre": "Имя получателя", "name": "Имя получателя",
-        "destinatario": "Получатель", "recipient": "Получатель", "beneficiario": "Получатель",
-        "cuit": "CUIT получателя", "cvu": "CVU получателя",
-        "banco": "Банк получателя", "bank": "Банк получателя",
-        "banco origen": "Банк отправителя", "banco remitente": "Банк отправителя",
-        "id": "ID", "balance": "Баланс",
+        "fecha":              "Fecha",
+        "date":               "Fecha",
+        "hora":               "Hora",
+        "envía":              "Envía",
+        "envia":              "Envía",
+        "recibe":             "Recibe",
+        "desde":              "Desde",
+        "cuil/cuit":          "CUIL/CUIT",
+        "cuit":               "CUIL/CUIT",
+        "banco/billetera":    "Banco/Billetera",
+        "banco":              "Banco/Billetera",
+        "bank":               "Banco/Billetera",
+        "cbu/cvu":            "CBU/CVU",
+        "cvu":                "CBU/CVU",
+        "cbu":                "CBU/CVU",
+        "nº de la operación": "Nº operación",
+        "nº operación":       "Nº operación",
+        "coelsaid":           "CoelsaID",
+        "estado":             "Estado",
+        "status":             "Estado",
+        "monto":              "Monto",
+        "amount":             "Monto",
+        "id":                 "ID",
+        "remitente":          "Envía",
+        "titular":            "Envía",
+        "sender":             "Envía",
+        "destinatario":       "Recibe",
+        "recipient":          "Recibe",
+        "beneficiario":       "Recibe",
     }
     skip_labels = {"utr"}
-    seen_recipient = None
+    seen_keys: set = set()
 
     if transference and isinstance(transference, dict):
         for d in (transference.get("details") or []):
             if not isinstance(d, dict):
                 continue
-            label = (d.get("label") or d.get("key") or "").strip().lower()
-            value = d.get("value") or d.get("displayValue") or ""
-            if label in skip_labels:
+            label = (d.get("label") or d.get("key") or "").strip()
+            value = str(d.get("value") or d.get("displayValue") or "").strip()
+            if label.lower() in skip_labels or not value:
                 continue
-            label_show = label_ru.get(label) or (d.get("label") or d.get("key") or "")
-            if not (label_show or value):
+            label_show = label_ru.get(label.lower()) or label
+            # Пропускаем дубли (один и тот же лейбл с одним значением)
+            dedup_key = label_show.lower() + "|" + value.lower()
+            if dedup_key in seen_keys:
                 continue
-            if label_show in ("Получатель", "Имя получателя") and str(value).strip() == str(seen_recipient or "").strip():
-                continue
-            if label_show in ("Получатель", "Имя получателя"):
-                seen_recipient = value
-            receipt_lines.append({"label": label_show or label, "value": value})
+            seen_keys.add(dedup_key)
+            receipt_lines.append({"label": label_show, "value": value})
 
         tid = transference.get("id") or transaction_id
         if tid and not any(str(r.get("value") or "").strip() == str(tid).strip() for r in receipt_lines):
@@ -1840,17 +1874,15 @@ async def receipt(request: Request, account_id: int, transaction_id: str = ""):
         amount_num = float(amount_val) if amount_val is not None else None
     except (TypeError, ValueError):
         amount_num = None
-    amount_display = (
-        f"-{amount_val}" if (is_outgoing and amount_num is not None and amount_num > 0)
-        else (amount_val if amount_val is not None else "")
-    )
+    # На чеке сумма всегда положительная — направление указывает заголовок (Enviaste / Recibiste)
+    amount_display = str(abs(amount_num)) if amount_num is not None else str(amount_val or "")
 
     return templates.TemplateResponse("receipt.html", {
         **base_ctx,
         "error":         None,
         "transference":  transference,
         "receipt_lines": receipt_lines,
-        "receipt_title": "Исходящая транзакция" if is_outgoing else (transference or {}).get("title") or "Чек перевода",
+        "receipt_title": (transference or {}).get("title") or ("Enviaste dinero" if is_outgoing else "Recibiste dinero"),
         "amount_display":amount_display,
         "is_outgoing":   is_outgoing,
     })
