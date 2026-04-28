@@ -188,15 +188,30 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
             "Authorization": token,
             "x-fraud-paygilant-session-id": paygilant,
         }
-        # Шаг 1 — имитируем возврат в приложение (игнорируем ошибки)
+        # Шаг 1 — проверяем статус PIN (как делает приложение перед вводом)
         try:
             _request_with_proxy_fallback(
-                "POST", c, f"{c['base_url']}/identity/auth/session/focus/changed",
-                headers=post_hdrs, json={"hasFocus": True},
+                "GET", c, f"{c['base_url']}/identity/auth/pin/status",
+                headers=base_hdrs,
             )
         except Exception:
             pass
-        # Шаг 2 — валидируем PIN (SHA-256 hex)
+
+        # Шаг 2 — имитируем возврат в приложение (точное тело из HAR)
+        try:
+            _request_with_proxy_fallback(
+                "POST", c, f"{c['base_url']}/identity/auth/session/focus/changed",
+                headers=post_hdrs,
+                json={
+                    "deviceId": c.get("device_id") or "no_device_id",
+                    "sessionId": _paygilant_id(c.get("device_id") or "no_device_id"),
+                    "type": "focusIn",
+                },
+            )
+        except Exception:
+            pass
+
+        # Шаг 3 — валидируем PIN (SHA-256 hex)
         r_pin = _request_with_proxy_fallback(
             "POST", c, f"{c['base_url']}/identity/auth/pin/validate",
             headers=post_hdrs, json={"pin": pin_hash},
