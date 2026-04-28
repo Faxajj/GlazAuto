@@ -10,16 +10,26 @@
       <p style="margin:0.25rem 0 0;color:#475569;font-size:0.8rem">Bybit P2P · Средняя по топ-10 · Время МСК (UTC+3)</p>
     </div>
     <div style="display:flex;align-items:center;gap:1.5rem;flex-wrap:wrap">
-      <div>
-        <div style="font-size:0.7rem;color:#475569;margin-bottom:0.1rem">Текущий курс</div>
-        <div id="cur-price" style="font-size:1.6rem;font-weight:700;color:#34d399;font-variant-numeric:tabular-nums">—</div>
+      <!-- Buy (зелёный) / Sell (красный) — как на Bybit -->
+      <div style="display:flex;align-items:center;gap:1.2rem;background:#0a1628;border:1px solid #1e293b;border-radius:10px;padding:0.5rem 1rem">
+        <div>
+          <div style="font-size:0.65rem;color:#2DB525;font-weight:600;letter-spacing:0.05em;margin-bottom:0.15rem">BUY</div>
+          <div id="cur-buy" style="font-size:1.5rem;font-weight:700;color:#2DB525;font-variant-numeric:tabular-nums;letter-spacing:-0.5px">—</div>
+        </div>
+        <div style="width:1px;height:36px;background:#1e293b"></div>
+        <div>
+          <div style="font-size:0.65rem;color:#F6465D;font-weight:600;letter-spacing:0.05em;margin-bottom:0.15rem">SELL</div>
+          <div id="cur-sell" style="font-size:1.5rem;font-weight:700;color:#F6465D;font-variant-numeric:tabular-nums;letter-spacing:-0.5px">—</div>
+        </div>
       </div>
+      <!-- скрытый элемент для обратной совместимости -->
+      <span id="cur-price" style="display:none">—</span>
       <div>
         <div style="font-size:0.7rem;color:#475569;margin-bottom:0.1rem">Изменение за 24ч</div>
         <div id="cur-change" style="font-size:1rem;font-weight:600;color:#64748b">—</div>
       </div>
       <div>
-        <div style="font-size:0.7rem;color:#475569;margin-bottom:0.1rem">Мин / Макс</div>
+        <div style="font-size:0.7rem;color:#475569;margin-bottom:0.1rem">Мин / Макс (buy)</div>
         <div id="cur-minmax" style="font-size:0.9rem;color:#94a3b8;font-variant-numeric:tabular-nums">— / —</div>
       </div>
       <button id="btn-refresh" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;border-radius:8px;padding:0.45rem 0.9rem;cursor:pointer;font-size:0.85rem">↻ Обновить</button>
@@ -177,36 +187,43 @@
   // ── Обновление верхней статистики ─────────────────────────────────────────
 
   function updateStats(pts){
-    var curEl    = document.getElementById('cur-price');
+    var buyEl    = document.getElementById('cur-buy');
+    var sellEl   = document.getElementById('cur-sell');
     var changeEl = document.getElementById('cur-change');
     var mmEl     = document.getElementById('cur-minmax');
 
     if(!pts.length){
-      curEl.textContent = '—';
-      changeEl.textContent = '—';
-      mmEl.textContent = '— / —';
+      if(buyEl)  buyEl.textContent  = '—';
+      if(sellEl) sellEl.textContent = '—';
+      if(changeEl) changeEl.textContent = '—';
+      if(mmEl)   mmEl.textContent   = '— / —';
       return;
     }
 
-    // Используем sell_avg как основной курс (цена продавцов = курс покупки)
-    var vals = pts.map(function(p){ return p.s || p.b; }).filter(function(v){ return v != null; });
-    if(!vals.length) return;
+    // buy (зелёный) и sell (красный) — последние значения
+    var lastPt  = pts[pts.length - 1];
+    var curBuy  = lastPt.b;
+    var curSell = lastPt.s;
 
-    var cur  = vals[vals.length - 1];
-    var first = vals[0];
-    var minV = Math.min.apply(null, vals);
-    var maxV = Math.max.apply(null, vals);
-    var diff  = cur - first;
-    var diffPct = first ? (diff / first * 100) : 0;
+    if(buyEl  && curBuy  != null) buyEl.textContent  = fmtPrice(curBuy)  + ' ARS';
+    if(sellEl && curSell != null) sellEl.textContent = fmtPrice(curSell) + ' ARS';
 
-    curEl.textContent = fmtPrice(cur) + ' ARS';
-    curEl.style.color = diff >= 0 ? '#34d399' : '#f87171';
-
-    var sign = diff >= 0 ? '+' : '';
-    changeEl.textContent = sign + fmtPrice(diff) + ' (' + sign + diffPct.toFixed(2) + '%)';
-    changeEl.style.color = diff >= 0 ? '#34d399' : '#f87171';
-
-    mmEl.textContent = fmtPrice(minV) + ' / ' + fmtPrice(maxV);
+    // Изменение за период (по buy)
+    var buyVals = pts.map(function(p){ return p.b; }).filter(function(v){ return v != null; });
+    if(buyVals.length >= 2){
+      var cur   = buyVals[buyVals.length - 1];
+      var first = buyVals[0];
+      var minV  = Math.min.apply(null, buyVals);
+      var maxV  = Math.max.apply(null, buyVals);
+      var diff  = cur - first;
+      var diffPct = first ? (diff / first * 100) : 0;
+      var sign  = diff >= 0 ? '+' : '';
+      if(changeEl){
+        changeEl.textContent = sign + fmtPrice(diff) + ' (' + sign + diffPct.toFixed(2) + '%)';
+        changeEl.style.color = diff >= 0 ? '#2DB525' : '#F6465D';
+      }
+      if(mmEl) mmEl.textContent = fmtPrice(minV) + ' / ' + fmtPrice(maxV);
+    }
   }
 
   // ── Рисуем график ─────────────────────────────────────────────────────────
@@ -446,8 +463,8 @@
     fetch('/api/bybit-rate')
       .then(function(r){ return r.json(); })
       .then(function(d){
-        pushPoint(d);
-        render();
+        pushLocalPoint(d);
+        fetchServerHistory(activeHours || 24);
         refreshBtn.textContent = '↻ Обновить';
         refreshBtn.disabled = false;
       })

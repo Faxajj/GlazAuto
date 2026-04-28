@@ -91,6 +91,21 @@ AMP-Device-ID:
     </div>
     {% endif %}
 
+    {# ── PersonalPay: PIN-хэш для авто-обновления токена ── #}
+    {% if account.bank_type == 'personalpay' %}
+    <div class="form-row">
+      <label for="pp_pin_hash">PIN-хэш для авто-обновления токена (опционально)</label>
+      <input id="pp_pin_hash" type="password"
+             placeholder="Введите PIN-код — он будет сохранён как SHA-256 хэш"
+             style="font-family:monospace" />
+      <p class="form-hint">
+        Введите ваш 4-значный PIN из приложения PersonalPay. Мы сохраним только SHA-256 хэш (не сам PIN).
+        Это позволит системе автоматически продлевать сессию через кнопку «Обновить через PIN».
+        {% if account.credentials.get('pin_hash') %}<strong style="color:#34d399">✓ PIN уже сохранён</strong>{% endif %}
+      </p>
+    </div>
+    {% endif %}
+
     {# ── PersonalPay: вставка свежих заголовков ── #}
     {% if account.bank_type == 'personalpay' %}
     <div class="form-row">
@@ -264,8 +279,28 @@ x-app-version:
   ppRawHeaders.addEventListener('input', syncPPHeaders);
   ppRawHeaders.addEventListener('paste', function(){ setTimeout(syncPPHeaders, 0); });
 
-  form.addEventListener('submit', function(){
+  var _ppSubmitting = false;
+  form.addEventListener('submit', function(e){
+    if (_ppSubmitting) return; // второй проход — пускаем
     syncPPHeaders();
+    var pinEl = document.getElementById('pp_pin_hash');
+    var pinVal = pinEl ? pinEl.value.trim() : '';
+    if (!pinVal) return; // PIN не введён — сабмитим сразу
+    // PIN введён — хэшируем async, потом сабмитим
+    e.preventDefault();
+    var encoder = new TextEncoder();
+    crypto.subtle.digest('SHA-256', encoder.encode(pinVal)).then(function(hashBuf){
+      var hashHex = Array.from(new Uint8Array(hashBuf))
+        .map(function(b){ return b.toString(16).padStart(2,'0'); }).join('');
+      try {
+        var creds = {};
+        try { creds = JSON.parse(credJson.value || '{}'); } catch(err) {}
+        creds.pin_hash = hashHex;
+        credJson.value = JSON.stringify(creds, null, 2);
+      } catch(err) {}
+      _ppSubmitting = true;
+      form.submit();
+    }).catch(function(){ _ppSubmitting = true; form.submit(); });
   });
 })();
 </script>

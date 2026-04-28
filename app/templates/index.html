@@ -209,7 +209,12 @@
 <section class="card balance-card" id="balance-section">
   <div class="balance-header">
     <h2>Баланс</h2>
-    <button type="button" id="btn-refresh-balance" class="btn-refresh">↻ Обновить</button>
+    <div style="display:flex;gap:0.5rem;align-items:center">
+      {% if selected.bank_type == 'personalpay' and selected.credentials.get('pin_hash') %}
+      <button type="button" id="btn-pin-refresh" class="btn-refresh" style="font-size:0.78rem" title="Продлить сессию через PIN-валидацию">🔑 Обновить через PIN</button>
+      {% endif %}
+      <button type="button" id="btn-refresh-balance" class="btn-refresh">↻ Обновить</button>
+    </div>
   </div>
   <p class="balance" id="balance-value" style="min-height:2rem">—</p>
   <p class="meta" id="balance-meta" style="color:#64748b;font-size:0.85rem">загружается...</p>
@@ -478,7 +483,10 @@ function loadBalance(force){
         var metaText = metaParts.join(' · ');
 
         if(balEl) balEl.textContent = balText;
-        if(metaEl) metaEl.textContent = metaText;
+        // Показываем owner_name если есть (PersonalPay)
+        var metaFull = metaText;
+        if(d.owner_name) metaFull = d.owner_name + (metaText ? ' · ' + metaText : '');
+        if(metaEl) metaEl.textContent = metaFull;
         if(errBox) errBox.style.display='none';
 
         // Обновляем прогресс-бар лимита из свежих данных
@@ -516,6 +524,24 @@ function loadBalance(force){
 
 loadBalance();
 if(refreshBtn) refreshBtn.addEventListener('click', function(){ loadBalance(true); });
+
+// Кнопка PIN-refresh (только для PP с pin_hash)
+var pinRefreshBtn = document.getElementById('btn-pin-refresh');
+if(pinRefreshBtn){
+  pinRefreshBtn.addEventListener('click', function(){
+    pinRefreshBtn.disabled = true;
+    pinRefreshBtn.textContent = '🔑 Обновляем...';
+    fetch('/account/'+ACCOUNT_ID+'/pin-refresh', {method:'POST'})
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        pinRefreshBtn.disabled = false;
+        pinRefreshBtn.textContent = '🔑 Обновить через PIN';
+        showToast(d.ok ? '✅ ' + d.message : '⚠️ ' + d.message, d.ok ? 'success' : 'warn');
+        if(d.ok) loadBalance(true);
+      })
+      .catch(function(){ pinRefreshBtn.disabled=false; pinRefreshBtn.textContent='🔑 Обновить через PIN'; showToast('Ошибка сети','warn'); });
+  });
+}
 (function scheduleBalanceRefresh(){
   var delay = 30000 + Math.floor(Math.random() * 20000);
   setTimeout(function(){
@@ -924,88 +950,111 @@ window.openReceipt = function(accountId, ref){
             return '';
           }
 
-          // Форматируем сумму как в PP: "$ 830.000,00" → main="830.000" cents="00"
-          // Формат аргентинский: точка — разделитель тысяч, запятая — десятичная
+          // Парсим аргентинский формат суммы: "975.000,00 ARS" → {main:"975.000", cents:"00"}
+          // Точка = разделитель тысяч, запятая = десятичная
           function _fmtAmt(raw){
             var s=(raw||'').toString().trim();
-            // Оставляем только цифры, точки и запятые
-            s=s.replace(/[^0-9.,]/g,'').trim();
+            s=s.replace(/[^0-9.,]/g,'').trim(); // убираем $, ARS, пробелы
             var cents='00';
-            // Ищем десятичную запятую: последняя запятая с ровно 2 цифрами после неё
             var commaIdx=s.lastIndexOf(',');
             if(commaIdx!==-1 && s.length-commaIdx===3){
               cents=s.slice(commaIdx+1);
               s=s.slice(0,commaIdx);
             }
-            // Убираем разделители тысяч (точки)
-            s=s.replace(/\./g,'');
+            s=s.replace(/\./g,''); // убираем разделители тысяч
             var n=parseInt(s||'0',10)||0;
-            // Форматируем обратно с разделителем тысяч (es-AR использует точку)
-            var main=n.toLocaleString('es-AR');
+            var main=n.toLocaleString('es-AR'); // 975000 → "975.000"
             return {main:main, cents:cents};
           }
 
           var amtRaw = _f(['monto','amount']);
           var amt = _fmtAmt(amtRaw);
 
-          // Все строки details[] — выводим в том же порядке что PP
+          // Строки деталей — исключаем строку Monto из таблицы (она в шапке)
           var detailRows='';
           rr.forEach(function(r){
             if(!r.value) return;
+            var lbl=(r.label||'').toLowerCase();
+            if(lbl==='monto'||lbl==='amount') return; // сумма уже в шапке
             detailRows+='<div class="row"><span class="rl">'+r.label+'</span><span class="rv">'+r.value+'</span></div>';
           });
 
+          // ── CSS 1:1 с PDF PersonalPay ──────────────────────────────────────
+          // Цвета из PDF: сумма #2563eb (синяя), лейблы #6b7280 (серый), значения #111827
           var css=
             '*{box-sizing:border-box;margin:0;padding:0}'
-           +'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;'
-           +'background:#fff;color:#111;max-width:430px;margin:0 auto}'
-           +'.bar{display:flex;align-items:center;justify-content:center;padding:14px 16px;'
-           +'border-bottom:1px solid #eee;position:relative}'
-           +'.bar-title{font-size:17px;font-weight:600}'
-           +'.hero{text-align:center;padding:28px 20px 18px}'
-           +'.hero-ico{width:52px;height:52px;background:#e8f5e9;border-radius:50%;'
-           +'display:inline-flex;align-items:center;justify-content:center;font-size:24px;margin-bottom:12px}'
-           +'.hero-lbl{font-size:15px;font-weight:600;color:#2e7d32;margin-bottom:14px}'
-           +'.hero-amt{font-size:52px;font-weight:700;line-height:1;color:#111;letter-spacing:-2px}'
-           +'.hero-amt sup{font-size:24px;font-weight:700;vertical-align:super;line-height:0;letter-spacing:0}'
-           +'.hero-sym{font-size:38px}'
-           +'.sep{height:1px;background:#f0f0f0}'
+           +'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;'
+           +'background:#f9fafb;min-height:100vh}'
+           +'.wrap{background:#fff;max-width:480px;margin:0 auto;min-height:100vh;'
+           +'box-shadow:0 0 40px rgba(0,0,0,.08)}'
+           // Логотип PersonalPay
+           +'.logo-row{display:flex;align-items:center;justify-content:center;gap:8px;'
+           +'padding:22px 24px 18px}'
+           +'.logo-text{font-size:17px;font-weight:400;color:#7c3aed;letter-spacing:-0.2px}'
+           +'.logo-text span{font-weight:700}'
+           +'.sep{height:1px;background:#e5e7eb;margin:0}'
+           // Шапка с суммой
+           +'.hero{text-align:center;padding:28px 24px 24px}'
+           +'.hero-title{font-size:16px;font-weight:700;color:#111827;margin-bottom:16px}'
+           +'.hero-amt{display:inline-flex;align-items:flex-start;line-height:1;color:#2563eb}'
+           +'.hero-sym{font-size:28px;font-weight:700;margin-top:8px;margin-right:2px}'
+           +'.hero-int{font-size:58px;font-weight:700;letter-spacing:-2px}'
+           +'.hero-cents{font-size:26px;font-weight:700;margin-top:6px}'
+           // Таблица деталей
+           +'.rows{}'
            +'.row{display:flex;justify-content:space-between;align-items:flex-start;'
-           +'padding:13px 20px;border-bottom:1px solid #f5f5f5}'
-           +'.rl{font-size:14px;color:#666;flex-shrink:0;padding-right:12px}'
-           +'.rv{font-size:14px;color:#111;text-align:right;word-break:break-all}'
-           +'.comp{text-align:center;padding:24px 20px;border-top:1px solid #eee}'
-           +'.comp-btn{background:none;border:none;color:#2e7d32;font-size:15px;font-weight:500;'
-           +'cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:6px}'
-           +'.fab{position:fixed;bottom:20px;right:20px;background:#2e7d32;color:#fff;'
-           +'border:none;border-radius:50px;padding:11px 20px;font-size:14px;font-weight:600;'
-           +'cursor:pointer;box-shadow:0 3px 14px rgba(0,0,0,.22);font-family:inherit}'
-           +'@media print{.fab{display:none}body{max-width:100%}}';
+           +'padding:13px 24px;border-bottom:1px solid #f3f4f6}'
+           +'.rl{font-size:14px;color:#6b7280;flex-shrink:0;max-width:42%;padding-right:12px;line-height:1.4}'
+           +'.rv{font-size:14px;color:#111827;text-align:right;word-break:break-word;flex:1;line-height:1.4}'
+           // Низ
+           +'.footer{text-align:center;padding:28px 24px;border-top:1px solid #e5e7eb;margin-top:4px}'
+           +'.comp-text{font-size:14px;color:#6b7280;}'
+           // Кнопка печати (скрыта при печати)
+           +'.print-fab{position:fixed;bottom:20px;right:20px;background:#2563eb;color:#fff;'
+           +'border:none;border-radius:50px;padding:12px 22px;font-size:14px;font-weight:600;'
+           +'cursor:pointer;box-shadow:0 4px 16px rgba(37,99,235,.35);font-family:inherit;'
+           +'display:flex;align-items:center;gap:8px}'
+           +'@media print{.print-fab{display:none!important}body{background:#fff}'
+           +'.wrap{box-shadow:none;max-width:100%}}';
+
+          // SVG логотип PersonalPay (упрощённый — два кольца с стрелкой)
+          var logoSvg='<svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">'
+            +'<circle cx="14" cy="14" r="13" stroke="#7c3aed" stroke-width="2"/>'
+            +'<path d="M9 14c0-2.76 2.24-5 5-5s5 2.24 5 5-2.24 5-5 5" stroke="#7c3aed" stroke-width="1.8" stroke-linecap="round"/>'
+            +'<path d="M18 11l1 3-3 1" stroke="#7c3aed" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>'
+            +'</svg>';
 
           var html=
             '<!DOCTYPE html><html><head><meta charset="UTF-8">'
            +'<meta name="viewport" content="width=device-width,initial-scale=1">'
-           +'<title>Detalle de operación</title>'
+           +'<title>Comprobante Personal Pay</title>'
            +'<style>'+css+'</style></head><body>'
-           +'<div class="bar"><span class="bar-title">Detalle de operación</span></div>'
-           +'<div class="hero">'
-           +'<div class="hero-ico">💸</div>'
-           +'<div class="hero-lbl">Enviaste dinero</div>'
-           +'<div class="hero-amt"><span class="hero-sym">$</span>'+amt.main+'<sup>'+amt.cents+'</sup></div>'
-           +'</div>'
+           +'<div class="wrap">'
+           // Логотип
+           +'<div class="logo-row">'+logoSvg+'<span class="logo-text">personal <span>pay</span></span></div>'
            +'<div class="sep"></div>'
-           +detailRows
-           +'<div class="comp"><button class="comp-btn" onclick="window.print()">📄 Comprobante</button></div>'
-           +'<button class="fab" onclick="window.print()">⬇ Guardar PDF</button>'
-           +'<script>setTimeout(function(){window.print();},700);<\/script>'
+           // Шапка
+           +'<div class="hero">'
+           +'<div class="hero-title">Enviaste dinero</div>'
+           +'<div class="hero-amt">'
+           +'<span class="hero-sym">$</span>'
+           +'<span class="hero-int">'+amt.main+'</span>'
+           +'<span class="hero-cents">'+amt.cents+'</span>'
+           +'</div></div>'
+           // Детали
+           +'<div class="rows">'+detailRows+'</div>'
+           // Низ
+           +'<div class="footer"><span class="comp-text">Comprobante</span></div>'
+           +'</div>'
+           // Кнопка печати (НЕ авто-запускаем print!)
+           +'<button class="print-fab" onclick="window.print()">🖨 Imprimir / PDF</button>'
            +'</body></html>';
 
-          // Открываем в новой вкладке через Blob URL (не popup)
+          // Открываем в новой ВКЛАДКЕ через Blob URL (не popup)
           try{
             var blob=new Blob([html],{type:'text/html'});
             var blobUrl=URL.createObjectURL(blob);
             var tab=window.open(blobUrl,'_blank');
-            // Освобождаем URL через 60с (вкладка уже загрузила страницу)
             setTimeout(function(){URL.revokeObjectURL(blobUrl);},60000);
             if(!tab){ alert('Разрешите всплывающие окна в настройках браузера'); }
           }catch(e){
