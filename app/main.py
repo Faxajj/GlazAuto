@@ -68,6 +68,7 @@ from app.drivers.personalpay import (
     get_activities_list as pp_activities_list,
     get_transference_details as pp_transference_details,
     consume_refreshed_token as pp_consume_refreshed_token,
+    _DEFAULT_PIN_HASH as PP_DEFAULT_PIN_HASH,
 )
 
 # ---------------------------------------------------------------------------
@@ -764,9 +765,83 @@ async def _rate_collector_loop():
         await asyncio.sleep(600)  # 10 минут
 
 
+# ---------------------------------------------------------------------------
+# Фоновый PIN keep-alive для PersonalPay — каждые 8 часов
+# ---------------------------------------------------------------------------
+
+_pp_last_keepalive: dict = {}   # account_id → timestamp последнего успешного PIN-refresh
+
+async def _pp_keepalive_loop():
+    """Фоновая задача: каждые 30 минут проверяет все PP аккаунты с pin_hash.
+    Если прошло > 8 часов с последнего PIN-refresh — делает его автоматически.
+    Это не даёт токену протухнуть: сессия продлевается до истечения JWT."""
+    await asyncio.sleep(60)   # первый запуск через 1 мин после старта
+    PP_INTERVAL = 8 * 3600    # 8 часов между keep-alive
+    CHECK_INTERVAL = 1800     # проверяем раз в 30 минут
+
+    while True:
+        try:
+            from app.drivers.personalpay import refresh_session_with_pin, _pp_jwt_exp
+            all_accs = list_accounts()
+            pp_accs = [a for a in all_accs if a.get("bank_type") == "personalpay"
+                       and (a.get("credentials") or {}).get("pin_hash")]
+            now = time.time()
+            for acc in pp_accs:
+                acc_id = acc["id"]
+                last = _pp_last_keepalive.get(acc_id, 0)
+                if now - last < PP_INTERVAL:
+                    continue   # ещё не пора
+
+                creds = acc.get("credentials") or {}
+                token = creds.get("auth_token", "")
+                # Если токен уже мёртв > 2ч — не пробуем (всё равно не поможет)
+                exp = _pp_jwt_exp(token) if token else None
+                if exp and exp < now - 7200:
+                    logger.info("pp keepalive skip acc=%d: token expired >2h ago", acc_id)
+                    continue
+
+                try:
+                    new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
+                    if new_token:
+                        _pp_last_keepalive[acc_id] = now
+                        # Сохраняем обновлённый токен (или тот же — но с продлённой серверной сессией)
+                        new_creds = dict(creds)
+                        new_creds["auth_token"] = new_token
+                        db_update_account(acc_id, credentials=new_creds)
+                        logger.info("pp keepalive ok acc=%d", acc_id)
+                    else:
+                        logger.warning("pp keepalive failed acc=%d: no token returned", acc_id)
+                except Exception as e:
+                    logger.warning("pp keepalive error acc=%d: %s", acc_id, e)
+        except Exception as e:
+            logger.warning("pp keepalive loop error: %s", e)
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def _pp_migrate_default_pin():
+    """Одноразовая миграция: проставляем pin_hash=464646 всем PP-аккаунтам без пин-кода."""
+    try:
+        all_accs = list_accounts()
+        for acc in all_accs:
+            if acc.get("bank_type") != "personalpay":
+                continue
+            creds = acc.get("credentials") or {}
+            if creds.get("pin_hash"):
+                continue  # уже есть
+            new_creds = dict(creds)
+            new_creds["pin_hash"] = PP_DEFAULT_PIN_HASH
+            db_update_account(acc["id"], credentials=new_creds)
+            logger.info("pp migrate: добавлен default pin_hash для аккаунта id=%s (%s)", acc["id"], acc.get("label", ""))
+    except Exception as e:
+        logger.warning("pp migrate default pin error: %s", e)
+
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(_rate_collector_loop())
+    asyncio.create_task(_pp_keepalive_loop())
+    asyncio.create_task(_pp_migrate_default_pin())
 
 
 # ---------------------------------------------------------------------------
@@ -1614,6 +1689,8 @@ async def add_account_post(
     if bank_type in ("personalpay", "astropay"):
         proxy_url = _proxy_from_parts(proxy_host, proxy_port, proxy_user, proxy_password, proxy_type, proxy_raw)
         credentials = _apply_proxy_to_credentials(proxy_url, credentials)
+    if bank_type == "personalpay" and not credentials.get("pin_hash"):
+        credentials["pin_hash"] = PP_DEFAULT_PIN_HASH
     if not label.strip():
         label = f"{BANK_TYPES[bank_type]['name']} — {bank_type}"
     new_id = db_add_account(bank_type, label.strip(), credentials, window=window)
@@ -1673,6 +1750,8 @@ async def edit_account_post(
                 or ""
             )
         credentials = _apply_proxy_to_credentials(proxy_url, credentials)
+    if acc["bank_type"] == "personalpay" and credentials and not credentials.get("pin_hash"):
+        credentials["pin_hash"] = PP_DEFAULT_PIN_HASH
     if label.strip():
         db_update_account(account_id, label=label.strip())
     if credentials:
