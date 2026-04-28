@@ -538,20 +538,14 @@ def pin_hash_from_pin(pin_code: str) -> str:
 
 
 def refresh_session_with_pin(credentials: dict) -> Optional[str]:
-    """Публичный API: продлевает сессию PP через PIN-валидацию и обновляет кэш токенов.
-    Используется кнопкой «Обновить через PIN» в UI (через /account/{id}/pin-refresh).
+    """Публичный API: продлевает сессию PP через PIN-валидацию.
+    Используется кнопкой «Обновить через PIN» в UI (через /account/{id}/pin-refresh)
+    и фоновым keepalive-циклом.
 
-    Возвращает новый auth_token если PP выдал его, иначе None.
+    Возвращает токен (тот же или новый) если PIN принят, иначе None.
     credentials должны содержать "pin_hash" (SHA-256 от PIN-кода).
     """
     c = _norm_creds(credentials)
     if not c.get("pin_hash"):
         return None
-    new_token = _do_pin_refresh(c)
-    if new_token:
-        key = _pp_account_key(c)
-        now = time.time()
-        exp = _pp_jwt_exp(new_token) or (now + 43200)
-        with _pp_token_lock:
-            _pp_token_cache[key] = {"token": new_token, "expires_at": exp}
-    return new_token
+    return _do_pin_refresh(c)
