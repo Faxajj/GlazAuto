@@ -683,61 +683,98 @@ textarea:focus {
   margin-left: 0.5rem;
 }
 
-.receipt-box {
-  margin: 1rem 0;
-  padding: 1rem;
+/* ── Legacy receipt (keep for fallback) ── */
+.receipt-box { margin: 1rem 0; padding: 1rem; background: #0f172a; border-radius: 0.5rem; border: 1px solid #334155; }
+.receipt-raw { margin-top: 1rem; font-size: 0.9rem; }
+.receipt-raw summary { cursor: pointer; color: #94a3b8; }
+.receipt-details { margin: 0.5rem 0 0 1rem; padding-left: 1rem; }
+
+/* ── PP-style чек (1:1 с оригиналом Personal Pay) ── */
+.pp-receipt {
   background: #0f172a;
-  border-radius: 0.5rem;
-  border: 1px solid #334155;
+  border: 1px solid #1e293b;
+  border-radius: 12px;
+  padding: 1.5rem 1.75rem 1.75rem;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
-.receipt-card .receipt-card-title {
-  margin: 0 0 0.25rem;
-  font-size: 0.95rem;
-  font-weight: 400;
+.pp-receipt__logo {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  margin-bottom: 1rem;
   color: #94a3b8;
-}
-
-.receipt-card .receipt-amount {
-  margin: 0.25rem 0 1.25rem;
-  font-size: 2.6rem;
-  font-weight: 300;
-  letter-spacing: -0.5px;
-  color: #34d399;
-  line-height: 1.1;
-}
-
-.receipt-dl {
-  margin: 0;
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 0.35rem 1.5rem;
-  font-size: 0.95rem;
-}
-
-.receipt-dl dt {
-  color: #94a3b8;
-  font-weight: 500;
-}
-
-.receipt-dl dd {
-  margin: 0;
-  color: #e2e8f0;
-}
-
-.receipt-raw {
-  margin-top: 1rem;
   font-size: 0.9rem;
+  letter-spacing: 0.02em;
+}
+.pp-receipt__logo-icon { font-size: 1.1rem; color: #7c3aed; }
+.pp-receipt__logo-text { color: #94a3b8; font-weight: 300; }
+.pp-receipt__logo-text strong { font-weight: 600; color: #e2e8f0; }
+
+.pp-receipt__divider {
+  height: 1px;
+  background: #1e293b;
+  margin: 0.75rem 0;
 }
 
-.receipt-raw summary {
-  cursor: pointer;
-  color: #94a3b8;
+.pp-receipt__title {
+  text-align: center;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #cbd5e1;
+  margin: 0.5rem 0 0.25rem;
+  letter-spacing: 0.01em;
 }
 
-.receipt-details {
-  margin: 0.5rem 0 0 1rem;
-  padding-left: 1rem;
+.pp-receipt__amount {
+  text-align: center;
+  font-size: 2.8rem;
+  font-weight: 300;
+  letter-spacing: -1px;
+  line-height: 1.15;
+  margin: 0.25rem 0 0.5rem;
+}
+.pp-receipt__amount--out { color: #3b82f6; }  /* синий — PP использует синий для исходящих */
+.pp-receipt__amount--in  { color: #22c55e; }  /* зелёный — входящие */
+
+.pp-receipt__cents {
+  font-size: 0.45em;
+  font-weight: 500;
+  vertical-align: super;
+  letter-spacing: 0;
+}
+
+.pp-receipt__dl {
+  margin: 0.5rem 0 0;
+  list-style: none;
+  padding: 0;
+}
+
+.pp-receipt__row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 0.55rem 0;
+  border-bottom: 1px solid #1e293b;
+  gap: 1rem;
+}
+.pp-receipt__row:last-child { border-bottom: none; }
+
+.pp-receipt__label {
+  color: #64748b;
+  font-size: 0.82rem;
+  font-weight: 400;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.pp-receipt__value {
+  color: #e2e8f0;
+  font-size: 0.85rem;
+  text-align: right;
+  word-break: break-all;
+  margin: 0;
 }
 
 .activities-list {
