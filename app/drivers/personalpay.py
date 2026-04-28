@@ -5,12 +5,15 @@ Personal Pay API — работа по переданным credentials (dict).
 import base64
 import hashlib
 import json
+import logging
 import time
 import uuid
 from typing import Optional
 
 import requests
 from requests import exceptions as req_exc
+
+logger = logging.getLogger(__name__)
 
 
 HTTP_TIMEOUT = (5, 12)  # (connect, read) — даём API время ответить, без лишнего ожидания
@@ -174,85 +177,104 @@ def _get_token_direct(c: dict) -> tuple:
 
 def _do_pin_refresh(c: dict) -> Optional[str]:
     """Внутренняя функция: PIN-refresh без авто-обновления (без рекурсии через _get_token).
-    Возвращает новый JWT или None."""
+    Возвращает токен (тот же или новый) если сессия продлена, иначе None.
+    При ошибках кидает RuntimeError с описанием причины."""
     pin_hash = c.get("pin_hash", "").strip()
     if not pin_hash:
         return None
+    acc_label = (c.get("username") or c.get("device_id") or "?")[:20]
+
+    token, paygilant = _get_token_direct(c)
+    base_hdrs = _base_headers(c) | {
+        "Authorization": token,
+        "x-fraud-paygilant-session-id": paygilant,
+    }
+    post_hdrs = _post_headers(c) | {
+        "Authorization": token,
+        "x-fraud-paygilant-session-id": paygilant,
+    }
+
+    # Шаг 1 — проверяем статус PIN
     try:
-        token, paygilant = _get_token_direct(c)
-        base_hdrs = _base_headers(c) | {
-            "Authorization": token,
-            "x-fraud-paygilant-session-id": paygilant,
-        }
-        post_hdrs = _post_headers(c) | {
-            "Authorization": token,
-            "x-fraud-paygilant-session-id": paygilant,
-        }
-        # Шаг 1 — проверяем статус PIN (как делает приложение перед вводом)
-        try:
-            _request_with_proxy_fallback(
-                "GET", c, f"{c['base_url']}/identity/auth/pin/status",
-                headers=base_hdrs,
-            )
-        except Exception:
-            pass
+        r1 = _request_with_proxy_fallback(
+            "GET", c, f"{c['base_url']}/identity/auth/pin/status",
+            headers=base_hdrs,
+        )
+        logger.debug("pp pin_refresh [%s] step1 pin/status → %s", acc_label, r1.status_code)
+    except Exception as e:
+        logger.warning("pp pin_refresh [%s] step1 pin/status error: %s", acc_label, e)
 
-        # Шаг 2 — имитируем возврат в приложение (точное тело из HAR)
-        try:
-            _request_with_proxy_fallback(
-                "POST", c, f"{c['base_url']}/identity/auth/session/focus/changed",
-                headers=post_hdrs,
-                json={
-                    "deviceId": c.get("device_id") or "no_device_id",
-                    "sessionId": _paygilant_id(c.get("device_id") or "no_device_id"),
-                    "type": "focusIn",
-                },
-            )
-        except Exception:
-            pass
+    # Шаг 2 — имитируем возврат в приложение
+    try:
+        r2 = _request_with_proxy_fallback(
+            "POST", c, f"{c['base_url']}/identity/auth/session/focus/changed",
+            headers=post_hdrs,
+            json={
+                "deviceId": c.get("device_id") or "no_device_id",
+                "sessionId": _paygilant_id(c.get("device_id") or "no_device_id"),
+                "type": "focusIn",
+            },
+        )
+        logger.debug("pp pin_refresh [%s] step2 focus/changed → %s", acc_label, r2.status_code)
+    except Exception as e:
+        logger.warning("pp pin_refresh [%s] step2 focus/changed error: %s", acc_label, e)
 
-        # Шаг 3 — валидируем PIN (SHA-256 hex)
+    # Шаг 3 — валидируем PIN
+    try:
         r_pin = _request_with_proxy_fallback(
             "POST", c, f"{c['base_url']}/identity/auth/pin/validate",
             headers=post_hdrs, json={"pin": pin_hash},
         )
-        if r_pin.status_code not in (200, 201):
-            return None
-        # Шаг 3 — статус сессии
-        # PP продлевает серверную сессию через PIN — новый JWT может не выдаваться.
-        # Если находим JWT в ответе — возвращаем его.
-        # Если нет — возвращаем существующий токен: сервер уже принял сессию как активную.
-        existing_token = token  # токен с которым мы вошли (может быть "просроченным" по exp)
-        try:
-            r_status = _request_with_proxy_fallback(
-                "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
-                headers=base_hdrs,
-            )
-            if r_status.status_code == 200:
-                try:
-                    body = r_status.json()
-                except Exception:
-                    body = {}
-                # Ищем новый JWT во всех возможных полях (включая вложенные)
-                data = body.get("data") or body
-                new_token = (
-                    data.get("idToken") or data.get("id_token")
-                    or data.get("accessToken") or data.get("access_token")
-                    or data.get("token")
-                    or body.get("idToken") or body.get("id_token")
-                    or body.get("accessToken") or body.get("access_token")
-                    or body.get("token") or ""
-                )
-                if new_token and str(new_token).startswith("eyJ"):
-                    return str(new_token)
-        except Exception:
-            pass
+    except Exception as e:
+        raise RuntimeError(f"Сеть недоступна (pin/validate): {e}") from e
 
-        # PIN принят → сессия продлена на сервере.
-        # Возвращаем существующий токен — он снова работает (серверный exp сброшен).
-        return existing_token
-    except Exception:
-        return None
+    logger.info("pp pin_refresh [%s] step3 pin/validate → %s %s",
+                acc_label, r_pin.status_code, r_pin.text[:120])
+
+    if r_pin.status_code in (401, 403):
+        raise RuntimeError(
+            f"Токен истёк на сервере (HTTP {r_pin.status_code}). "
+            "Получите новый auth_token из приложения PP и добавьте вручную."
+        )
+    if r_pin.status_code == 400:
+        body_txt = r_pin.text[:200]
+        raise RuntimeError(f"Неверный PIN или запрос отклонён (400): {body_txt}")
+    if r_pin.status_code not in (200, 201):
+        raise RuntimeError(
+            f"pin/validate вернул {r_pin.status_code}: {r_pin.text[:200]}"
+        )
+
+    # PIN принят — ищем новый JWT в статусе сессии
+    existing_token = token
+    try:
+        r_status = _request_with_proxy_fallback(
+            "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
+            headers=base_hdrs,
+        )
+        logger.debug("pp pin_refresh [%s] step4 session/status → %s", acc_label, r_status.status_code)
+        if r_status.status_code == 200:
+            try:
+                body = r_status.json()
+            except Exception:
+                body = {}
+            data = body.get("data") or body
+            new_token = (
+                data.get("idToken") or data.get("id_token")
+                or data.get("accessToken") or data.get("access_token")
+                or data.get("token")
+                or body.get("idToken") or body.get("id_token")
+                or body.get("accessToken") or body.get("access_token")
+                or body.get("token") or ""
+            )
+            if new_token and str(new_token).startswith("eyJ"):
+                logger.info("pp pin_refresh [%s] получен новый JWT", acc_label)
+                return str(new_token)
+    except Exception as e:
+        logger.warning("pp pin_refresh [%s] step4 session/status error: %s", acc_label, e)
+
+    # PP продлил сессию server-side — JWT тот же, но сервер его снова принимает
+    logger.info("pp pin_refresh [%s] сессия продлена (тот же JWT)", acc_label)
+    return existing_token
 
 
 def _get_token(session: requests.Session, c: dict) -> tuple:
@@ -542,10 +564,11 @@ def refresh_session_with_pin(credentials: dict) -> Optional[str]:
     Используется кнопкой «Обновить через PIN» в UI (через /account/{id}/pin-refresh)
     и фоновым keepalive-циклом.
 
-    Возвращает токен (тот же или новый) если PIN принят, иначе None.
+    Возвращает токен (тот же или новый) если PIN принят.
+    При неудаче кидает RuntimeError с описанием причины.
     credentials должны содержать "pin_hash" (SHA-256 от PIN-кода).
     """
     c = _norm_creds(credentials)
     if not c.get("pin_hash"):
-        return None
+        raise RuntimeError("pin_hash не задан в credentials")
     return _do_pin_refresh(c)
