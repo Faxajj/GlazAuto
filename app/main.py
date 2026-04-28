@@ -1178,10 +1178,13 @@ async def api_pin_refresh(account_id: int):
             return JSONResponse({"ok": True, "message": "Сессия продлена через PIN ✓"})
         return JSONResponse({
             "ok": False,
-            "message": "PIN не принят или сессия не продлена. Обновите auth_token вручную."
+            "message": "PIN не принят — ответ от сервера пустой. Обновите auth_token вручную."
         })
+    except RuntimeError as e:
+        return JSONResponse({"ok": False, "message": str(e)})
     except Exception as e:
-        return JSONResponse({"ok": False, "message": str(e)}, status_code=500)
+        logger.exception("api_pin_refresh error acc=%s", account_id)
+        return JSONResponse({"ok": False, "message": f"Ошибка: {e}"}, status_code=500)
 
 
 @app.get("/account/{account_id}/status")
