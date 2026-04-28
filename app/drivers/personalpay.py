@@ -5,7 +5,6 @@ Personal Pay API — работа по переданным credentials (dict).
 import base64
 import hashlib
 import json
-import threading
 import time
 import uuid
 from typing import Optional
@@ -19,8 +18,6 @@ HTTP_TIMEOUT = (5, 12)  # (connect, read) — даём API время ответ
 # ---------------------------------------------------------------------------
 # Кэш токенов (AstroPay-style авто-обновление через PIN)
 # ---------------------------------------------------------------------------
-_pp_token_cache: dict = {}          # key → {"token": str, "expires_at": float}
-_pp_token_lock = threading.Lock()   # защита кэша от гонок
 _pp_refreshed_tokens: dict = {}     # device_id → new_token, ожидает сохранения в БД
 
 # SHA-256 от дефолтного PIN-кода (используется если pin_hash не задан в credentials)
@@ -97,11 +94,6 @@ def _pp_jwt_exp(token: str) -> Optional[float]:
         return float(exp) if exp else None
     except Exception:
         return None
-
-
-def _pp_account_key(c: dict) -> str:
-    """Ключ кэша: device_id или первые 40 символов токена."""
-    return (c.get("device_id") or c.get("auth_token") or "default")[:40]
 
 
 def consume_refreshed_token(device_id: str) -> Optional[str]:
@@ -232,48 +224,27 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
 
 def _get_token(session: requests.Session, c: dict) -> tuple:
     """Возвращает (token, paygilant_session_id) для PP-запросов.
-    Если pin_hash задан и JWT истекает (< 5 мин) — прозрачно обновляет через PIN (как AstroPay).
-    Лок удерживается только для чтения/записи кэша, HTTP-вызовы делаются вне лока."""
-    key = _pp_account_key(c)
+    Если pin_hash задан и JWT истёк или истекает < 5 мин — прозрачно обновляет через PIN.
+    Намеренно БЕЗ кросс-запросного кэша: разные аккаунты могут иметь одинаковый device_id
+    (один телефон, несколько аккаунтов) — кэш по device_id даст чужой токен."""
+    raw_token = (c.get("auth_token") or "").strip()
+    if raw_token.upper().startswith("BEARER "):
+        raw_token = raw_token[7:].strip()
+
     pin_hash = c.get("pin_hash", "").strip()
-    now = time.time()
-    do_refresh = False
 
-    with _pp_token_lock:
-        cached = _pp_token_cache.get(key)
-        # Свежий кэш — отдаём сразу (без HTTP-запроса)
-        if cached and cached.get("expires_at", 0) > now + 300:
-            return cached["token"], _paygilant_id(c.get("device_id") or "no_device")
+    # Если есть токен и PIN — проверяем не истёк ли JWT
+    if raw_token and pin_hash:
+        exp = _pp_jwt_exp(raw_token)
+        now = time.time()
+        if not exp or exp <= now + 300:          # истёк или меньше 5 мин
+            new_token = _do_pin_refresh(c)
+            if new_token:
+                c["auth_token"] = new_token      # обновляем c in-place
+                device_id = (c.get("device_id") or "")[:40]
+                _pp_refreshed_tokens[device_id] = new_token   # сигнал main.py → сохранить в БД
+                return new_token, _paygilant_id(c.get("device_id") or "no_device")
 
-        # Кэш устарел или пуст — пробуем инициализировать из credentials
-        raw_token = (c.get("auth_token") or "").strip()
-        if raw_token.upper().startswith("BEARER "):
-            raw_token = raw_token[7:].strip()
-
-        if raw_token:
-            exp = _pp_jwt_exp(raw_token)
-            # Токен ещё свеж — кэшируем и отдаём
-            if exp and exp > now + 300:
-                _pp_token_cache[key] = {"token": raw_token, "expires_at": exp}
-                return raw_token, _paygilant_id(c.get("device_id") or "no_device")
-
-        # Токен истёк/истекает — нужен PIN-refresh (делаем вне лока)
-        do_refresh = bool(pin_hash)
-
-    # HTTP-вызов PIN-refresh вне лока, чтобы не блокировать другие потоки
-    if do_refresh:
-        new_token = _do_pin_refresh(c)
-        if new_token:
-            exp = _pp_jwt_exp(new_token) or (now + 43200)  # 12 ч по умолчанию
-            with _pp_token_lock:
-                _pp_token_cache[key] = {"token": new_token, "expires_at": exp}
-            c["auth_token"] = new_token  # обновляем c in-place
-            # Сигнализируем main.py что нужно сохранить в БД
-            device_id = (c.get("device_id") or "")[:40]
-            _pp_refreshed_tokens[device_id] = new_token
-            return new_token, _paygilant_id(c.get("device_id") or "no_device")
-
-    # PIN не задан или refresh не удался — возвращаем текущий токен как есть
     return _get_token_direct(c)
 
 
