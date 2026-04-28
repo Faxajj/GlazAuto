@@ -16,7 +16,7 @@ from requests import exceptions as req_exc
 logger = logging.getLogger(__name__)
 
 
-HTTP_TIMEOUT = (5, 12)  # (connect, read) — даём API время ответить, без лишнего ожидания
+HTTP_TIMEOUT = (8, 25)  # (connect, read) — PP через прокси иногда отвечает 15-20 сек
 
 # ---------------------------------------------------------------------------
 # Кэш токенов (AstroPay-style авто-обновление через PIN)
@@ -293,12 +293,16 @@ def _get_token(session: requests.Session, c: dict) -> tuple:
         exp = _pp_jwt_exp(raw_token)
         now = time.time()
         if not exp or exp <= now + 300:          # истёк или меньше 5 мин
-            new_token = _do_pin_refresh(c)
-            if new_token:
-                c["auth_token"] = new_token      # обновляем c in-place
-                device_id = (c.get("device_id") or "")[:40]
-                _pp_refreshed_tokens[device_id] = new_token   # сигнал main.py → сохранить в БД
-                return new_token, _paygilant_id(c.get("device_id") or "no_device")
+            try:
+                new_token = _do_pin_refresh(c)
+                if new_token:
+                    c["auth_token"] = new_token      # обновляем c in-place
+                    device_id = (c.get("device_id") or "")[:40]
+                    _pp_refreshed_tokens[device_id] = new_token   # сигнал main.py → сохранить в БД
+                    return new_token, _paygilant_id(c.get("device_id") or "no_device")
+            except Exception as e:
+                logger.warning("_get_token: PIN auto-refresh failed, using existing token: %s", e)
+                # PIN не помог — продолжаем со старым токеном, пусть сервер решит
 
     return _get_token_direct(c)
 
@@ -503,7 +507,7 @@ def get_transference_details(credentials: dict, transaction_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def get_cvu_info(credentials: dict) -> dict:
-    """GET /payments/cashin/b2c-bff-service/cvu — CVU-номер и алиас счёта."""
+    """GET /payments/cashin/b2c-bff-service/cvu — CVU-номер, алиас и имя владельца."""
     c = _norm_creds(credentials)
     session = _session(c)
     token, paygilant = _get_token(session, c)
@@ -518,7 +522,11 @@ def get_cvu_info(credentials: dict) -> dict:
     if r.status_code == 304:
         return {}
     r.raise_for_status()
-    return r.json()
+    body = r.json()
+    # PP оборачивает ответы в {"data": {...}} — разворачиваем
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        return body["data"]
+    return body if isinstance(body, dict) else {}
 
 
 def get_owner_name_from_jwt(auth_token: str) -> Optional[str]:
