@@ -269,8 +269,29 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
         if r_pin.status_code not in (200, 201):
             raise RuntimeError(f"pin/validate вернул {r_pin.status_code}: {r_pin.text[:200]}")
 
-        # PIN принят — ищем новый JWT в session/status
+        # Вспомогательная функция: ищет JWT в любом dict/body
+        def _extract_jwt(body: dict) -> Optional[str]:
+            data = body.get("data") or body
+            for d in (data, body):
+                for key in ("idToken", "id_token", "accessToken", "access_token", "token",
+                            "jwtToken", "jwt_token", "authToken", "auth_token"):
+                    v = d.get(key) if isinstance(d, dict) else None
+                    if v and str(v).startswith("eyJ"):
+                        return str(v)
+            return None
+
+        # Шаг 4a — ищем новый JWT прямо в ответе pin/validate
         existing_token = token
+        try:
+            pin_body = r_pin.json()
+            jwt_from_pin = _extract_jwt(pin_body)
+            if jwt_from_pin:
+                logger.info("pp pin_refresh [%s] новый JWT из pin/validate ответа", acc_label)
+                return jwt_from_pin
+        except Exception:
+            pass
+
+        # Шаг 4b — запрашиваем session/status для нового JWT
         try:
             r_status = _request_with_proxy_fallback(
                 "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
@@ -279,26 +300,33 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
             logger.debug("pp pin_refresh [%s] session/status → %s", acc_label, r_status.status_code)
             if r_status.status_code == 200:
                 try:
-                    body = r_status.json()
+                    jwt_from_status = _extract_jwt(r_status.json())
+                    if jwt_from_status:
+                        logger.info("pp pin_refresh [%s] новый JWT из session/status", acc_label)
+                        return jwt_from_status
                 except Exception:
-                    body = {}
-                data = body.get("data") or body
-                new_token = (
-                    data.get("idToken") or data.get("id_token")
-                    or data.get("accessToken") or data.get("access_token")
-                    or data.get("token")
-                    or body.get("idToken") or body.get("id_token")
-                    or body.get("accessToken") or body.get("access_token")
-                    or body.get("token") or ""
-                )
-                if new_token and str(new_token).startswith("eyJ"):
-                    logger.info("pp pin_refresh [%s] получен новый JWT", acc_label)
-                    return str(new_token)
+                    pass
         except Exception as e:
             logger.warning("pp pin_refresh [%s] session/status error: %s", acc_label, e)
 
-        # PP продлил сессию server-side — тот же JWT снова работает
-        logger.info("pp pin_refresh [%s] сессия продлена (тот же JWT)", acc_label)
+        # Шаг 4c — пробуем получить свежий токен через token-эндпоинт
+        for token_path in ("/identity/auth/v3/token", "/identity/auth/token"):
+            try:
+                r_tok = _request_with_proxy_fallback(
+                    "GET", c, f"{c['base_url']}{token_path}",
+                    headers=base_hdrs,
+                )
+                if r_tok.status_code == 200:
+                    jwt_from_tok = _extract_jwt(r_tok.json())
+                    if jwt_from_tok:
+                        logger.info("pp pin_refresh [%s] новый JWT из %s", acc_label, token_path)
+                        return jwt_from_tok
+            except Exception:
+                pass
+
+        # PIN принят, но новый JWT не получен — возвращаем старый
+        # PP мог продлить серверную сессию, так что старый JWT может ещё работать
+        logger.info("pp pin_refresh [%s] сессия продлена (новый JWT не получен — используем текущий)", acc_label)
         return existing_token
 
     finally:
