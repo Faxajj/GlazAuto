@@ -17,7 +17,7 @@ from requests import exceptions as req_exc
 logger = logging.getLogger(__name__)
 
 
-HTTP_TIMEOUT = (6, 15)  # (connect, read) — агрессивный таймаут чтобы не висеть вечно
+HTTP_TIMEOUT = (8, 28)  # (connect, read) — увеличен для медленных SOCKS5-прокси
 
 # ---------------------------------------------------------------------------
 # Кэш токенов (AstroPay-style авто-обновление через PIN)
