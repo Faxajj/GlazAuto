@@ -16,10 +16,13 @@ credentials = {
 }
 """
 import json
+import logging
 import time
 import threading
 import requests
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 BASE_URL    = "https://mapi.astropaycard.com"
 HTTP_TIMEOUT = (8, 20)
@@ -95,7 +98,7 @@ def _get_valid_token(credentials: dict) -> str:
                 return new_token
             except Exception as e:
                 # Если refresh не сработал — используем текущий токен
-                pass
+                logger.warning("AstroPay token refresh failed (will use existing token): %s", e)
 
         # Используем токен как есть
         if not cached:
