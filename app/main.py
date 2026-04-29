@@ -1061,15 +1061,24 @@ async def _pp_keepalive_loop():
 
                 try:
                     new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
-                    if new_token:
-                        _pp_last_keepalive[acc_id] = now
-                        new_creds = dict(creds)
-                        new_creds["auth_token"] = new_token
-                        db_update_account(acc_id, credentials=new_creds)
-                        # Инвалидируем кэш — следующий запрос баланса покажет обновлённый токен
-                        _balance_cache.pop(acc_id, None)
-                        logger.info("pp keepalive ok acc=%d (new_jwt=%s)",
-                                    acc_id, new_token != token)
+                    _pp_last_keepalive[acc_id] = now
+                    if new_token and new_token != token:
+                        # Получен НОВЫЙ JWT — сохраняем в БД
+                        # Перечитываем свежие credentials из БД перед записью:
+                        # если пользователь обновил токен вручную пока мы делали refresh,
+                        # берём его credentials как базу (не перезаписываем прокси и другие поля)
+                        fresh_acc = get_account(acc_id)
+                        if fresh_acc:
+                            fresh_creds = dict(fresh_acc.get("credentials") or creds)
+                            fresh_creds["auth_token"] = new_token
+                            db_update_account(acc_id, credentials=fresh_creds)
+                            _balance_cache.pop(acc_id, None)
+                            logger.info("pp keepalive ok acc=%d: новый JWT сохранён", acc_id)
+                    elif new_token == token:
+                        # PP подтвердил сессию, но вернул тот же JWT (нет нового токена)
+                        # НЕ пишем в БД: если пользователь вручную обновил токен пока
+                        # мы делали keepalive — перезапись старым JWT сотрёт свежий токен
+                        logger.info("pp keepalive ok acc=%d: сессия жива, новый JWT не получен", acc_id)
                     else:
                         logger.warning("pp keepalive failed acc=%d: no token returned", acc_id)
                 except Exception as e:
@@ -1451,28 +1460,31 @@ async def api_pin_refresh(account_id: int):
         })
     try:
         from app.drivers.personalpay import refresh_session_with_pin, _pp_jwt_exp
+        old_token = creds.get("auth_token", "")
         new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
         if new_token:
-            new_creds = dict(creds)
-            new_creds["auth_token"] = new_token
-            db_update_account(account_id, credentials=new_creds)
-            # Сбрасываем кэш — следующий запрос баланса возьмёт свежие credentials
+            # Сохраняем только если получили НОВЫЙ JWT (не тот же старый как fallback)
+            if new_token != old_token:
+                new_creds = dict(creds)
+                new_creds["auth_token"] = new_token
+                db_update_account(account_id, credentials=new_creds)
+            # В любом случае сбрасываем кэш и прогреваем с актуальными credentials
             _balance_cache.pop(account_id, None)
             _activities_cache.pop(account_id, None)
-            # Сразу запускаем фоновый прогрев с новым токеном
             if account_id not in _bg_refreshing_bal:
                 _bg_refreshing_bal.add(account_id)
                 asyncio.create_task(_bg_refresh_balance(account_id))
-            # Вычисляем сколько осталось до истечения нового токена
-            new_exp = _pp_jwt_exp(new_token)
-            is_fresh = bool(new_exp and new_exp > time.time() + 60)
+            # Проверяем свежесть токена по JWT exp
+            check_token = new_token if new_token != old_token else old_token
+            new_exp    = _pp_jwt_exp(check_token)
+            is_fresh   = bool(new_exp and new_exp > time.time() + 60)
             hours_left = round((new_exp - time.time()) / 3600, 1) if new_exp else None
             if is_fresh and hours_left:
                 msg = f"Сессия продлена ✓  Токен действует ещё {hours_left} ч."
             elif is_fresh:
                 msg = "Сессия продлена через PIN ✓"
             else:
-                msg = "PIN принят, но токен не обновился. Обновите auth_token вручную."
+                msg = "PIN принят, но новый токен не получен. Обновите auth_token вручную."
             return JSONResponse({"ok": is_fresh, "message": msg})
         return JSONResponse({
             "ok": False,
@@ -2029,6 +2041,15 @@ async def edit_account_post(
     if credentials:
         db_update_account(account_id, credentials=credentials)
     db_update_account(account_id, window=normalize_window_slug(window_custom or window or acc.get("window") or "glazars"))
+
+    # Сбрасываем кэш — старые данные (ошибка 403 и т.д.) больше не актуальны
+    _balance_cache.pop(account_id, None)
+    _activities_cache.pop(account_id, None)
+    # Немедленно запускаем фоновый прогрев с новыми credentials
+    if account_id not in _bg_refreshing_bal:
+        _bg_refreshing_bal.add(account_id)
+        asyncio.create_task(_bg_refresh_balance(account_id))
+
     return RedirectResponse(url=f"/?account_id={account_id}&success=updated", status_code=302)
 
 
