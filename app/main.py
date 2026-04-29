@@ -3,6 +3,7 @@ Banks Dashboard — единый дашборд для нескольких ба
 """
 import asyncio
 import base64
+import collections
 import json
 import logging
 import secrets
@@ -117,6 +118,71 @@ templates.env.filters["ars"]    = lambda value, decimals=2: _format_ars(value, d
 
 
 # ---------------------------------------------------------------------------
+# Security headers — добавляются ко ВСЕМ ответам
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.update({
+        "X-Frame-Options":        "DENY",
+        "X-Content-Type-Options": "nosniff",
+        "X-XSS-Protection":       "1; mode=block",
+        "Referrer-Policy":        "strict-origin-when-cross-origin",
+        "Permissions-Policy":     "camera=(), microphone=(), geolocation=()",
+        # Inline scripts/styles в шаблонах требуют unsafe-inline.
+        # blob: нужен для печати чека (_ppPrintReceipt).
+        "Content-Security-Policy": (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "connect-src 'self' https://api2.bybit.com; "
+            "worker-src blob:; "
+            "frame-ancestors 'none'; "
+            "object-src 'none'; "
+            "base-uri 'self';"
+        ),
+    })
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Login rate limiting — защита от брутфорса (5 попыток / 15 мин на IP)
+# ---------------------------------------------------------------------------
+
+_login_attempts: dict = collections.defaultdict(list)
+_LOGIN_MAX_ATTEMPTS     = 5
+_LOGIN_LOCKOUT_SECONDS  = 900   # 15 минут
+
+
+def _get_client_ip(request: Request) -> str:
+    """Возвращает IP клиента с учётом reverse-proxy заголовков."""
+    for header in ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"):
+        val = request.headers.get(header, "").strip()
+        if val:
+            return val.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _is_login_rate_limited(ip: str) -> bool:
+    now = time.time()
+    cutoff = now - _LOGIN_LOCKOUT_SECONDS
+    _login_attempts[ip] = [t for t in _login_attempts[ip] if t > cutoff]
+    return len(_login_attempts[ip]) >= _LOGIN_MAX_ATTEMPTS
+
+
+def _record_failed_login(ip: str) -> int:
+    """Записывает неудачную попытку, возвращает текущее число попыток."""
+    _login_attempts[ip].append(time.time())
+    return len(_login_attempts[ip])
+
+
+def _clear_login_attempts(ip: str) -> None:
+    _login_attempts.pop(ip, None)
+
+
+# ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
@@ -137,10 +203,6 @@ def _is_limit_exempt(destination: str) -> bool:
     dest = (destination or "").strip()
     return any(dest.startswith(prefix) for prefix in _EXEMPT_CVU_PREFIXES)
 
-
-# Обратная совместимость — старое имя функции оставлено как псевдоним.
-def _is_pp_internal_cvu(destination: str) -> bool:
-    return _is_limit_exempt(destination)
 
 
 def _format_ars(value, decimals: int = 2) -> str:
@@ -819,6 +881,19 @@ async def _pp_keepalive_loop():
         await asyncio.sleep(CHECK_INTERVAL)
 
 
+async def _session_cleanup_loop():
+    """Удаляет протухшие сессии из БД раз в час.
+    Без этого таблица sessions растёт без ограничений."""
+    await asyncio.sleep(300)   # первый запуск через 5 мин после старта
+    while True:
+        try:
+            cleanup_sessions()
+            logger.debug("session cleanup: expired sessions removed")
+        except Exception as e:
+            logger.warning("session cleanup error: %s", e)
+        await asyncio.sleep(3600)   # каждый час
+
+
 async def _pp_migrate_default_pin():
     """Одноразовая миграция: проставляем pin_hash=464646 всем PP-аккаунтам без пин-кода."""
     try:
@@ -842,6 +917,7 @@ async def startup_event():
     asyncio.create_task(_rate_collector_loop())
     asyncio.create_task(_pp_keepalive_loop())
     asyncio.create_task(_pp_migrate_default_pin())
+    asyncio.create_task(_session_cleanup_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -917,13 +993,28 @@ async def login_page(request: Request):
 
 @app.post("/login", response_class=HTMLResponse)
 async def login_post(request: Request, username: str = Form(""), password: str = Form("")):
-    user = get_user_by_username(username)
-    if not user or not user.get("is_active") or not verify_password(password, user.get("password_hash", "")):
+    ip = _get_client_ip(request)
+
+    # Блокировка после 5 неудачных попыток за 15 минут
+    if _is_login_rate_limited(ip):
         return templates.TemplateResponse(
             "login.html",
-            {"request": request, "error": "Неверный логин или пароль."},
+            {"request": request, "error": "Слишком много попыток входа. Попробуйте через 15 минут."},
+            status_code=429,
+        )
+
+    user = get_user_by_username(username)
+    if not user or not user.get("is_active") or not verify_password(password, user.get("password_hash", "")):
+        attempts = _record_failed_login(ip)
+        left = max(0, _LOGIN_MAX_ATTEMPTS - attempts)
+        warn = f" Осталось попыток: {left}." if left <= 2 else ""
+        return templates.TemplateResponse(
+            "login.html",
+            {"request": request, "error": f"Неверный логин или пароль.{warn}"},
             status_code=400,
         )
+
+    _clear_login_attempts(ip)
     token = secrets.token_urlsafe(32)
     create_session(token, user["id"], user["username"], int(time.time() + SESSION_TTL))
     response = RedirectResponse(url="/", status_code=302)
@@ -2091,7 +2182,7 @@ async def api_bybit_debug():
     Используй для проверки поля price и структуры ответа."""
     results = {}
     async with httpx.AsyncClient(timeout=12) as client:
-        for side_code, label in [("0", "buy"), ("1", "sell")]:
+        for side_code, label in [("1", "buy"), ("0", "sell")]:
             try:
                 payload = {
                     "tokenId": "USDT", "currencyId": "ARS", "payment": [],

@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
-DB_PATH = "/var/www/app/accounts.db"
+DB_PATH = os.getenv("DB_PATH", "/var/www/app/accounts.db")
 
 def _load_windows() -> List[Tuple[str, str]]:
     """Список кабинетов можно расширять через env WINDOWS_CONFIG.
@@ -650,8 +650,7 @@ def save_rate_point(buy_avg: float, sell_avg: float, ts: int) -> None:
 
 def get_rate_history(hours: int = 24) -> list:
     """Возвращает историю курса за последние N часов."""
-    import time as _time
-    since = int(_time.time()) - hours * 3600
+    since = int(time.time()) - hours * 3600
     with _get_conn() as conn:
         rows = conn.execute(
             "SELECT ts, buy_avg, sell_avg FROM rate_history WHERE ts >= ? ORDER BY ts ASC",
