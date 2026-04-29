@@ -787,6 +787,196 @@ app.add_middleware(AuthMiddleware)
 
 
 # ---------------------------------------------------------------------------
+# In-memory кэш баланса / активностей (stale-while-revalidate)
+# ---------------------------------------------------------------------------
+# Логика: при запросе отдаём кэш мгновенно, а обновление делаем в фоне.
+#   • age < TTL   → отдать кэш, ничего не делать (данные свежие)
+#   • TTL ≤ age < STALE → отдать кэш + запустить фоновое обновление
+#   • age ≥ STALE → кэш слишком старый, ждём свежих данных синхронно
+# Результат: первый запрос после старта сервера — синхронный (одноразовый «холодный» старт).
+# Все последующие запросы — мгновенные из кэша, а кэш незаметно обновляется в фоне.
+
+_balance_cache:    dict = {}   # {account_id: {"data": dict, "ts": float}}
+_activities_cache: dict = {}   # {account_id: {"acts": list, "ts": float}}
+_bg_refreshing_bal: set = set()  # id аккаунтов с активным фоновым обновлением баланса
+_bg_refreshing_act: set = set()  # id аккаунтов с активным фоновым обновлением активностей
+
+_BALANCE_TTL    = 25    # сек — кэш «свежий», не обновлять
+_BALANCE_STALE  = 300   # сек — кэш «устаревший», обновить в фоне
+_ACTIVITIES_TTL   = 60
+_ACTIVITIES_STALE = 600
+
+
+async def _fetch_and_cache_balance(account_id: int, acc: dict) -> dict:
+    """Делает реальный API-запрос за балансом и сохраняет результат в кэш.
+    Возвращает dict (без account_withdraw_count/limit — они добавляются при отдаче)."""
+    raw  = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
+    info = _normalize_balance(raw, acc["bank_type"])
+    info.pop("raw_accounts", None)
+
+    if acc["bank_type"] == "personalpay":
+        from app.drivers.personalpay import get_owner_name_from_jwt, get_cvu_info
+        creds = acc["credentials"]
+
+        cached_cvu   = creds.get("_cvu_number") or ""
+        cached_alias = creds.get("_cvu_alias")  or ""
+        cached_owner = creds.get("_owner_name") or ""
+
+        if cached_cvu:
+            info["cvu_number"] = cached_cvu
+        if cached_alias:
+            info["cvu_alias"] = cached_alias
+
+        owner = get_owner_name_from_jwt(creds.get("auth_token", "")) or cached_owner
+
+        if not cached_cvu:
+            try:
+                cvu_data   = await asyncio.to_thread(get_cvu_info, creds)
+                real_cvu   = (cvu_data.get("cvu") or cvu_data.get("number")
+                              or cvu_data.get("cbu") or cvu_data.get("accountNumber") or "")
+                real_alias = cvu_data.get("alias") or cvu_data.get("aliasId") or ""
+                cvu_holder = (cvu_data.get("holder") or cvu_data.get("holderName")
+                              or cvu_data.get("ownerName") or cvu_data.get("fullName")
+                              or cvu_data.get("name") or "")
+                if real_cvu:
+                    info["cvu_number"] = real_cvu
+                if real_alias:
+                    info["cvu_alias"] = real_alias
+                if not owner and cvu_holder:
+                    owner = cvu_holder
+                new_creds = dict(creds)
+                if real_cvu:
+                    new_creds["_cvu_number"] = real_cvu
+                if real_alias:
+                    new_creds["_cvu_alias"] = real_alias
+                if owner:
+                    new_creds["_owner_name"] = owner
+                db_update_account(account_id, credentials=new_creds)
+            except Exception as e:
+                logger.debug("get_cvu_info failed (non-critical): %s", e)
+
+        info["owner_name"] = str(owner).strip() if owner else ""
+
+        # Авто-сохранение обновлённого токена (PIN авто-refresh)
+        device_id = creds.get("device_id", "")
+        new_tok = pp_consume_refreshed_token(device_id)
+        if new_tok:
+            new_creds = dict(creds)
+            new_creds["auth_token"] = new_tok
+            try:
+                db_update_account(account_id, credentials=new_creds)
+                info["token_auto_refreshed"] = True
+            except Exception:
+                pass
+
+    _balance_cache[account_id] = {"data": info, "ts": time.time()}
+    return info
+
+
+async def _bg_refresh_balance(account_id: int) -> None:
+    """Фоновое обновление кэша баланса (не блокирует HTTP-ответ)."""
+    try:
+        fresh_acc = get_account(account_id)
+        if fresh_acc:
+            await _fetch_and_cache_balance(account_id, fresh_acc)
+            logger.debug("bg_refresh_balance ok acc=%d", account_id)
+    except Exception as e:
+        logger.debug("bg_refresh_balance error acc=%d: %s", account_id, e)
+    finally:
+        _bg_refreshing_bal.discard(account_id)
+
+
+async def _fetch_and_cache_activities(account_id: int, acc: dict) -> list:
+    """Делает реальный API-запрос за активностями и сохраняет в кэш.
+    Возвращает нормализованный список dict (без фильтрации и пагинации)."""
+    bank = acc["bank_type"]
+    raw  = []
+    if bank == "personalpay":
+        data = await asyncio.to_thread(pp_activities_list, acc["credentials"], 0, 50)
+        raw  = _extract_activities_raw(data)
+        _new_tok = pp_consume_refreshed_token(acc["credentials"].get("device_id", ""))
+        if _new_tok:
+            try:
+                _nc = dict(acc["credentials"])
+                _nc["auth_token"] = _new_tok
+                db_update_account(account_id, credentials=_nc)
+            except Exception:
+                pass
+    elif bank == "astropay":
+        from app.drivers.astropay import get_activities as ap_get_activities
+        data = await asyncio.to_thread(ap_get_activities, acc["credentials"], 1, 50)
+        raw  = data.get("data") or []
+
+    activities = []
+    for act in (raw if isinstance(raw, list) else []):
+        n = _normalize_activity(act)
+        if not n:
+            continue
+        is_outgoing = bool(n.get("is_outgoing"))
+        s_name  = n.get("sender") or ""
+        s_last  = n.get("sender_lastname") or ""
+        r_name  = n.get("recipient") or ""
+        r_last  = n.get("recipient_lastname") or ""
+        if is_outgoing:
+            full_parts = [p for p in [r_name, r_last] if p]
+        else:
+            full_parts = [p for p in [s_name, s_last] if p]
+        full_name = " ".join(full_parts) if full_parts else "Не указано"
+        activities.append({
+            "id":                n.get("id"),
+            "title":             n.get("title"),
+            "receipt_id":        n.get("receipt_id"),
+            "amount":            n.get("amount"),
+            "date_str":          n.get("date_str"),
+            "is_outgoing":       is_outgoing,
+            "type":              "outgoing" if is_outgoing else "incoming",
+            "sender":            s_name,
+            "sender_lastname":   s_last  or "Не указана",
+            "recipient":         r_name,
+            "recipient_lastname":r_last  or "Не указана",
+            "full_name":         full_name,
+        })
+
+    _activities_cache[account_id] = {"acts": activities, "ts": time.time()}
+    return activities
+
+
+async def _bg_refresh_activities(account_id: int) -> None:
+    """Фоновое обновление кэша активностей (не блокирует HTTP-ответ)."""
+    try:
+        fresh_acc = get_account(account_id)
+        if fresh_acc:
+            await _fetch_and_cache_activities(account_id, fresh_acc)
+            logger.debug("bg_refresh_activities ok acc=%d", account_id)
+    except Exception as e:
+        logger.debug("bg_refresh_activities error acc=%d: %s", account_id, e)
+    finally:
+        _bg_refreshing_act.discard(account_id)
+
+
+async def _proactive_refresh_loop() -> None:
+    """Каждые 2 минуты прогревает кэш баланса для всех PP/AP аккаунтов.
+    Благодаря этому кэш почти всегда свежий — пользователь получает данные мгновенно."""
+    await asyncio.sleep(90)   # первый прогрев через 90 сек после старта
+    while True:
+        try:
+            all_accs = list_accounts()
+            for acc in all_accs:
+                if acc.get("bank_type") not in ("personalpay", "astropay"):
+                    continue
+                acc_id = acc["id"]
+                cached = _balance_cache.get(acc_id)
+                age    = (time.time() - cached["ts"]) if cached else 9999
+                if age > _BALANCE_TTL and acc_id not in _bg_refreshing_bal:
+                    _bg_refreshing_bal.add(acc_id)
+                    asyncio.create_task(_bg_refresh_balance(acc_id))
+                    await asyncio.sleep(0.3)   # небольшая пауза между аккаунтами
+        except Exception as e:
+            logger.debug("proactive_refresh_loop error: %s", e)
+        await asyncio.sleep(120)   # каждые 2 минуты
+
+
+# ---------------------------------------------------------------------------
 # Фоновый сбор курса USDT/ARS каждые 10 минут
 # ---------------------------------------------------------------------------
 
@@ -918,6 +1108,7 @@ async def startup_event():
     asyncio.create_task(_pp_keepalive_loop())
     asyncio.create_task(_pp_migrate_default_pin())
     asyncio.create_task(_session_cleanup_loop())
+    asyncio.create_task(_proactive_refresh_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -1168,75 +1359,39 @@ async def api_balance(account_id: int):
     acc = get_account(account_id)
     if not acc:
         return JSONResponse({"error": "account not found"}, status_code=404)
+
+    now    = time.time()
+    cached = _balance_cache.get(account_id)
+
+    # ── Stale-while-revalidate ──────────────────────────────────────────────
+    if cached:
+        age  = now - cached["ts"]
+        if age < _BALANCE_STALE:
+            # Кэш актуален (или немного устарел) — отдаём мгновенно
+            if age >= _BALANCE_TTL and account_id not in _bg_refreshing_bal:
+                # Немного устарел — запускаем фоновое обновление
+                _bg_refreshing_bal.add(account_id)
+                asyncio.create_task(_bg_refresh_balance(account_id))
+            data = dict(cached["data"])
+            data["account_withdraw_count"] = get_account_withdraw_count(account_id)
+            data["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
+            return JSONResponse(data)
+        # Кэш слишком старый (> _BALANCE_STALE) — продолжаем к синхронному запросу
+
+    # ── Нет кэша или слишком старый — синхронный запрос ────────────────────
     try:
-        raw = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
-        info = _normalize_balance(raw, acc["bank_type"])
-        info.pop("raw_accounts", None)
-        info["account_withdraw_count"] = get_account_withdraw_count(account_id)
-        info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
-
-        if acc["bank_type"] == "personalpay":
-            from app.drivers.personalpay import get_owner_name_from_jwt, get_cvu_info
-            creds = acc["credentials"]
-
-            # CVU и алиас кешируются в credentials (поля _cvu_number, _cvu_alias, _owner_name).
-            # /cvu вызывается ОДИН РАЗ при первом балансе — потом читаем из кеша в БД.
-            # Это исключает второй API-запрос на каждый refresh баланса.
-            cached_cvu   = creds.get("_cvu_number") or ""
-            cached_alias = creds.get("_cvu_alias")  or ""
-            cached_owner = creds.get("_owner_name")  or ""
-
-            if cached_cvu:
-                info["cvu_number"] = cached_cvu
-            if cached_alias:
-                info["cvu_alias"] = cached_alias
-
-            owner = get_owner_name_from_jwt(creds.get("auth_token", "")) or cached_owner
-
-            if not cached_cvu:
-                # Первый раз — идём в /cvu, кешируем результат в БД
-                try:
-                    cvu_data = await asyncio.to_thread(get_cvu_info, creds)
-                    real_cvu   = (cvu_data.get("cvu") or cvu_data.get("number")
-                                  or cvu_data.get("cbu") or cvu_data.get("accountNumber") or "")
-                    real_alias = cvu_data.get("alias") or cvu_data.get("aliasId") or ""
-                    cvu_holder = (cvu_data.get("holder") or cvu_data.get("holderName")
-                                  or cvu_data.get("ownerName") or cvu_data.get("fullName")
-                                  or cvu_data.get("name") or "")
-                    if real_cvu:
-                        info["cvu_number"] = real_cvu
-                    if real_alias:
-                        info["cvu_alias"] = real_alias
-                    if not owner and cvu_holder:
-                        owner = cvu_holder
-                    # Сохраняем в credentials чтобы больше не дёргать /cvu
-                    new_creds = dict(creds)
-                    if real_cvu:
-                        new_creds["_cvu_number"] = real_cvu
-                    if real_alias:
-                        new_creds["_cvu_alias"] = real_alias
-                    if owner:
-                        new_creds["_owner_name"] = owner
-                    db_update_account(account_id, credentials=new_creds)
-                except Exception as e:
-                    logger.debug("get_cvu_info failed (non-critical): %s", e)
-
-            info["owner_name"] = str(owner).strip() if owner else ""
-
-            # ── Авто-сохранение обновлённого токена (PIN авто-refresh) ─────────
-            device_id = creds.get("device_id", "")
-            new_tok = pp_consume_refreshed_token(device_id)
-            if new_tok:
-                new_creds = dict(creds)
-                new_creds["auth_token"] = new_tok
-                try:
-                    db_update_account(account_id, credentials=new_creds)
-                    info["token_auto_refreshed"] = True
-                except Exception:
-                    pass
-
-        return info
+        info   = await _fetch_and_cache_balance(account_id, acc)
+        result = dict(info)
+        result["account_withdraw_count"] = get_account_withdraw_count(account_id)
+        result["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
+        return JSONResponse(result)
     except Exception as e:
+        # Если упал, но есть хоть какой-то кэш — отдадим его (лучше устаревшие данные, чем ошибка)
+        if cached:
+            data = dict(cached["data"])
+            data["account_withdraw_count"] = get_account_withdraw_count(account_id)
+            data["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
+            return JSONResponse(data)
         err = str(e)
         low = err.lower()
         code = "bank_unavailable"
@@ -1456,98 +1611,63 @@ async def api_activities(
     if bank not in _SUPPORTED:
         return JSONResponse({"activities": [], "total": 0, "page": 1, "pages": 1})
 
-    # Ограничиваем limit во избежание злоупотреблений
     limit = max(1, min(limit, 100))
     page  = max(1, page)
 
-    try:
-        # ── Загрузка сырых активностей ──────────────────────────────────────
-        if bank == "personalpay":
-            data = await asyncio.to_thread(pp_activities_list, acc["credentials"], 0, 50)
-            raw  = _extract_activities_raw(data)
-            # Если во время запроса произошёл авто-refresh токена — сохраняем в БД
-            _new_tok = pp_consume_refreshed_token(acc["credentials"].get("device_id", ""))
-            if _new_tok:
-                try:
-                    _nc = dict(acc["credentials"]); _nc["auth_token"] = _new_tok
-                    db_update_account(account_id, credentials=_nc)
-                except Exception:
-                    pass
-        else:  # astropay
-            from app.drivers.astropay import get_activities as ap_get_activities
-            data = await asyncio.to_thread(ap_get_activities, acc["credentials"], 1, 50)
-            raw  = data.get("data") or []
+    now    = time.time()
+    cached = _activities_cache.get(account_id)
 
-        # ── Нормализация ─────────────────────────────────────────────────────
-        activities = []
-        for act in (raw if isinstance(raw, list) else []):
-            n = _normalize_activity(act)
-            if not n:
-                continue
-            is_outgoing = bool(n.get("is_outgoing"))
+    activities = None
 
-            s_name  = n.get("sender") or ""
-            s_last  = n.get("sender_lastname") or ""
-            r_name  = n.get("recipient") or ""
-            r_last  = n.get("recipient_lastname") or ""
+    # ── Stale-while-revalidate ──────────────────────────────────────────────
+    if cached:
+        age = now - cached["ts"]
+        if age < _ACTIVITIES_STALE:
+            activities = cached["acts"]
+            if age >= _ACTIVITIES_TTL and account_id not in _bg_refreshing_act:
+                _bg_refreshing_act.add(account_id)
+                asyncio.create_task(_bg_refresh_activities(account_id))
 
-            # Полное имя контрагента (кто получил при выводе / кто прислал при поступлении)
-            if is_outgoing:
-                full_parts = [p for p in [r_name, r_last] if p]
-            else:
-                full_parts = [p for p in [s_name, s_last] if p]
-            full_name = " ".join(full_parts) if full_parts else "Не указано"
+    if activities is None:
+        try:
+            activities = await _fetch_and_cache_activities(account_id, acc)
+        except Exception as e:
+            logger.exception("api_activities error account=%d", account_id)
+            return JSONResponse({"error": str(e)}, status_code=500)
 
-            activities.append({
-                "id":                n.get("id"),
-                "title":             n.get("title"),
-                "receipt_id":        n.get("receipt_id"),
-                "amount":            n.get("amount"),
-                "date_str":          n.get("date_str"),
-                "is_outgoing":       is_outgoing,
-                "type":              "outgoing" if is_outgoing else "incoming",
-                "sender":            s_name,
-                "sender_lastname":   s_last  or "Не указана",
-                "recipient":         r_name,
-                "recipient_lastname":r_last  or "Не указана",
-                "full_name":         full_name,
-            })
+    # ── Фильтр по типу ───────────────────────────────────────────────────────
+    filtered = activities
+    if type == "incoming":
+        filtered = [a for a in filtered if not a["is_outgoing"]]
+    elif type == "outgoing":
+        filtered = [a for a in filtered if a["is_outgoing"]]
 
-        # ── Фильтр по типу ───────────────────────────────────────────────────
-        if type == "incoming":
-            activities = [a for a in activities if not a["is_outgoing"]]
-        elif type == "outgoing":
-            activities = [a for a in activities if a["is_outgoing"]]
+    # ── Поиск по имени / фамилии ─────────────────────────────────────────────
+    q = search.strip().lower()
+    if q:
+        def _match(a):
+            haystack = " ".join(filter(None, [
+                a.get("sender"), a.get("sender_lastname"),
+                a.get("recipient"), a.get("recipient_lastname"),
+                a.get("full_name"),
+            ])).lower()
+            return q in haystack
+        filtered = [a for a in filtered if _match(a)]
 
-        # ── Поиск по имени / фамилии ─────────────────────────────────────────
-        q = search.strip().lower()
-        if q:
-            def _match(a):
-                haystack = " ".join(filter(None, [
-                    a.get("sender"), a.get("sender_lastname"),
-                    a.get("recipient"), a.get("recipient_lastname"),
-                    a.get("full_name"),
-                ])).lower()
-                return q in haystack
-            activities = [a for a in activities if _match(a)]
+    # ── Пагинация ─────────────────────────────────────────────────────────────
+    total  = len(filtered)
+    pages  = max(1, (total + limit - 1) // limit)
+    page   = min(page, pages)
+    offset = (page - 1) * limit
+    paged  = filtered[offset : offset + limit]
 
-        # ── Пагинация ────────────────────────────────────────────────────────
-        total  = len(activities)
-        pages  = max(1, (total + limit - 1) // limit)
-        page   = min(page, pages)
-        offset = (page - 1) * limit
-        paged  = activities[offset : offset + limit]
-
-        return JSONResponse({
-            "activities": paged,
-            "total":  total,
-            "page":   page,
-            "pages":  pages,
-            "limit":  limit,
-        })
-    except Exception as e:
-        logger.exception("api_activities error account=%d", account_id)
-        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({
+        "activities": paged,
+        "total":  total,
+        "page":   page,
+        "pages":  pages,
+        "limit":  limit,
+    })
 
 
 @app.post("/account/{account_id}/auto-withdraw/{rule_id}/trigger")
@@ -1624,6 +1744,9 @@ async def multi_withdraw(request: Request):
                 )
             increment_withdraw_count(destination, acc["id"])
             increment_account_withdraw_count(acc["id"])
+            # Инвалидируем кэш баланса / активностей
+            _balance_cache.pop(acc["id"], None)
+            _activities_cache.pop(acc["id"], None)
             tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
             return {"account_id": acc_id, "label": acc["label"], "ok": True, "error": None, "tid": tid}
         except Exception as e:
@@ -1695,6 +1818,9 @@ async def withdraw(
             )
         increment_withdraw_count(dest, account_id)
         increment_account_withdraw_count(account_id)
+        # Инвалидируем кэш — следующий запрос баланса покажет актуальные данные
+        _balance_cache.pop(account_id, None)
+        _activities_cache.pop(account_id, None)
     except Exception as e:
         err_msg = str(e)
         if any(x in err_msg.lower() for x in ("rechazad", "rejected", "rechazo", "denied", "denegad")):
