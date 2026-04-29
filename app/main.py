@@ -1078,60 +1078,71 @@ async def api_balance(account_id: int):
     if not acc:
         return JSONResponse({"error": "account not found"}, status_code=404)
     try:
+        raw = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
+        info = _normalize_balance(raw, acc["bank_type"])
+        info.pop("raw_accounts", None)
+        info["account_withdraw_count"] = get_account_withdraw_count(account_id)
+        info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
+
         if acc["bank_type"] == "personalpay":
             from app.drivers.personalpay import get_owner_name_from_jwt, get_cvu_info
-            # Запускаем balance и /cvu параллельно — не тратим лишних секунд
-            bal_result, cvu_result = await asyncio.gather(
-                asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"]),
-                asyncio.to_thread(get_cvu_info, acc["credentials"]),
-                return_exceptions=True,
-            )
-            if isinstance(bal_result, Exception):
-                raise bal_result
-            info = _normalize_balance(bal_result, acc["bank_type"])
-            info.pop("raw_accounts", None)
-            info["account_withdraw_count"] = get_account_withdraw_count(account_id)
-            info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
+            creds = acc["credentials"]
 
-            # /cvu даёт реальный CVU (22 цифры) и алиас — всегда перезаписываем
-            # (financial-accounts возвращает internal id и "Disponible" в name)
-            owner = get_owner_name_from_jwt(acc["credentials"].get("auth_token", ""))
-            if not isinstance(cvu_result, Exception) and isinstance(cvu_result, dict):
-                cvu_data = cvu_result
-                real_cvu = (
-                    cvu_data.get("cvu") or cvu_data.get("number")
-                    or cvu_data.get("cbu") or cvu_data.get("accountNumber") or ""
-                )
-                real_alias = cvu_data.get("alias") or cvu_data.get("aliasId") or ""
-                if real_cvu:
-                    info["cvu_number"] = real_cvu
-                if real_alias:
-                    info["cvu_alias"] = real_alias
-                if not owner:
-                    owner = (
-                        cvu_data.get("holder") or cvu_data.get("holderName")
-                        or cvu_data.get("ownerName") or cvu_data.get("fullName")
-                        or cvu_data.get("name") or ""
-                    )
+            # CVU и алиас кешируются в credentials (поля _cvu_number, _cvu_alias, _owner_name).
+            # /cvu вызывается ОДИН РАЗ при первом балансе — потом читаем из кеша в БД.
+            # Это исключает второй API-запрос на каждый refresh баланса.
+            cached_cvu   = creds.get("_cvu_number") or ""
+            cached_alias = creds.get("_cvu_alias")  or ""
+            cached_owner = creds.get("_owner_name")  or ""
+
+            if cached_cvu:
+                info["cvu_number"] = cached_cvu
+            if cached_alias:
+                info["cvu_alias"] = cached_alias
+
+            owner = get_owner_name_from_jwt(creds.get("auth_token", "")) or cached_owner
+
+            if not cached_cvu:
+                # Первый раз — идём в /cvu, кешируем результат в БД
+                try:
+                    cvu_data = await asyncio.to_thread(get_cvu_info, creds)
+                    real_cvu   = (cvu_data.get("cvu") or cvu_data.get("number")
+                                  or cvu_data.get("cbu") or cvu_data.get("accountNumber") or "")
+                    real_alias = cvu_data.get("alias") or cvu_data.get("aliasId") or ""
+                    cvu_holder = (cvu_data.get("holder") or cvu_data.get("holderName")
+                                  or cvu_data.get("ownerName") or cvu_data.get("fullName")
+                                  or cvu_data.get("name") or "")
+                    if real_cvu:
+                        info["cvu_number"] = real_cvu
+                    if real_alias:
+                        info["cvu_alias"] = real_alias
+                    if not owner and cvu_holder:
+                        owner = cvu_holder
+                    # Сохраняем в credentials чтобы больше не дёргать /cvu
+                    new_creds = dict(creds)
+                    if real_cvu:
+                        new_creds["_cvu_number"] = real_cvu
+                    if real_alias:
+                        new_creds["_cvu_alias"] = real_alias
+                    if owner:
+                        new_creds["_owner_name"] = owner
+                    db_update_account(account_id, credentials=new_creds)
+                except Exception as e:
+                    logger.debug("get_cvu_info failed (non-critical): %s", e)
+
             info["owner_name"] = str(owner).strip() if owner else ""
 
             # ── Авто-сохранение обновлённого токена (PIN авто-refresh) ─────────
-            device_id = acc["credentials"].get("device_id", "")
+            device_id = creds.get("device_id", "")
             new_tok = pp_consume_refreshed_token(device_id)
             if new_tok:
-                new_creds = dict(acc["credentials"])
+                new_creds = dict(creds)
                 new_creds["auth_token"] = new_tok
                 try:
                     db_update_account(account_id, credentials=new_creds)
                     info["token_auto_refreshed"] = True
                 except Exception:
                     pass
-        else:
-            raw = await asyncio.to_thread(driver_balance, acc["bank_type"], acc["credentials"])
-            info = _normalize_balance(raw, acc["bank_type"])
-            info.pop("raw_accounts", None)
-            info["account_withdraw_count"] = get_account_withdraw_count(account_id)
-            info["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
 
         return info
     except Exception as e:
