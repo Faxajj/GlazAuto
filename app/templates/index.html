@@ -194,14 +194,14 @@
 {% endif %}
 
 {% if token_expired %}
-<div class="alert alert-error">
-  🔑 <strong>Токен истёк.</strong> Обновите в <a href="/account/{{ selected.id }}/edit" class="alert-link">настройках</a>.
+<div class="alert alert-error" id="token-alert">
+  🔑 <strong>Токен истёк.</strong> Нажмите «Обновить через PIN» или обновите вручную в <a href="/account/{{ selected.id }}/edit" class="alert-link">настройках</a>.
 </div>
 {% elif token_expires_in_hours is not none and token_expires_in_hours < 24 %}
-<div class="alert alert-warning">
+<div class="alert alert-warning" id="token-alert">
   ⏰ Токен истекает через
   <strong>{% if token_expires_in_hours < 1 %}{{ (token_expires_in_hours * 60)|int }} мин.{% else %}{{ "%.1f"|format(token_expires_in_hours) }} ч.{% endif %}</strong>
-  — <a href="/account/{{ selected.id }}/edit" class="alert-link">обновить</a>.
+  — нажмите «Обновить через PIN» или <a href="/account/{{ selected.id }}/edit" class="alert-link">обновите вручную</a>.
 </div>
 {% endif %}
 
@@ -539,11 +539,20 @@ if(pinRefreshBtn){
         pinRefreshBtn.textContent = '🔑 Обновить через PIN';
         showToast(d.ok ? '✅ ' + d.message : '⚠️ ' + d.message, d.ok ? 'success' : 'warn');
         if(d.ok){
-          // Перезагружаем страницу через 1.5с чтобы обновился баннер "токен истекает через"
-          setTimeout(function(){ window.location.reload(); }, 1500);
+          // Скрываем баннер «Токен истёк» / «Токен истекает» сразу
+          var tokenAlert = document.getElementById('token-alert');
+          if(tokenAlert) tokenAlert.style.display = 'none';
+          // Перезагружаем баланс — он подхватит новый токен из кэша
+          loadBalance(true);
+          // Перезагружаем страницу через 3с — сервер успеет прогреть кэш, баннер обновится
+          setTimeout(function(){ window.location.reload(); }, 3000);
         }
       })
-      .catch(function(){ pinRefreshBtn.disabled=false; pinRefreshBtn.textContent='🔑 Обновить через PIN'; showToast('Ошибка сети','warn'); });
+      .catch(function(){
+        pinRefreshBtn.disabled = false;
+        pinRefreshBtn.textContent = '🔑 Обновить через PIN';
+        showToast('Ошибка сети', 'warn');
+      });
   });
 }
 (function scheduleBalanceRefresh(){
