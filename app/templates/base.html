@@ -4,9 +4,10 @@
   <meta charset="UTF-8" />
   <title>{% block title %}Banks Dashboard{% endblock %}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="/static/style.css?v=11" />
+  <link rel="stylesheet" href="/static/style.css?v=13" />
 </head>
 <body>
+  <a href="#main-content" class="skip-link">Перейти к содержимому</a>
   <header class="header">
     <div style="display:flex;align-items:center;gap:0.75rem">
       <button class="sidebar-toggle-btn" id="sidebar-toggle-btn" aria-label="Открыть меню">☰</button>
@@ -22,7 +23,7 @@
           <span>USDT/ARS · Bybit P2P</span>
           <div style="display:flex;align-items:center;gap:0.4rem">
             <span id="rate-age" style="color:#334155"></span>
-            <a href="/rates" title="Открыть полный график" style="color:#475569;text-decoration:none;font-size:0.85rem;line-height:1;padding:0 2px" onclick="event.stopPropagation()">☰</a>
+            <a href="/rates" title="Открыть полный график" style="color:#475569;text-decoration:none;font-size:0.85rem;line-height:1;padding:0 2px" onclick="event.stopPropagation()" aria-label="График курса">☰</a>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:0.5rem">
@@ -307,10 +308,10 @@
                 div.style.cssText='padding:0.6rem 0.9rem;border-radius:8px;border:1px solid;display:flex;justify-content:space-between;align-items:center;font-size:0.88rem;';
                 if(r.ok){
                   div.style.background='#14532d';div.style.borderColor='#16a34a';div.style.color='#86efac';
-                  div.innerHTML='<span>✅ '+r.label+'</span>'+(r.tid?'<a href="/account/'+r.account_id+'/receipt?transaction_id='+r.tid+'" style="color:#86efac;text-decoration:underline">Чек</a>':'<span>OK</span>');
+                  div.innerHTML='<span>✅ '+escHtml(r.label)+'</span>'+(r.tid?'<a href="/account/'+encodeURIComponent(r.account_id)+'/receipt?transaction_id='+encodeURIComponent(r.tid)+'" style="color:#86efac;text-decoration:underline">Чек</a>':'<span>OK</span>');
                 } else {
                   div.style.background='#431407';div.style.borderColor='#dc2626';div.style.color='#fca5a5';
-                  div.innerHTML='<span>❌ '+r.label+'</span><span>'+r.error+'</span>';
+                  div.innerHTML='<span>❌ '+escHtml(r.label)+'</span><span>'+escHtml(r.error)+'</span>';
                 }
                 if(resultsEl) resultsEl.appendChild(div);
               });
@@ -319,7 +320,7 @@
               overlay.querySelector('#mw-ok-btn').onclick=function(){ overlay.remove(); };
             })
             .catch(function(e){
-              if(resultsEl) resultsEl.innerHTML='<p style="color:#f87171">Ошибка: '+e.message+'</p>';
+              if(resultsEl) resultsEl.innerHTML='<p style="color:#f87171">Ошибка: '+escHtml(e.message)+'</p>';
               overlay.querySelector('#mw-ok-btn').disabled=false;
               overlay.querySelector('#mw-ok-btn').textContent='Выполнить';
             });
@@ -338,13 +339,13 @@
     </aside>
     {% endblock %}
 
-    <main class="main">
+    <main class="main" id="main-content" tabindex="-1">
       {% block content %}{% endblock %}
     </main>
   </div>
 
   <!-- Модальное окно подтверждения удаления -->
-  <div id="confirm-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center">
+  <div id="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-text" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center">
     <div style="background:#1e293b;border:1px solid #334155;border-radius:16px;padding:2rem;max-width:420px;width:90%;box-shadow:0 20px 60px rgba(0,0,0,0.5)">
       <h3 style="margin:0 0 0.75rem;color:#f1f5f9;font-size:1.1rem">⚠️ Подтвердите удаление</h3>
       <p id="confirm-modal-text" style="color:#94a3b8;margin:0 0 1.5rem;line-height:1.5"></p>
@@ -354,6 +355,18 @@
       </div>
     </div>
   </div>
+
+  <script>
+  // ── Глобальная утилита: экранирование HTML (защита от XSS) ──────────────
+  window.escHtml = function(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;')
+      .replace(/'/g,'&#039;');
+  };
+  </script>
 
   <script>
   // Универсальный модальный диалог подтверждения

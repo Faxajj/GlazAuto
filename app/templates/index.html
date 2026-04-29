@@ -211,13 +211,13 @@
     <h2>Баланс</h2>
     <div style="display:flex;gap:0.5rem;align-items:center">
       {% if selected.bank_type == 'personalpay' and selected.credentials.get('pin_hash') %}
-      <button type="button" id="btn-pin-refresh" class="btn-refresh" style="font-size:0.78rem" title="Продлить сессию через PIN-валидацию">🔑 Обновить через PIN</button>
+      <button type="button" id="btn-pin-refresh" class="btn-refresh" style="font-size:0.78rem" title="Продлить сессию через PIN-валидацию" aria-label="Обновить токен через PIN">🔑 Обновить через PIN</button>
       {% endif %}
-      <button type="button" id="btn-refresh-balance" class="btn-refresh">↻ Обновить</button>
+      <button type="button" id="btn-refresh-balance" class="btn-refresh" aria-label="Обновить баланс">↻ Обновить</button>
     </div>
   </div>
-  <p class="balance" id="balance-value" style="min-height:2rem">—</p>
-  <p class="meta" id="balance-meta" style="color:#64748b;font-size:0.85rem">загружается...</p>
+  <p class="balance" id="balance-value" style="min-height:2rem" aria-live="polite" aria-label="Баланс счёта">—</p>
+  <p class="meta" id="balance-meta" style="color:#64748b;font-size:0.85rem" aria-live="polite">загружается...</p>
 
   {# ── Прогресс-бар лимита выводов ── #}
   {% set _pct = [(account_withdraw_count / daily_limit * 100)|int, 100]|min %}
@@ -470,9 +470,9 @@ function loadBalance(force){
           var meta = d.error_meta || {};
           errBox.style.display='block';
           errBox.innerHTML = '<div class="alert alert-error" style="margin-top:0.75rem">'+
-            '<strong>'+(meta.message || 'Ошибка подключения к банку')+'</strong><br>'+
-            '<span style="font-size:0.85rem;opacity:0.85">'+(meta.details || d.error)+'</span>'+
-            (meta.suggestion ? '<p style="margin:0.5rem 0 0;font-size:0.85rem">'+meta.suggestion+' <a href="/account/'+ACCOUNT_ID+'/edit" class="alert-link">Настройки</a></p>' : '')+
+            '<strong>'+escHtml(meta.message || 'Ошибка подключения к банку')+'</strong><br>'+
+            '<span style="font-size:0.85rem;opacity:0.85">'+escHtml(meta.details || d.error)+'</span>'+
+            (meta.suggestion ? '<p style="margin:0.5rem 0 0;font-size:0.85rem">'+escHtml(meta.suggestion)+' <a href="/account/'+ACCOUNT_ID+'/edit" class="alert-link">Настройки</a></p>' : '')+
             '</div>';
         }
       } else {
@@ -645,7 +645,7 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
         if(d.error){
           if(txError){
             txError.style.display='block';
-            txError.innerHTML='<p style="color:#f87171;padding:0.5rem 0">Не удалось загрузить историю: '+d.error+'</p>';
+            txError.innerHTML='<p style="color:#f87171;padding:0.5rem 0">Не удалось загрузить историю: '+escHtml(d.error)+'</p>';
           }
           return;
         }
@@ -897,7 +897,7 @@ window.openReceipt = function(accountId, ref){
     .then(function(r){ return r.json(); })
     .then(function(d){
       if(d.error){
-        body.innerHTML = '<p class="alert alert-error">'+d.error+'</p>';
+        body.innerHTML = '<p class="alert alert-error">'+escHtml(d.error)+'</p>';
         return;
       }
       if(d.type === 'pdf'){
@@ -938,8 +938,9 @@ window.openReceipt = function(accountId, ref){
           + 'style="padding:0.5rem 1.1rem;background:#334155;color:#e2e8f0;border:1px solid #475569;'
           + 'border-radius:8px;cursor:pointer;font-size:0.85rem">🖨 Сохранить как PDF</button></div>';
         body.innerHTML = tableHtml + printBtn;
-        // Сохраняем строки для печати
+        // Сохраняем строки и заголовок для печати
         window._ppReceiptRows = rows;
+        window._ppReceiptTitle = d.title || 'Enviaste dinero';
         window._ppPrintReceipt = function(){
           var rr = window._ppReceiptRows || [];
 
@@ -1039,7 +1040,7 @@ window.openReceipt = function(accountId, ref){
            +'<div class="sep"></div>'
            // Шапка
            +'<div class="hero">'
-           +'<div class="hero-title">Enviaste dinero</div>'
+           +'<div class="hero-title">'+(window._ppReceiptTitle||'Enviaste dinero')+'</div>'
            +'<div class="hero-amt">'
            +'<span class="hero-sym">$</span>'
            +'<span class="hero-int">'+amt.main+'</span>'
@@ -1070,7 +1071,7 @@ window.openReceipt = function(accountId, ref){
       body.innerHTML = '<pre style="font-size:0.8rem;overflow:auto;color:#94a3b8">'+JSON.stringify(d,null,2)+'</pre>';
     })
     .catch(function(e){
-      body.innerHTML = '<p class="alert alert-error">'+String(e)+'</p>';
+      body.innerHTML = '<p class="alert alert-error">'+escHtml(String(e))+'</p>';
     });
 };
 
@@ -1078,7 +1079,7 @@ window.openReceipt = function(accountId, ref){
 </script>
 
 {# ── Модальное окно чека ── #}
-<div id="receipt-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9000;align-items:center;justify-content:center;padding:1rem">
+<div id="receipt-modal" role="dialog" aria-modal="true" aria-label="Чек операции" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9000;align-items:center;justify-content:center;padding:1rem">
   <div style="background:#1e293b;border:1px solid #334155;border-radius:0.75rem;max-width:540px;width:100%;padding:1.25rem 1.5rem;max-height:85vh;overflow-y:auto">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
       <strong style="font-size:1rem">📄 Чек</strong>

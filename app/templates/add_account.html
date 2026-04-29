@@ -63,7 +63,7 @@
     </div>
     <div class="form-row">
       <label for="proxy_password">Proxy Password</label>
-      <input id="proxy_password" name="proxy_password" type="text" placeholder="6vrTNk8q" />
+      <input id="proxy_password" name="proxy_password" type="password" placeholder="6vrTNk8q" autocomplete="new-password" />
     </div>
     <div class="form-row">
       <label for="proxy_raw">Или одной строкой (fallback)</label>
@@ -138,7 +138,7 @@ okhttp/4.12.0"></textarea>
     {# ── Credentials JSON ── #}
     <div class="form-row" id="creds-json-row">
       <label for="credentials_json">Credentials (JSON) *</label>
-      <textarea id="credentials_json" name="credentials_json" rows="14" class="textarea-json"
+      <textarea id="credentials_json" name="credentials_json" rows="14" class="textarea-json" autocomplete="off" spellcheck="false"
                 placeholder='Personal Pay:
 { "auth_token": "eyJ...", "device_id": "178DC6C7-..." }
 

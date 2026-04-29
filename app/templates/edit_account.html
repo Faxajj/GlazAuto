@@ -51,7 +51,7 @@
     </div>
     <div class="form-row">
       <label for="proxy_password">Proxy Password</label>
-      <input id="proxy_password" name="proxy_password" type="text" value="{{ proxy_password }}" placeholder="6vrTNk8q" />
+      <input id="proxy_password" name="proxy_password" type="password" value="{{ proxy_password }}" placeholder="6vrTNk8q" autocomplete="new-password" />
     </div>
     <div class="form-row">
       <label for="proxy_raw">Или одной строкой (fallback)</label>
@@ -130,7 +130,7 @@ x-app-version:
     {# ── Credentials JSON ── #}
     <div class="form-row">
       <label for="credentials_json">Credentials (JSON) *</label>
-      <textarea id="credentials_json" name="credentials_json" rows="14" class="textarea-json">{{ account.credentials | tojson(indent=2) }}</textarea>
+      <textarea id="credentials_json" name="credentials_json" rows="14" class="textarea-json" autocomplete="off" spellcheck="false">{{ account.credentials | tojson(indent=2) }}</textarea>
       {% if account.bank_type == 'astropay' %}
       <p class="form-hint">
         Обновляй <strong>auth_token</strong> когда истечёт сессия.
