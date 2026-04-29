@@ -445,7 +445,7 @@ function loadBalance(force){
   _balLoading = true;
   if(refreshBtn) refreshBtn.disabled = true;
 
-  // Таймаут 20 секунд — после него показываем ошибку и разблокируем
+  // Таймаут 38 секунд — с кэшем почти никогда не срабатывает; резерв для первого холодного запроса
   var timedOut = false;
   var timeoutId = setTimeout(function(){
     timedOut = true;
@@ -453,7 +453,7 @@ function loadBalance(force){
     if(refreshBtn) refreshBtn.disabled = false;
     if(balEl) balEl.innerHTML = '<span style="color:#f87171">Таймаут ответа</span>';
     if(metaEl && metaEl.textContent === 'загружается...') metaEl.textContent = '';
-  }, 20000);
+  }, 38000);
 
   fetch('/account/'+ACCOUNT_ID+'/balance')
     .then(function(r){ return r.json(); })
