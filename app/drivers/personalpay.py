@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+import threading
 import time
 import uuid
 from typing import Optional
@@ -16,12 +17,23 @@ from requests import exceptions as req_exc
 logger = logging.getLogger(__name__)
 
 
-HTTP_TIMEOUT = (8, 25)  # (connect, read) — PP через прокси иногда отвечает 15-20 сек
+HTTP_TIMEOUT = (6, 15)  # (connect, read) — агрессивный таймаут чтобы не висеть вечно
 
 # ---------------------------------------------------------------------------
 # Кэш токенов (AstroPay-style авто-обновление через PIN)
 # ---------------------------------------------------------------------------
 _pp_refreshed_tokens: dict = {}     # device_id → new_token, ожидает сохранения в БД
+
+# Lock по device_id — предотвращает одновременный PIN-refresh из нескольких потоков
+# (параллельные вызовы balance + cvu_info + activities все пытались бы делать refresh)
+_pp_refresh_locks: dict = {}
+_pp_refresh_locks_meta = threading.Lock()
+
+def _get_device_lock(device_id: str) -> threading.Lock:
+    with _pp_refresh_locks_meta:
+        if device_id not in _pp_refresh_locks:
+            _pp_refresh_locks[device_id] = threading.Lock()
+        return _pp_refresh_locks[device_id]
 
 # SHA-256 от дефолтного PIN-кода (используется если pin_hash не задан в credentials)
 _DEFAULT_PIN_HASH = "3bd9fa371342f9d53b917a59430208dca20f2f508e1337dbb4969543508d2c0f"  # PIN: 464646
@@ -178,103 +190,119 @@ def _get_token_direct(c: dict) -> tuple:
 def _do_pin_refresh(c: dict) -> Optional[str]:
     """Внутренняя функция: PIN-refresh без авто-обновления (без рекурсии через _get_token).
     Возвращает токен (тот же или новый) если сессия продлена, иначе None.
-    При ошибках кидает RuntimeError с описанием причины."""
+    При ошибках кидает RuntimeError с описанием причины.
+    Защищён lock'ом по device_id — только один refresh за раз."""
     pin_hash = c.get("pin_hash", "").strip()
     if not pin_hash:
         return None
     acc_label = (c.get("username") or c.get("device_id") or "?")[:20]
+    device_id = c.get("device_id") or "no_device"
+    lock = _get_device_lock(device_id)
 
-    token, paygilant = _get_token_direct(c)
-    base_hdrs = _base_headers(c) | {
-        "Authorization": token,
-        "x-fraud-paygilant-session-id": paygilant,
-    }
-    post_hdrs = _post_headers(c) | {
-        "Authorization": token,
-        "x-fraud-paygilant-session-id": paygilant,
-    }
+    if not lock.acquire(blocking=False):
+        # Другой поток уже делает PIN-refresh — ждём его завершения, затем используем результат
+        logger.debug("pp pin_refresh [%s] waiting for concurrent refresh", acc_label)
+        lock.acquire(blocking=True)
+        lock.release()
+        # Проверяем: может другой поток уже обновил токен в c["auth_token"]
+        existing = c.get("auth_token", "")
+        exp = _pp_jwt_exp(existing) if existing else None
+        if exp and exp > time.time() + 300:
+            return existing
+        return None
 
-    # Шаг 1 — проверяем статус PIN
     try:
-        r1 = _request_with_proxy_fallback(
-            "GET", c, f"{c['base_url']}/identity/auth/pin/status",
-            headers=base_hdrs,
-        )
-        logger.debug("pp pin_refresh [%s] step1 pin/status → %s", acc_label, r1.status_code)
-    except Exception as e:
-        logger.warning("pp pin_refresh [%s] step1 pin/status error: %s", acc_label, e)
+        token, paygilant = _get_token_direct(c)
+        base_hdrs = _base_headers(c) | {
+            "Authorization": token,
+            "x-fraud-paygilant-session-id": paygilant,
+        }
+        post_hdrs = _post_headers(c) | {
+            "Authorization": token,
+            "x-fraud-paygilant-session-id": paygilant,
+        }
 
-    # Шаг 2 — имитируем возврат в приложение
-    try:
-        r2 = _request_with_proxy_fallback(
-            "POST", c, f"{c['base_url']}/identity/auth/session/focus/changed",
-            headers=post_hdrs,
-            json={
-                "deviceId": c.get("device_id") or "no_device_id",
-                "sessionId": _paygilant_id(c.get("device_id") or "no_device_id"),
-                "type": "focusIn",
-            },
-        )
-        logger.debug("pp pin_refresh [%s] step2 focus/changed → %s", acc_label, r2.status_code)
-    except Exception as e:
-        logger.warning("pp pin_refresh [%s] step2 focus/changed error: %s", acc_label, e)
-
-    # Шаг 3 — валидируем PIN
-    try:
-        r_pin = _request_with_proxy_fallback(
-            "POST", c, f"{c['base_url']}/identity/auth/pin/validate",
-            headers=post_hdrs, json={"pin": pin_hash},
-        )
-    except Exception as e:
-        raise RuntimeError(f"Сеть недоступна (pin/validate): {e}") from e
-
-    logger.info("pp pin_refresh [%s] step3 pin/validate → %s %s",
-                acc_label, r_pin.status_code, r_pin.text[:120])
-
-    if r_pin.status_code in (401, 403):
-        raise RuntimeError(
-            f"Токен истёк на сервере (HTTP {r_pin.status_code}). "
-            "Получите новый auth_token из приложения PP и добавьте вручную."
-        )
-    if r_pin.status_code == 400:
-        body_txt = r_pin.text[:200]
-        raise RuntimeError(f"Неверный PIN или запрос отклонён (400): {body_txt}")
-    if r_pin.status_code not in (200, 201):
-        raise RuntimeError(
-            f"pin/validate вернул {r_pin.status_code}: {r_pin.text[:200]}"
-        )
-
-    # PIN принят — ищем новый JWT в статусе сессии
-    existing_token = token
-    try:
-        r_status = _request_with_proxy_fallback(
-            "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
-            headers=base_hdrs,
-        )
-        logger.debug("pp pin_refresh [%s] step4 session/status → %s", acc_label, r_status.status_code)
-        if r_status.status_code == 200:
-            try:
-                body = r_status.json()
-            except Exception:
-                body = {}
-            data = body.get("data") or body
-            new_token = (
-                data.get("idToken") or data.get("id_token")
-                or data.get("accessToken") or data.get("access_token")
-                or data.get("token")
-                or body.get("idToken") or body.get("id_token")
-                or body.get("accessToken") or body.get("access_token")
-                or body.get("token") or ""
+        # Шаг 1 — проверяем статус PIN
+        try:
+            r1 = _request_with_proxy_fallback(
+                "GET", c, f"{c['base_url']}/identity/auth/pin/status",
+                headers=base_hdrs,
             )
-            if new_token and str(new_token).startswith("eyJ"):
-                logger.info("pp pin_refresh [%s] получен новый JWT", acc_label)
-                return str(new_token)
-    except Exception as e:
-        logger.warning("pp pin_refresh [%s] step4 session/status error: %s", acc_label, e)
+            logger.debug("pp pin_refresh [%s] step1 pin/status → %s", acc_label, r1.status_code)
+        except Exception as e:
+            logger.warning("pp pin_refresh [%s] step1 pin/status error: %s", acc_label, e)
 
-    # PP продлил сессию server-side — JWT тот же, но сервер его снова принимает
-    logger.info("pp pin_refresh [%s] сессия продлена (тот же JWT)", acc_label)
-    return existing_token
+        # Шаг 2 — имитируем возврат в приложение
+        try:
+            r2 = _request_with_proxy_fallback(
+                "POST", c, f"{c['base_url']}/identity/auth/session/focus/changed",
+                headers=post_hdrs,
+                json={
+                    "deviceId": device_id,
+                    "sessionId": _paygilant_id(device_id),
+                    "type": "focusIn",
+                },
+            )
+            logger.debug("pp pin_refresh [%s] step2 focus/changed → %s", acc_label, r2.status_code)
+        except Exception as e:
+            logger.warning("pp pin_refresh [%s] step2 focus/changed error: %s", acc_label, e)
+
+        # Шаг 3 — валидируем PIN
+        try:
+            r_pin = _request_with_proxy_fallback(
+                "POST", c, f"{c['base_url']}/identity/auth/pin/validate",
+                headers=post_hdrs, json={"pin": pin_hash},
+            )
+        except Exception as e:
+            raise RuntimeError(f"Сеть недоступна (pin/validate): {e}") from e
+
+        logger.info("pp pin_refresh [%s] pin/validate → %s %s",
+                    acc_label, r_pin.status_code, r_pin.text[:120])
+
+        if r_pin.status_code in (401, 403):
+            raise RuntimeError(
+                f"Токен истёк на сервере (HTTP {r_pin.status_code}). "
+                "Получите новый auth_token из приложения PP и добавьте вручную."
+            )
+        if r_pin.status_code == 400:
+            raise RuntimeError(f"Неверный PIN или запрос отклонён (400): {r_pin.text[:200]}")
+        if r_pin.status_code not in (200, 201):
+            raise RuntimeError(f"pin/validate вернул {r_pin.status_code}: {r_pin.text[:200]}")
+
+        # PIN принят — ищем новый JWT в session/status
+        existing_token = token
+        try:
+            r_status = _request_with_proxy_fallback(
+                "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
+                headers=base_hdrs,
+            )
+            logger.debug("pp pin_refresh [%s] session/status → %s", acc_label, r_status.status_code)
+            if r_status.status_code == 200:
+                try:
+                    body = r_status.json()
+                except Exception:
+                    body = {}
+                data = body.get("data") or body
+                new_token = (
+                    data.get("idToken") or data.get("id_token")
+                    or data.get("accessToken") or data.get("access_token")
+                    or data.get("token")
+                    or body.get("idToken") or body.get("id_token")
+                    or body.get("accessToken") or body.get("access_token")
+                    or body.get("token") or ""
+                )
+                if new_token and str(new_token).startswith("eyJ"):
+                    logger.info("pp pin_refresh [%s] получен новый JWT", acc_label)
+                    return str(new_token)
+        except Exception as e:
+            logger.warning("pp pin_refresh [%s] session/status error: %s", acc_label, e)
+
+        # PP продлил сессию server-side — тот же JWT снова работает
+        logger.info("pp pin_refresh [%s] сессия продлена (тот же JWT)", acc_label)
+        return existing_token
+
+    finally:
+        lock.release()
 
 
 def _get_token(session: requests.Session, c: dict) -> tuple:
