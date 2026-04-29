@@ -1024,12 +1024,12 @@ async def _rate_collector_loop():
 _pp_last_keepalive: dict = {}   # account_id → timestamp последнего успешного PIN-refresh
 
 async def _pp_keepalive_loop():
-    """Фоновая задача: каждые 30 минут проверяет все PP аккаунты с pin_hash.
-    Если прошло > 8 часов с последнего PIN-refresh — делает его автоматически.
-    Это не даёт токену протухнуть: сессия продлевается до истечения JWT."""
+    """Фоновая задача: каждые 20 минут проверяет все PP аккаунты с pin_hash.
+    Если прошло > 5 часов с последнего PIN-refresh — делает его автоматически.
+    Интервал 5ч при 12-часовом JWT даёт ~2 refresh'а в окне жизни токена с запасом."""
     await asyncio.sleep(60)   # первый запуск через 1 мин после старта
-    PP_INTERVAL = 8 * 3600    # 8 часов между keep-alive
-    CHECK_INTERVAL = 1800     # проверяем раз в 30 минут
+    PP_INTERVAL    = 5 * 3600  # 5 часов между keep-alive (было 8h — слишком мало запаса)
+    CHECK_INTERVAL = 1200      # проверяем раз в 20 минут (было 30 мин)
 
     while True:
         try:
@@ -1041,26 +1041,35 @@ async def _pp_keepalive_loop():
             for acc in pp_accs:
                 acc_id = acc["id"]
                 last = _pp_last_keepalive.get(acc_id, 0)
-                if now - last < PP_INTERVAL:
-                    continue   # ещё не пора
 
                 creds = acc.get("credentials") or {}
                 token = creds.get("auth_token", "")
-                # Если токен уже мёртв > 2ч — не пробуем (всё равно не поможет)
-                exp = _pp_jwt_exp(token) if token else None
-                if exp and exp < now - 7200:
-                    logger.info("pp keepalive skip acc=%d: token expired >2h ago", acc_id)
+                exp   = _pp_jwt_exp(token) if token else None
+
+                # Токен истёк — пробуем обновить независимо от PP_INTERVAL
+                # (PP сервер может принять PIN даже на недавно истёкший токен)
+                token_needs_refresh = exp is not None and exp <= now + 300  # истёк или < 5 мин
+                interval_passed = now - last >= PP_INTERVAL
+
+                if not token_needs_refresh and not interval_passed:
+                    continue   # рано, токен ещё свежий
+
+                # Пропускаем только если токен мёртв давно (>8ч) И интервал ещё не прошёл
+                if exp and exp < now - 8 * 3600 and not interval_passed:
+                    logger.debug("pp keepalive skip acc=%d: token expired >8h ago, interval not passed", acc_id)
                     continue
 
                 try:
                     new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
                     if new_token:
                         _pp_last_keepalive[acc_id] = now
-                        # Сохраняем обновлённый токен (или тот же — но с продлённой серверной сессией)
                         new_creds = dict(creds)
                         new_creds["auth_token"] = new_token
                         db_update_account(acc_id, credentials=new_creds)
-                        logger.info("pp keepalive ok acc=%d", acc_id)
+                        # Инвалидируем кэш — следующий запрос баланса покажет обновлённый токен
+                        _balance_cache.pop(acc_id, None)
+                        logger.info("pp keepalive ok acc=%d (new_jwt=%s)",
+                                    acc_id, new_token != token)
                     else:
                         logger.warning("pp keepalive failed acc=%d: no token returned", acc_id)
                 except Exception as e:
@@ -1441,13 +1450,30 @@ async def api_pin_refresh(account_id: int):
             "message": "pin_hash не задан. Добавьте SHA-256 от PIN-кода в credentials."
         })
     try:
-        from app.drivers.personalpay import refresh_session_with_pin
+        from app.drivers.personalpay import refresh_session_with_pin, _pp_jwt_exp
         new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
         if new_token:
             new_creds = dict(creds)
             new_creds["auth_token"] = new_token
             db_update_account(account_id, credentials=new_creds)
-            return JSONResponse({"ok": True, "message": "Сессия продлена через PIN ✓"})
+            # Сбрасываем кэш — следующий запрос баланса возьмёт свежие credentials
+            _balance_cache.pop(account_id, None)
+            _activities_cache.pop(account_id, None)
+            # Сразу запускаем фоновый прогрев с новым токеном
+            if account_id not in _bg_refreshing_bal:
+                _bg_refreshing_bal.add(account_id)
+                asyncio.create_task(_bg_refresh_balance(account_id))
+            # Вычисляем сколько осталось до истечения нового токена
+            new_exp = _pp_jwt_exp(new_token)
+            is_fresh = bool(new_exp and new_exp > time.time() + 60)
+            hours_left = round((new_exp - time.time()) / 3600, 1) if new_exp else None
+            if is_fresh and hours_left:
+                msg = f"Сессия продлена ✓  Токен действует ещё {hours_left} ч."
+            elif is_fresh:
+                msg = "Сессия продлена через PIN ✓"
+            else:
+                msg = "PIN принят, но токен не обновился. Обновите auth_token вручную."
+            return JSONResponse({"ok": is_fresh, "message": msg})
         return JSONResponse({
             "ok": False,
             "message": "PIN не принят — ответ от сервера пустой. Обновите auth_token вручную."
