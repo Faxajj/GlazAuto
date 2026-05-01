@@ -11,6 +11,7 @@
   {% endif %}
 
   <form method="post" action="/account/{{ account.id }}/edit" class="form" id="edit-account-form">
+    {{ csrf_input(request) }}
     <div class="form-row">
       <label for="window">Окно (группа)</label>
       <select id="window" name="window">

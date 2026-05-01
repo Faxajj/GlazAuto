@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <title>{% block title %}Banks Dashboard{% endblock %}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="/static/style.css?v=13" />
+  {{ csrf_meta(request) }}
+  <link rel="stylesheet" href="/static/style.css?v=14" />
 </head>
 <body>
   <a href="#main-content" class="skip-link">Перейти к содержимому</a>
@@ -39,6 +40,7 @@
       <a href="/windows" class="btn-table btn-edit" style="text-decoration:none">🗂 Кабинеты</a>
       {% if current_user %}
       <form method="post" action="/logout" class="form-inline">
+        {{ csrf_input(request) }}
         <button type="submit" class="btn-table btn-edit">Выйти ({{ current_user.username }})</button>
       </form>
       {% endif %}
@@ -77,6 +79,22 @@
       <a href="/add" class="btn-add">+ Добавить аккаунт</a>
 
       <script>
+      // ─── CSRF helper: читает токен из meta-tag, fallback на cookie ─────
+      // Используется всеми JS fetch POST вызовами через заголовок X-CSRF-Token.
+      window._csrfToken = function(){
+        var m = document.querySelector('meta[name="csrf-token"]');
+        if(m && m.content) return m.content;
+        // Fallback на cookie
+        var match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+        return match ? decodeURIComponent(match[1]) : '';
+      };
+      // Удобный helper для fetch — добавляет CSRF header автоматически
+      window._csrfHeaders = function(extra){
+        var h = Object.assign({}, extra || {});
+        h['X-CSRF-Token'] = window._csrfToken();
+        return h;
+      };
+
       (function() {
         var fmt = function(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : v; };
 
@@ -297,7 +315,10 @@
             var resultsEl=overlay.querySelector('#mw-results');
             fetch('/multi-withdraw',{
               method:'POST',
-              headers:{'Content-Type':'application/json'},
+              headers:{
+                'Content-Type':'application/json',
+                'X-CSRF-Token': (window._csrfToken && window._csrfToken()) || ''
+              },
               body:JSON.stringify({account_ids:ids, destination:dest, amount:amt})
             })
             .then(function(r){return r.json();})

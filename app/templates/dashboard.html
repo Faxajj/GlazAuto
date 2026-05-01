@@ -31,6 +31,7 @@
               <a href="/?account_id={{ acc.id }}" class="btn-table btn-open">Открыть</a>
               <form method="post" action="/account/{{ acc.id }}/delete" class="form-inline"
                     data-confirm="Вы уверены, что хотите удалить счёт «{{ acc.label }}»? Все данные для входа будут удалены.">
+                {{ csrf_input(request) }}
                 <button type="submit" class="btn-table btn-danger">Удалить</button>
               </form>
             </div>

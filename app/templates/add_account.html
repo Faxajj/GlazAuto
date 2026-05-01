@@ -13,6 +13,7 @@
   {% endif %}
 
   <form method="post" action="/add" class="form" id="add-account-form">
+    {{ csrf_input(request) }}
     <div class="form-row">
       <label for="window">Окно (группа) *</label>
       <select id="window" name="window">

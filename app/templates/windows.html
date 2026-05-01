@@ -43,6 +43,7 @@
         {# Переименовать #}
         <form method="post" action="/windows/{{ w_slug }}/rename"
               style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+          {{ csrf_input(request) }}
           <input type="text" name="title" value="{{ w_name }}" required
                  style="background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:0.4rem 0.7rem;font-size:0.875rem;width:140px"/>
           <button type="submit" class="btn-table btn-edit" style="white-space:nowrap">✎ Переименовать</button>
@@ -52,6 +53,7 @@
         {% if not w_accounts %}
         <form method="post" action="/windows/{{ w_slug }}/delete"
               data-confirm="Удалить кабинет «{{ w_name }}»? Это действие нельзя отменить.">
+          {{ csrf_input(request) }}
           <button type="submit" class="btn-table btn-danger">✕</button>
         </form>
         {% else %}
@@ -83,6 +85,7 @@
   <div style="border-top:1px solid #1e293b;padding-top:1.5rem">
     <h3 style="margin:0 0 1rem;font-size:1rem;color:#e2e8f0">Создать новый кабинет</h3>
     <form method="post" action="/windows/add" class="form">
+      {{ csrf_input(request) }}
       <div class="form-row">
         <label for="win-title">Название кабинета *</label>
         <input id="win-title" name="title" type="text" placeholder="Glaz7" required
