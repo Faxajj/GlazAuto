@@ -95,6 +95,10 @@ from app.database import (
     update_proxy as db_update_proxy,
     delete_proxy as db_delete_proxy,
     mark_proxy_status as db_mark_proxy_status,
+    set_balance_cache as db_set_balance_cache,
+    get_balance_cache as db_get_balance_cache,
+    get_balance_cache_batch as db_get_balance_cache_batch,
+    delete_balance_cache as db_delete_balance_cache,
 )
 from app.proxies import (
     proxy_url as build_proxy_url,
@@ -177,12 +181,11 @@ templates.env.filters["timeago"] = _timeago
 
 def _cached_balance_for_template(account_id) -> Optional[float]:
     """Jinja-helper: возвращает закешированный баланс для server-render.
-    Используется в base.html сайдбара чтобы первый paint показывал реальные числа,
-    а не «—». Если кэша нет — None и в шаблоне рендерится прочерк."""
+    Читает из shared SQLite-кэша → виден всем gunicorn-воркерам."""
     try:
         acc_id = int(account_id)
-        cached = _balance_cache.get(acc_id)
-        if cached:
+        cached = db_get_balance_cache(acc_id)
+        if cached and not cached.get("is_error"):
             data = cached.get("data") or {}
             bal = data.get("balance")
             return float(bal) if bal is not None else None
@@ -1144,7 +1147,38 @@ app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=5)
 # Результат: первый запрос после старта сервера — синхронный (одноразовый «холодный» старт).
 # Все последующие запросы — мгновенные из кэша, а кэш незаметно обновляется в фоне.
 
-_balance_cache:    dict = {}   # {account_id: {"data": dict, "ts": float}}
+# SQLite-backed shared cache между gunicorn-воркерами. API совместим с dict
+# (поддерживает .get/.pop/__setitem__/__getitem__/__contains__) — не нужно
+# переписывать все 18 мест использования _balance_cache.X в main.py.
+class _SharedBalanceCache:
+    def get(self, key, default=None):
+        v = db_get_balance_cache(int(key))
+        return v if v is not None else default
+    def __getitem__(self, key):
+        v = db_get_balance_cache(int(key))
+        if v is None:
+            raise KeyError(key)
+        return v
+    def __setitem__(self, key, value):
+        if not isinstance(value, dict):
+            return
+        db_set_balance_cache(
+            int(key),
+            value.get("data") or {},
+            is_error=bool(value.get("is_error")),
+            last_refresh_error=value.get("last_refresh_error"),
+        )
+    def __contains__(self, key):
+        return db_get_balance_cache(int(key)) is not None
+    def pop(self, key, default=None):
+        v = db_get_balance_cache(int(key))
+        db_delete_balance_cache(int(key))
+        return v if v is not None else default
+    def get_batch(self, keys):
+        return db_get_balance_cache_batch([int(k) for k in keys])
+
+_balance_cache = _SharedBalanceCache()
+_balance_cache_legacy:    dict = {}   # legacy slot, не используется
 _activities_cache: dict = {}   # {account_id: {"acts": list, "ts": float}}
 _bg_refreshing_bal: set = set()  # id аккаунтов с активным фоновым обновлением баланса
 _bg_refreshing_act: set = set()  # id аккаунтов с активным фоновым обновлением активностей
@@ -1239,7 +1273,9 @@ async def _fetch_and_cache_balance(account_id: int, acc: dict) -> dict:
 
 
 async def _bg_refresh_balance(account_id: int) -> None:
-    """Фоновое обновление кэша баланса (не блокирует HTTP-ответ)."""
+    """Фоновое обновление кэша баланса (не блокирует HTTP-ответ).
+    При ошибке записывает error-маркер в кэш — чтобы UI показал ⚠ вместо
+    пустой плашки. Раньше эта ошибка молча терялась."""
     try:
         fresh_acc = get_account(account_id)
         if fresh_acc:
@@ -1249,6 +1285,24 @@ async def _bg_refresh_balance(account_id: int) -> None:
             })
             logger.debug("bg_refresh_balance ok acc=%d", account_id)
     except Exception as e:
+        # Записываем ошибку в shared SQLite-кэш — все воркеры увидят is_error
+        err_str = str(e)[:300]
+        existing = db_get_balance_cache(account_id)
+        if existing and not existing.get("is_error"):
+            # Был успешный кэш — оставляем data, помечаем что последний refresh упал
+            db_set_balance_cache(
+                account_id,
+                existing["data"],
+                is_error=False,
+                last_refresh_error=err_str,
+            )
+        else:
+            db_set_balance_cache(
+                account_id,
+                {"error": err_str, "balance": None, "cvu_number": "", "cvu_alias": ""},
+                is_error=True,
+                last_refresh_error=err_str,
+            )
         logger.debug("bg_refresh_balance error acc=%d: %s", account_id, e)
     finally:
         _bg_refreshing_bal.discard(account_id)
@@ -2320,17 +2374,21 @@ async def api_balances_batch(ids: str = ""):
 
     result: dict = {}
     now = time.time()
+    # Один SQL-запрос на все ID → намного быстрее чем N отдельных
+    cached_batch = db_get_balance_cache_batch(id_list)
     for acc_id in id_list:
-        cached = _balance_cache.get(acc_id)
+        cached = cached_batch.get(acc_id)
         if cached and (now - cached["ts"]) < _BALANCE_STALE:
             data = dict(cached["data"])
             data["account_withdraw_count"] = get_account_withdraw_count(acc_id)
             data["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
             data["_cache_age_sec"] = int(now - cached["ts"])
+            data["_is_error"] = bool(cached.get("is_error"))
+            if cached.get("last_refresh_error"):
+                data["_last_refresh_error"] = cached["last_refresh_error"][:200]
             result[str(acc_id)] = data
         else:
             # Кэша нет → запускаем фоновое прогревание для ЛЮБОГО bank_type
-            # (раньше было только PP/AP — UC-карты никогда не показывали баланс)
             if acc_id not in _bg_refreshing_bal:
                 acc = get_account(acc_id)
                 if acc and acc.get("bank_type"):

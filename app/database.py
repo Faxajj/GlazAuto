@@ -317,6 +317,14 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_proxies_status_enabled
             ON proxies(status, enabled);
+        CREATE TABLE IF NOT EXISTS balance_cache (
+            account_id          INTEGER PRIMARY KEY,
+            data_json           TEXT NOT NULL,
+            ts                  INTEGER NOT NULL,
+            is_error            INTEGER NOT NULL DEFAULT 0,
+            last_refresh_error  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_balance_cache_ts ON balance_cache(ts DESC);
         """)
         conn.commit()
         _run_migrations(conn)
@@ -1299,6 +1307,99 @@ def delete_proxy(proxy_id: int) -> bool:
         return cur.rowcount > 0
     except sqlite3.OperationalError:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Balance cache (shared across gunicorn workers)
+# ---------------------------------------------------------------------------
+# Раньше хранился в _balance_cache: dict в памяти КАЖДОГО воркера.
+# В multi-worker setup (gunicorn -w 4) это значит что каждый воркер видит
+# только СВОЮ копию — proactive refresh worker'а 1 не виден worker'у 2.
+# SQLite-backed cache решает проблему: одна общая таблица для всех воркеров.
+
+def set_balance_cache(
+    account_id: int,
+    data: dict,
+    is_error: bool = False,
+    last_refresh_error: Optional[str] = None,
+) -> None:
+    """UPSERT записи кэша баланса. Все воркеры увидят результат сразу."""
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO balance_cache "
+                "(account_id, data_json, ts, is_error, last_refresh_error) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(account_id) DO UPDATE SET "
+                "  data_json = excluded.data_json, "
+                "  ts = excluded.ts, "
+                "  is_error = excluded.is_error, "
+                "  last_refresh_error = excluded.last_refresh_error",
+                (account_id, json.dumps(data, ensure_ascii=False),
+                 int(time.time()), 1 if is_error else 0, last_refresh_error),
+            )
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def get_balance_cache(account_id: int) -> Optional[dict]:
+    """Возвращает {"data", "ts", "is_error", "last_refresh_error"} или None."""
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT data_json, ts, is_error, last_refresh_error "
+                "FROM balance_cache WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "data": json.loads(row["data_json"]),
+            "ts": int(row["ts"]),
+            "is_error": bool(row["is_error"]),
+            "last_refresh_error": row["last_refresh_error"],
+        }
+    except (sqlite3.OperationalError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def get_balance_cache_batch(account_ids: List[int]) -> dict:
+    """Один SELECT для всех ID-ов. Возвращает {account_id: cache_dict}."""
+    if not account_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(account_ids))
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(
+                f"SELECT account_id, data_json, ts, is_error, last_refresh_error "
+                f"FROM balance_cache WHERE account_id IN ({placeholders})",
+                tuple(account_ids),
+            ).fetchall()
+        out = {}
+        for r in rows:
+            try:
+                out[int(r["account_id"])] = {
+                    "data": json.loads(r["data_json"]),
+                    "ts": int(r["ts"]),
+                    "is_error": bool(r["is_error"]),
+                    "last_refresh_error": r["last_refresh_error"],
+                }
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return out
+    except sqlite3.OperationalError:
+        return {}
+
+
+def delete_balance_cache(account_id: int) -> None:
+    """Инвалидация — удаляем запись. Следующий read вернёт None → запустится bg refresh."""
+    try:
+        with _get_conn() as conn:
+            conn.execute("DELETE FROM balance_cache WHERE account_id=?", (account_id,))
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 def mark_proxy_status(
