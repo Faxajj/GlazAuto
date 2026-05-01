@@ -128,8 +128,9 @@ ERROR_MESSAGES: dict[str, str] = {
     "account_limit_reached": f"❌ Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT} в день на группу). Лимит обновляется ежедневно в 07:30 МСК.",
     "group_a_limit_reached": f"❌ Лимит для PP-внутренних переводов ({DAILY_WITHDRAW_LIMIT}/день) достигнут. Сброс в 07:30 МСК.",
     "group_b_limit_reached": f"❌ Лимит для внешних переводов ({DAILY_WITHDRAW_LIMIT}/день) достигнут. Сброс в 07:30 МСК.",
-    "duplicate_withdraw": "❌ Этот вывод уже был отправлен. Проверьте историю операций.",
+    "duplicate_withdraw":   "❌ Этот вывод уже был отправлен. Проверьте историю операций.",
     "withdraw_in_progress": "⏳ Этот вывод сейчас обрабатывается. Подождите.",
+    "retry_after_minute":   "⏳ Предыдущая попытка ждёт ответа банка. Подождите 1 минуту и повторите — система автоматически разрулит.",
     "token_expired": "❌ Сессия банка истекла. Обновите токен в настройках карты.",
     "bank_unavailable": "❌ Банк временно недоступен. Попробуйте повторить через 1–2 минуты.",
 }
@@ -2617,10 +2618,11 @@ async def multi_withdraw(request: Request):
         # Параллелизм сохраняется между разными account_id.
         lock = await _get_account_lock(acc["id"])
         async with lock:
-            # Idempotency: повторный multi-withdraw на ту же сумму/направление
-            # в один бизнес-день не пройдёт второй раз.
+            # Idempotency с 60-секундным окном — защита от double-click,
+            # но через минуту тот же multi-withdraw можно повторить.
+            minute_window = int(time.time() // 60)
             idem_key = _make_idempotency_key(acc["id"], destination, amt or 0,
-                                             salt="multi")
+                                             salt=f"multi:{minute_window}")
             created, prior = try_create_withdraw_attempt(
                 idem_key, acc["id"], destination, amt or 0, group_key=group_key,
             )
@@ -2636,8 +2638,13 @@ async def multi_withdraw(request: Request):
                     return {"account_id": acc_id, "label": acc["label"], "ok": False,
                             "error": prior.get("error_message") or "rejected_by_bank",
                             "tid": None}
+                # UNCERTAIN/STUCK в текущем 60-сек окне:
+                # Не пропускаем дальше — risk double-charge если bank на самом деле
+                # принял прошлый. Через минуту minute_window сменится → ключ
+                # станет другим → новая попытка пройдёт автоматически.
                 return {"account_id": acc_id, "label": acc["label"], "ok": False,
-                        "error": "Дубликат вывода", "tid": None}
+                        "error": "Предыдущая попытка ждёт ответа банка. Повторите через 1 минуту.",
+                        "tid": None}
 
             # Атомарный резерв per-CVU
             if try_reserve_withdraw_count(destination, acc["id"]) is None:
@@ -2741,16 +2748,20 @@ async def withdraw(
     account_lock = await _get_account_lock(account_id)
     async with account_lock:
 
-        # ── Идемпотентность: один и тот же (acc, dest, amount, business_date)
-        #     не должен обрабатываться повторно при refresh-replay браузера.
-        idem_key = _make_idempotency_key(account_id, dest, amt or 0)
+        # ── Идемпотентность с 60-секундным окном:
+        #   Защита от double-click и refresh-replay в первые 60 сек после submit.
+        #   После 60 сек — minute_window меняется → новый ключ → можно повторно
+        #   отправить тот же вывод (например, та же сумма на тот же CVU).
+        minute_window = int(time.time() // 60)
+        idem_key = _make_idempotency_key(account_id, dest, amt or 0,
+                                         salt=f"manual:{minute_window}")
         created, prior = try_create_withdraw_attempt(
             idem_key, account_id, dest, amt or 0, group_key=group_key,
         )
         if not created and prior:
             status = prior.get("status")
             if status == "SUCCESS":
-                # Повторный submit того же вывода — отдадим прошлый чек
+                # Тот же submit в окне 60 сек — silently показываем прошлый чек
                 tid = prior.get("bank_tx_id")
                 if tid:
                     return RedirectResponse(
@@ -2761,6 +2772,7 @@ async def withdraw(
                     url=f"/?account_id={account_id}&success=1", status_code=302,
                 )
             if status in ("PENDING", "EXECUTING"):
+                # Реальный in-flight — единственный случай где блокируем явно
                 return RedirectResponse(
                     url=f"/?account_id={account_id}&error=withdraw_in_progress",
                     status_code=302,
@@ -2770,9 +2782,14 @@ async def withdraw(
                 return RedirectResponse(
                     url=f"/?account_id={account_id}&error={err_param}", status_code=302,
                 )
-            # UNCERTAIN/STUCK — даём пользователю явный сигнал
+            # UNCERTAIN/STUCK в текущем 60-сек окне:
+            # Не пропускаем — есть risk double-charge если банк на самом деле
+            # принял прошлый запрос (мы не получили ответ из-за сети). Reconciliation
+            # worker разрешит это сам в течение 5 минут. Через 1 минуту minute_window
+            # сменится → ключ станет другим → новая попытка пройдёт автоматически.
             return RedirectResponse(
-                url=f"/?account_id={account_id}&error=duplicate_withdraw", status_code=302,
+                url=f"/?account_id={account_id}&error=retry_after_minute",
+                status_code=302,
             )
 
         # ── Per-CVU лимит: атомарный резерв (15 на CVU за день) ─────────────
@@ -3298,6 +3315,116 @@ async def proxies_add(
           target_type="proxy", target_id=new_id,
           details={"host": host.strip(), "port": port_i, "type": type})
     return RedirectResponse(url="/admin/proxies?success=added", status_code=302)
+
+
+@app.post("/admin/proxies/add-bulk", response_class=RedirectResponse)
+async def proxies_add_bulk(
+    request:        Request,
+    bulk_list:      str = Form(...),
+    default_type:   str = Form("socks5h"),
+    region:         str = Form(""),
+    label_prefix:   str = Form(""),
+):
+    """Парсит textarea со списком прокси и добавляет все валидные.
+    Поддерживает форматы:
+      host:port:user:pass
+      host:port
+      socks5h://user:pass@host:port
+      http://host:port
+    """
+    added = skipped = invalid = 0
+    region_norm = (region or "").strip().upper() or None
+    prefix = (label_prefix or "").strip()
+    lines = [ln.strip() for ln in (bulk_list or "").splitlines()]
+    counter = 1
+
+    for raw_line in lines:
+        # Пропускаем пустые и комментарии
+        if not raw_line or raw_line.startswith("#"):
+            continue
+        parsed = _parse_proxy_line(raw_line, default_type=default_type)
+        if not parsed:
+            invalid += 1
+            continue
+
+        # Авто-label: prefix + counter, или None
+        auto_label: Optional[str] = None
+        if prefix:
+            auto_label = f"{prefix}{counter}"
+
+        new_id = db_add_proxy(
+            type=parsed["type"],
+            host=parsed["host"],
+            port=parsed["port"],
+            username=parsed["user"],
+            password=parsed["pass"],
+            label=auto_label,
+            region=region_norm,
+        )
+        if new_id:
+            added += 1
+            counter += 1
+            audit("proxy.created", request=request, user=_current_user(request),
+                  target_type="proxy", target_id=new_id,
+                  details={"host": parsed["host"], "port": parsed["port"],
+                           "type": parsed["type"], "via": "bulk_import"})
+        else:
+            skipped += 1     # дубликат (UNIQUE constraint на host+port+username)
+
+    return RedirectResponse(
+        url=f"/admin/proxies?success=bulk&added={added}&skipped={skipped}&invalid={invalid}",
+        status_code=302,
+    )
+
+
+def _parse_proxy_line(line: str, default_type: str = "socks5h") -> Optional[dict]:
+    """Парсит одну строку прокси в dict {type, host, port, user, pass}.
+    Возвращает None если строка нераспознана.
+    """
+    line = (line or "").strip()
+    if not line:
+        return None
+    # Формат 1: scheme://[user:pass@]host:port
+    if "://" in line:
+        try:
+            from urllib.parse import urlparse
+            u = urlparse(line)
+            if not u.hostname or not u.port:
+                return None
+            scheme = (u.scheme or default_type).lower()
+            if scheme not in ("socks5h", "socks5", "http", "https"):
+                scheme = default_type
+            return {
+                "type":     scheme,
+                "host":     u.hostname,
+                "port":     int(u.port),
+                "user":     u.username or None,
+                "pass":     u.password or None,
+            }
+        except Exception:
+            return None
+    # Формат 2: host:port:user:pass или host:port
+    parts = line.split(":")
+    if len(parts) == 2:
+        host, port = parts
+        user = pwd = None
+    elif len(parts) == 4:
+        host, port, user, pwd = parts
+    else:
+        return None
+    try:
+        port_i = int(port.strip())
+        if port_i < 1 or port_i > 65535 or not host.strip():
+            return None
+    except (ValueError, TypeError):
+        return None
+    return {
+        "type": default_type,
+        "host": host.strip(),
+        "port": port_i,
+        "user": user.strip() if user else None,
+        "pass": pwd.strip() if pwd else None,
+    }
 
 
 @app.post("/admin/proxies/{proxy_id}/check", response_class=RedirectResponse)
