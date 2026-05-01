@@ -22,6 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.database import (
     DAILY_WITHDRAW_LIMIT,
@@ -172,6 +173,25 @@ def _timeago(unix_ts) -> str:
 
 
 templates.env.filters["timeago"] = _timeago
+
+
+def _cached_balance_for_template(account_id) -> Optional[float]:
+    """Jinja-helper: возвращает закешированный баланс для server-render.
+    Используется в base.html сайдбара чтобы первый paint показывал реальные числа,
+    а не «—». Если кэша нет — None и в шаблоне рендерится прочерк."""
+    try:
+        acc_id = int(account_id)
+        cached = _balance_cache.get(acc_id)
+        if cached:
+            data = cached.get("data") or {}
+            bal = data.get("balance")
+            return float(bal) if bal is not None else None
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+templates.env.globals["cached_balance"] = _cached_balance_for_template
 
 
 # ---------------------------------------------------------------------------
@@ -1109,6 +1129,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(AuthMiddleware)
+# GZip-сжатие для всех ответов >500 байт — экономит трафик на JSON и HTML
+# в 4-7 раз. CPU-overhead минимален (несколько мс на typical response).
+app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=5)
 
 
 # ---------------------------------------------------------------------------
@@ -1195,6 +1218,21 @@ async def _fetch_and_cache_balance(account_id: int, acc: dict) -> dict:
                 info["token_auto_refreshed"] = True
             except Exception:
                 pass
+
+    # Sticky proxy-failover persistence: если драйвер переключился на pool-proxy
+    # (credentials._failover_to_proxy выставлен), сохраняем новый прокси в БД
+    # чтобы следующие вызовы не тратили время на мёртвый прокси
+    creds_after = acc.get("credentials") or {}
+    failover_to = creds_after.pop("_failover_to_proxy", None)
+    if failover_to:
+        fresh_acc = get_account(account_id)
+        if fresh_acc:
+            new_creds = dict(fresh_acc.get("credentials") or {})
+            new_creds["proxy"] = failover_to
+            new_creds["http_proxy"] = failover_to
+            new_creds["https_proxy"] = failover_to
+            db_update_account(account_id, credentials=new_creds)
+            logger.info("proxy sticky failover for acc=%d → switched to pool proxy", account_id)
 
     _balance_cache[account_id] = {"data": info, "ts": time.time()}
     return info
@@ -1578,14 +1616,16 @@ async def _audit_log_cleanup_loop():
 # После 3 fail'ов подряд → auto-disable (enabled=0). Можно re-enable вручную.
 
 async def _proxy_health_check_loop():
-    """Background: проверяет живость всех enabled прокси."""
+    """Background: проверяет живость всех enabled прокси.
+    При auto-disable прокси (3 fail подряд) → реактивно переназначает
+    все аккаунты на этом мёртвом прокси на healthy из пула.
+    """
     await asyncio.sleep(180)   # warm-up: даём системе подняться
     while True:
         try:
             proxies = db_list_proxies(only_enabled=True)
             if proxies:
                 logger.info("proxy health-check: testing %d proxies", len(proxies))
-                # Обходим в потоках чтобы один медленный не блокировал остальных
                 async def _check_and_mark(p):
                     status, latency, err = await asyncio.to_thread(
                         proxy_health_check_one, p,
@@ -1598,7 +1638,14 @@ async def _proxy_health_check_loop():
                             db_update_proxy(p["id"], enabled=False)
                             logger.warning("proxy %d (%s:%d) auto-disabled after 3 fails",
                                            p["id"], p["host"], p["port"])
-                # Параллельно по 5 прокси за раз чтобы не перегрузить
+                            # Реактивно переназначаем все аккаунты на этом мёртвом прокси
+                            dead_url = build_proxy_url(p)
+                            res = _reassign_dead_proxy_accounts(only_proxy_url=dead_url)
+                            if res["reassigned"]:
+                                logger.warning(
+                                    "proxy auto-disable acc-reassign: %d accounts moved off %s:%d",
+                                    res["reassigned"], p["host"], p["port"],
+                                )
                 semaphore = asyncio.Semaphore(5)
                 async def _with_sem(p):
                     async with semaphore:
@@ -1607,6 +1654,30 @@ async def _proxy_health_check_loop():
         except Exception as e:
             logger.warning("proxy health-check loop error: %s", e)
         await asyncio.sleep(PROXY_HEALTH_INTERVAL)
+
+
+async def _proxy_auto_reassign_loop():
+    """Раз в 10 минут (плюс одноразово через 5 мин после старта) сканирует все
+    PP/AP аккаунты и переназначает с мёртвых прокси на healthy.
+    Safety net поверх реактивного auto-disable — ловит крайние случаи:
+      - аккаунты с прокси, которая никогда не была в пуле (legacy)
+      - удалённые из пула прокси
+      - прокси которые умерли но fail_count ещё не достиг 3
+    """
+    await asyncio.sleep(300)   # первый прогон через 5 мин — даём health-check'у поработать
+    while True:
+        try:
+            res = _reassign_dead_proxy_accounts()
+            if res.get("no_healthy"):
+                logger.info("auto-reassign loop: пул пуст — пропуск")
+            elif res["reassigned"]:
+                logger.info(
+                    "auto-reassign loop: переназначено %d аккаунтов на healthy proxies",
+                    res["reassigned"],
+                )
+        except Exception as e:
+            logger.warning("auto-reassign loop error: %s", e)
+        await asyncio.sleep(600)   # каждые 10 минут
 
 
 # ---------------------------------------------------------------------------
@@ -1922,6 +1993,7 @@ async def startup_event():
     asyncio.create_task(_reconcile_uncertain_loop())
     asyncio.create_task(_auto_withdraw_scheduler_loop())
     asyncio.create_task(_proxy_health_check_loop())
+    asyncio.create_task(_proxy_auto_reassign_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -2224,6 +2296,48 @@ async def dashboard(request: Request):
 # ---------------------------------------------------------------------------
 # API: баланс + история (JSON, для lazy-loading)
 # ---------------------------------------------------------------------------
+
+@app.get("/api/balances")
+async def api_balances_batch(ids: str = ""):
+    """Batched-эндпоинт: возвращает балансы N аккаунтов за один HTTP-запрос.
+    Используется sidebar'ом — экономит N-1 round-trip'ов.
+
+    Семантика: возвращает ТОЛЬКО кэшированные значения, без блокирующих запросов
+    к банку. Если кэша нет — null. Это интенционально: sidebar обновляется часто
+    и не должен ждать 28с холодного fetch'а на каждом аккаунте.
+
+    Параметры: ids=1,2,3 (csv).
+    Ответ: {"balances": {"1": {balance, cvu_number, ...}, "2": {...}, "3": null}, "ts": <unix>}
+    """
+    if not ids:
+        return JSONResponse({"balances": {}, "ts": int(time.time())})
+    try:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip().isdigit()]
+    except Exception:
+        return JSONResponse({"error": "invalid ids"}, status_code=400)
+    if len(id_list) > 200:
+        return JSONResponse({"error": "too many ids"}, status_code=400)
+
+    result: dict = {}
+    now = time.time()
+    for acc_id in id_list:
+        cached = _balance_cache.get(acc_id)
+        if cached and (now - cached["ts"]) < _BALANCE_STALE:
+            data = dict(cached["data"])
+            data["account_withdraw_count"] = get_account_withdraw_count(acc_id)
+            data["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
+            data["_cache_age_sec"] = int(now - cached["ts"])
+            result[str(acc_id)] = data
+        else:
+            # Кэша нет → запускаем фоновое прогревание (не ждём здесь)
+            if acc_id not in _bg_refreshing_bal:
+                acc = get_account(acc_id)
+                if acc and acc.get("bank_type") in ("personalpay", "astropay"):
+                    _bg_refreshing_bal.add(acc_id)
+                    asyncio.create_task(_bg_refresh_balance(acc_id))
+            result[str(acc_id)] = None
+    return JSONResponse({"balances": result, "ts": int(now)})
+
 
 @app.get("/account/{account_id}/balance")
 async def api_balance(account_id: int):
@@ -3425,6 +3539,165 @@ def _parse_proxy_line(line: str, default_type: str = "socks5h") -> Optional[dict
         "user": user.strip() if user else None,
         "pass": pwd.strip() if pwd else None,
     }
+
+
+def _reassign_dead_proxy_accounts(
+    only_proxy_url: Optional[str] = None,
+    audit_request: Optional[Request] = None,
+    audit_user: Optional[dict] = None,
+) -> dict:
+    """Сканирует все PP/AP аккаунты и переназначает с DEAD прокси на healthy.
+
+    Args:
+        only_proxy_url: если задан — переназначает ТОЛЬКО аккаунты на этом конкретном
+                        прокси (для реактивного вызова после auto-disable).
+                        Если None — все аккаунты с прокси НЕ из healthy-pool.
+
+    Returns:
+        {"reassigned": int, "skipped_healthy": int, "skipped_uc": int, "no_healthy": bool}
+    """
+    healthy = db_list_proxies(only_enabled=True, only_healthy=True)
+    if not healthy:
+        return {"reassigned": 0, "skipped_healthy": 0, "skipped_uc": 0, "no_healthy": True}
+
+    healthy_urls      = set(build_proxy_url(p) for p in healthy)
+    healthy_url_to_id = {build_proxy_url(p): p["id"] for p in healthy}
+
+    # Текущая нагрузка по healthy-прокси (для load-balancing)
+    usage: dict = {url: 0 for url in healthy_urls}
+    accounts = list_accounts()
+    for acc in accounts:
+        cr = acc.get("credentials") or {}
+        cur = (cr.get("proxy") or cr.get("https_proxy") or cr.get("http_proxy") or "").strip()
+        if cur in healthy_urls:
+            usage[cur] += 1
+
+    reassigned = skipped_healthy = skipped_uc = 0
+    for acc in accounts:
+        bank_type = acc.get("bank_type")
+        if bank_type not in ("personalpay", "astropay"):
+            skipped_uc += 1
+            continue
+        cr = acc.get("credentials") or {}
+        cur = (cr.get("proxy") or cr.get("https_proxy") or cr.get("http_proxy") or "").strip()
+        if cur in healthy_urls:
+            skipped_healthy += 1
+            continue
+        if only_proxy_url is not None and cur != only_proxy_url:
+            continue   # реактивный режим — трогаем только заданный прокси
+        if not cur and only_proxy_url is None:
+            # Нет прокси вообще — не трогаем (возможно намеренно)
+            # Хотя можно бы и присвоить из пула. Делаем это:
+            pass
+        # Pick least-loaded healthy
+        best_url = min(usage, key=lambda u: usage[u])
+        new_creds = dict(cr)
+        new_creds["proxy"]       = best_url
+        new_creds["http_proxy"]  = best_url
+        new_creds["https_proxy"] = best_url
+        db_update_account(acc["id"], credentials=new_creds)
+        usage[best_url] += 1
+        reassigned += 1
+        # Кэш сбрасываем — следующий запрос пойдёт через новый прокси
+        _balance_cache.pop(acc["id"], None)
+        try:
+            audit("proxy.reassigned",
+                  request=audit_request, user=audit_user,
+                  target_type="account", target_id=acc["id"],
+                  details={"from_url_prefix": cur[:30] if cur else "(none)",
+                           "to_proxy_id": healthy_url_to_id[best_url],
+                           "auto": audit_request is None})
+        except Exception:
+            pass
+    return {"reassigned": reassigned, "skipped_healthy": skipped_healthy,
+            "skipped_uc": skipped_uc, "no_healthy": False}
+
+
+@app.post("/admin/proxies/reassign-all", response_class=RedirectResponse)
+async def proxies_reassign_all(request: Request):
+    """Manual мягкий режим — переназначает только аккаунты с прокси НЕ из healthy-пула.
+    Аккаунты на уже-healthy прокси не трогаются."""
+    res = _reassign_dead_proxy_accounts(audit_request=request, audit_user=_current_user(request))
+    if res.get("no_healthy"):
+        return RedirectResponse(url="/admin/proxies?error=no_healthy", status_code=302)
+    return RedirectResponse(
+        url=f"/admin/proxies?reassigned={res['reassigned']}"
+            f"&skipped_healthy={res['skipped_healthy']}"
+            f"&skipped_uc={res['skipped_uc']}",
+        status_code=302,
+    )
+
+
+def _force_reassign_all_accounts(
+    audit_request: Optional[Request] = None,
+    audit_user: Optional[dict] = None,
+) -> dict:
+    """ПРИНУДИТЕЛЬНО переназначает прокси из healthy-пула на ВСЕ PP/AP аккаунты,
+    независимо от текущего состояния. Распределяет нагрузку round-robin: первый
+    аккаунт → наименее загруженный healthy, второй → следующий по нагрузке, и т.д.
+
+    Это самый агрессивный режим — даже карты с уже healthy прокси получат новый
+    (возможно тот же, но всё равно через пул). Используется для:
+      - первичной настройки после добавления нового пула
+      - принудительного rebalance после удаления нескольких прокси
+      - инициации проверки всех карт через свежий пул
+
+    Returns: {"reassigned": int, "skipped_uc": int, "no_healthy": bool}
+    """
+    healthy = db_list_proxies(only_enabled=True, only_healthy=True)
+    if not healthy:
+        return {"reassigned": 0, "skipped_uc": 0, "no_healthy": True}
+
+    healthy_urls      = [build_proxy_url(p) for p in healthy]
+    healthy_url_to_id = {build_proxy_url(p): p["id"] for p in healthy}
+    # Стартуем с равной нагрузки (force = чистый redistribution)
+    usage: dict = {url: 0 for url in healthy_urls}
+
+    reassigned = skipped_uc = 0
+    accounts = list_accounts()
+    for acc in accounts:
+        bank_type = acc.get("bank_type")
+        if bank_type not in ("personalpay", "astropay"):
+            skipped_uc += 1
+            continue
+        # Pick least-loaded (round-robin при равной нагрузке)
+        best_url = min(usage, key=lambda u: usage[u])
+        cr = acc.get("credentials") or {}
+        cur = (cr.get("proxy") or cr.get("https_proxy") or cr.get("http_proxy") or "").strip()
+        new_creds = dict(cr)
+        new_creds["proxy"]       = best_url
+        new_creds["http_proxy"]  = best_url
+        new_creds["https_proxy"] = best_url
+        db_update_account(acc["id"], credentials=new_creds)
+        usage[best_url] += 1
+        reassigned += 1
+        _balance_cache.pop(acc["id"], None)
+        try:
+            audit("proxy.force_reassigned",
+                  request=audit_request, user=audit_user,
+                  target_type="account", target_id=acc["id"],
+                  details={"from_url_prefix": cur[:30] if cur else "(none)",
+                           "to_proxy_id": healthy_url_to_id[best_url],
+                           "force": True})
+        except Exception:
+            pass
+
+    return {"reassigned": reassigned, "skipped_uc": skipped_uc, "no_healthy": False}
+
+
+@app.post("/admin/proxies/force-reassign-all", response_class=RedirectResponse)
+async def proxies_force_reassign_all(request: Request):
+    """ПРИНУДИТЕЛЬНОЕ переназначение прокси на ВСЕХ PP/AP аккаунтах.
+    Заменяет даже на тех картах где сейчас вроде healthy прокси.
+    Используется для гарантированной чистой переналадки на свежий пул."""
+    res = _force_reassign_all_accounts(audit_request=request, audit_user=_current_user(request))
+    if res.get("no_healthy"):
+        return RedirectResponse(url="/admin/proxies?error=no_healthy", status_code=302)
+    return RedirectResponse(
+        url=f"/admin/proxies?force_reassigned={res['reassigned']}"
+            f"&skipped_uc={res['skipped_uc']}",
+        status_code=302,
+    )
 
 
 @app.post("/admin/proxies/{proxy_id}/check", response_class=RedirectResponse)
