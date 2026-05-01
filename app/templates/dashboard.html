@@ -48,44 +48,45 @@
 (function(){
   var fmt = function(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : v; };
 
-  function fetchBalance(id){
-    var balEl = document.getElementById('dash-balance-'+id);
+  function _renderCard(id, data){
+    var balEl  = document.getElementById('dash-balance-'+id);
     var metaEl = document.getElementById('dash-meta-'+id);
-    fetch('/account/'+id+'/balance')
-      .then(r=>r.json())
-      .then(d=>{
-        if(d.error){
-          balEl.innerHTML='<span style="color:#f87171;font-size:0.85rem">⚠ Ошибка подключения</span>';
-        } else {
-          balEl.textContent = fmt(d.balance) + ' ARS';
-          balEl.style.color = d.balance > 0 ? '#34d399' : '#94a3b8';
-          if(metaEl){
-            var parts=[];
-            if(d.cvu_number) parts.push('CVU: '+d.cvu_number);
-            if(d.cvu_alias) parts.push('Алиас: '+d.cvu_alias);
-            metaEl.textContent=parts.join(' · ');
-          }
-        }
-      })
-      .catch(()=>{ balEl.innerHTML='<span style="color:#f87171;font-size:0.85rem">⚠ Недоступен</span>'; });
+    if(!balEl) return;
+    if(!data){
+      // Сервер ещё не имеет кэша — оставим текущий вид (или skeleton)
+      return;
+    }
+    balEl.textContent = fmt(data.balance) + ' ARS';
+    balEl.style.color = data.balance > 0 ? '#34d399' : '#94a3b8';
+    if(metaEl){
+      var parts=[];
+      if(data.cvu_number) parts.push('CVU: '+data.cvu_number);
+      if(data.cvu_alias)  parts.push('Алиас: '+data.cvu_alias);
+      if(data._cache_age_sec && data._cache_age_sec > 300){
+        parts.push('обновлено ' + Math.floor(data._cache_age_sec/60) + ' мин назад');
+      }
+      metaEl.textContent = parts.join(' · ');
+    }
   }
 
-  var cards = document.querySelectorAll('.dashboard-card[data-account-id]');
-  cards.forEach(function(card){
-    fetchBalance(card.getAttribute('data-account-id'));
-  });
+  // Batched fetch: один HTTP вместо N
+  function refreshAll(){
+    var cards = document.querySelectorAll('.dashboard-card[data-account-id]');
+    if(!cards.length) return;
+    var ids = [];
+    cards.forEach(function(c){ ids.push(c.getAttribute('data-account-id')); });
+    fetch('/api/balances?ids=' + ids.join(','))
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        var balances = (d && d.balances) || {};
+        ids.forEach(function(id){ _renderCard(id, balances[id]); });
+      })
+      .catch(function(){ /* keep current */ });
+  }
 
-  document.getElementById('refresh-all').addEventListener('click', function(){
-    cards.forEach(function(card){
-      var id = card.getAttribute('data-account-id');
-      document.getElementById('dash-balance-'+id).innerHTML='<span class="balance-spinner">⟳</span>';
-      fetchBalance(id);
-    });
-  });
-
-  setInterval(function(){
-    cards.forEach(function(card){ fetchBalance(card.getAttribute('data-account-id')); });
-  }, 30000);
+  refreshAll();
+  document.getElementById('refresh-all').addEventListener('click', refreshAll);
+  setInterval(refreshAll, 30000);
 })();
 </script>
 {% endblock %}

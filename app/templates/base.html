@@ -5,7 +5,7 @@
   <title>{% block title %}Banks Dashboard{% endblock %}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   {{ csrf_meta(request) }}
-  <link rel="stylesheet" href="/static/style.css?v=14" />
+  <link rel="stylesheet" href="/static/style.css?v=18" />
 </head>
 <body>
   <a href="#main-content" class="skip-link">Перейти к содержимому</a>
@@ -38,6 +38,8 @@
       </div>
       <a href="/dashboard" class="btn-table btn-open" style="text-decoration:none">📊 Обзор</a>
       <a href="/windows" class="btn-table btn-edit" style="text-decoration:none">🗂 Кабинеты</a>
+      <a href="/admin/migrate" class="btn-table btn-edit" style="text-decoration:none">📦 Перенос</a>
+      <a href="/admin/proxies" class="btn-table btn-edit" style="text-decoration:none">🌐 Прокси</a>
       {% if current_user %}
       <form method="post" action="/logout" class="form-inline">
         {{ csrf_input(request) }}
@@ -66,9 +68,10 @@
           </div>
           <div class="nav-window-body" id="window-{{ w_slug }}">
             {% for acc in groups.get(w_slug, []) %}
+            {% set cb = cached_balance(acc.id) %}
             <a href="/?account_id={{ acc.id }}" class="profile-card {% if selected and selected.id == acc.id %}profile-card--active{% endif %}" data-account-id="{{ acc.id }}">
               <span class="profile-card-label">{{ acc.label }}</span>
-              <span class="profile-card-balance sidebar-balance" data-account-id="{{ acc.id }}">—</span>
+              <span class="profile-card-balance sidebar-balance" data-account-id="{{ acc.id }}">{% if cb is not none %}{{ cb|ars(0) }}{% else %}<span class="skel-line"></span>{% endif %}</span>
             </a>
             {% endfor %}
             <a href="/add?window={{ w_slug }}" class="btn-add-in-window">+ Добавить в {{ w_name }}</a>
@@ -98,60 +101,56 @@
       (function() {
         var fmt = function(v){ return typeof v==='number' ? v.toLocaleString('es-AR',{minimumFractionDigits:2,maximumFractionDigits:2}) : v; };
 
-        // ── Балансы в сайдбаре ─────────────────────────────────────────────
-        // БАГ 2 FIX: при переходе между страницами (MPA) DOM пересоздаётся —
-        // балансы сбрасываются в "—". Решение: sessionStorage как мгновенный кеш.
-        // При загрузке страницы сразу показываем кешированные значения,
-        // параллельно обновляем с сервера. Баланс никогда не пропадает.
+        // ── Балансы в сайдбаре (batched /api/balances) ────────────────────
+        // Один HTTP-запрос вместо N. Возвращает только ИЗ-КЭША значения,
+        // никогда не блокирует на slow-bank-call. Если кэша нет — сервер
+        // запускает фоновое прогревание и через ~30 сек подтянем свежее.
+        // Server-render уже показал значения при первой загрузке (см. base.html).
 
-        var _sbLoading = {}; // защита от параллельных запросов на один id
-
-        function fetchBal(id, el) {
-          if(_sbLoading[id]) return;
-          _sbLoading[id] = true;
-          var cacheKey = 'bal_sb_' + id;
-
-          // Мгновенно показываем кеш (если есть) — не ждём сеть
-          try {
-            var cached = sessionStorage.getItem(cacheKey);
-            if(cached && el.textContent === '—') el.textContent = cached;
-          } catch(e){}
-
-          fetch('/account/'+id+'/balance')
-            .then(function(r){ return r.json(); })
-            .then(function(d){
-              _sbLoading[id] = false;
-              if(d.error){
-                var errMeta = d.error_meta || {};
-                var low = String(d.error || '').toLowerCase();
-                var tokenErr = (errMeta.code === 'token_expired') || low.includes('403') || low.includes('401') || low.includes('token');
-                el.textContent = tokenErr ? '⚠' : '▲';
-                el.classList.add('sidebar-balance-error');
-                el.title = (errMeta.message || 'Ошибка обновления баланса') + (errMeta.suggestion ? ('\n' + errMeta.suggestion) : '');
-              } else {
-                var text = fmt(d.balance)+' ARS';
-                el.textContent = text;
-                el.classList.remove('sidebar-balance-error');
-                el.title = '';
-                try { sessionStorage.setItem(cacheKey, text); } catch(e){}
-              }
-            })
-            .catch(function(){
-              _sbLoading[id] = false;
-              // Не сбрасываем — оставляем кешированное значение
-            });
+        function _applyBalanceToCard(el, data){
+          if(!el) return;
+          if(!data){
+            // null = кэша нет, сервер прогревает; оставляем skeleton/прежнее значение
+            return;
+          }
+          var text = fmt(data.balance) + ' ARS';
+          el.textContent = text;
+          el.classList.remove('sidebar-balance-error');
+          // Возраст кэша: подсветим если данные >5 мин старые
+          if(data._cache_age_sec && data._cache_age_sec > 300){
+            el.title = 'Данные ' + Math.floor(data._cache_age_sec/60) + ' мин назад (банк не отвечает)';
+            el.classList.add('sidebar-balance-stale');
+          } else {
+            el.title = '';
+            el.classList.remove('sidebar-balance-stale');
+          }
+          try { sessionStorage.setItem('bal_sb_' + el.getAttribute('data-account-id'), text); } catch(e){}
         }
 
         function refreshAllSidebarBalances() {
-          document.querySelectorAll('.sidebar-balance[data-account-id]').forEach(function(el){
+          var els = document.querySelectorAll('.sidebar-balance[data-account-id]');
+          if(!els.length) return;
+          var ids = [];
+          var byId = {};
+          els.forEach(function(el){
             var id = el.getAttribute('data-account-id');
-            if(id) fetchBal(id, el);
+            if(id){ ids.push(id); byId[id] = el; }
           });
+          if(!ids.length) return;
+          fetch('/api/balances?ids=' + ids.join(','))
+            .then(function(r){ return r.json(); })
+            .then(function(d){
+              var balances = (d && d.balances) || {};
+              ids.forEach(function(id){ _applyBalanceToCard(byId[id], balances[id]); });
+            })
+            .catch(function(){
+              // Сеть упала — оставляем server-rendered значения
+            });
         }
 
-        // При загрузке: сначала показываем кеш, потом грузим свежие данные
-        refreshAllSidebarBalances();
-        // Обновление каждые 40 секунд
+        // Первый refresh через 1 сек (server-render уже показал кэш — не торопимся)
+        setTimeout(refreshAllSidebarBalances, 1000);
+        // Periodic refresh: 30-50 сек jitter
         (function scheduleSidebarRefresh(){
           var delay = 30000 + Math.floor(Math.random() * 20000);
           setTimeout(function(){

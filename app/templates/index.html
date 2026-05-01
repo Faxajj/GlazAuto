@@ -218,8 +218,11 @@
       <button type="button" id="btn-refresh-balance" class="btn-refresh" aria-label="Обновить баланс">↻ Обновить</button>
     </div>
   </div>
-  <p class="balance" id="balance-value" style="min-height:2rem" aria-live="polite" aria-label="Баланс счёта">—</p>
-  <p class="meta" id="balance-meta" style="color:#64748b;font-size:0.85rem" aria-live="polite">загружается...</p>
+  {# Server-render: если сервер уже имеет cached баланс — показываем его сразу,
+     не ждём JS-fetch. Skeleton-loader как fallback пока ждём первого ответа. #}
+  {% set _cb = cached_balance(selected.id) %}
+  <p class="balance" id="balance-value" style="min-height:2rem" aria-live="polite" aria-label="Баланс счёта">{% if _cb is not none %}{{ _cb|ars }} ARS{% else %}<span class="skel-line skel-line--xl"></span>{% endif %}</p>
+  <p class="meta" id="balance-meta" style="color:#64748b;font-size:0.85rem" aria-live="polite">{% if _cb is not none %}{% else %}<span class="skel-line skel-line--wide"></span>{% endif %}</p>
 
   {# ── Прогресс-бар лимита выводов ── #}
   {% set _pct = [(account_withdraw_count / daily_limit * 100)|int, 100]|min %}
@@ -371,6 +374,13 @@
     <div class="auto-rule-card {% if not rule.is_active %}auto-rule-done{% endif %}" id="rule-{{ rule.id }}">
       <div class="auto-rule-info">
         <span class="auto-rule-cvu">{{ rule.cvu }}</span>
+        {% if rule.is_active %}
+        <span class="tx-badge tx-running" title="Scheduler автоматически выполняет правило каждые 60 секунд если баланс достаточен">
+          🔄 Авто
+        </span>
+        {% else %}
+        <span class="tx-badge tx-incoming">✓ Завершено</span>
+        {% endif %}
         <span class="auto-rule-progress">{{ rule.paid_amount|ars }} / {{ rule.total_limit|ars }} ARS</span>
         <span class="auto-rule-step">шаг {{ rule.chunk_amount|ars }} ARS{% if rule.min_balance %} · порог {{ rule.min_balance|ars }} ARS{% endif %}</span>
         {% if rule.cvu in withdraw_counts %}
@@ -385,9 +395,10 @@
       </div>
       <div class="auto-rule-actions">
         {% if rule.is_active %}
-        <button class="btn-table btn-open js-run-rule" data-rule-id="{{ rule.id }}" data-account-id="{{ selected.id }}">▶ Выполнить шаг</button>
-        {% else %}
-        <span class="tx-badge tx-incoming">✓ Завершено</span>
+        <button class="btn-table btn-open js-run-rule" data-rule-id="{{ rule.id }}" data-account-id="{{ selected.id }}"
+                title="Принудительно выполнить шаг сейчас (обычно автоматически делает scheduler каждую минуту)">
+          ⚡ Выполнить сейчас
+        </button>
         {% endif %}
         <form method="post" action="/account/{{ selected.id }}/auto-withdraw/{{ rule.id }}/delete" class="form-inline" style="margin:0"
               data-confirm="Удалить автоправило для CVU {{ rule.cvu }}?">
@@ -434,8 +445,10 @@ var errBox     = document.getElementById('balance-error-box');
 var refreshBtn = document.getElementById('btn-refresh-balance');
 var _balLoading = false;
 var _balCacheKey = 'bal_main_' + ACCOUNT_ID;
+var _balRetryDelay = 0;          // 0 = нет ошибки. >0 = текущая backoff-задержка
+var _balLastSuccessTs = 0;       // unix-секунды последнего успешного fetch
 
-// Показать закешированное значение сразу (не ждать сети)
+// Восстанавливаем кэш сразу при загрузке страницы (не ждём сеть)
 (function(){
   try {
     var cached = sessionStorage.getItem(_balCacheKey);
@@ -443,26 +456,59 @@ var _balCacheKey = 'bal_main_' + ACCOUNT_ID;
       var c = JSON.parse(cached);
       if(balEl) balEl.textContent = c.text;
       if(metaEl) metaEl.textContent = c.meta || '';
+      _balLastSuccessTs = c.ts || 0;
     }
   } catch(e){}
 })();
+
+function _showStale(prefix){
+  // При ошибке показываем закешированное значение + индикатор «давно обновлялось»
+  try {
+    var cached = sessionStorage.getItem(_balCacheKey);
+    if(cached){
+      var c = JSON.parse(cached);
+      if(balEl) balEl.textContent = c.text;
+      var ageS = c.ts ? Math.max(0, Math.floor(Date.now()/1000 - c.ts)) : 0;
+      var ageStr = ageS < 60 ? ageS+' сек' : ageS < 3600 ? Math.floor(ageS/60)+' мин' : Math.floor(ageS/3600)+' ч';
+      if(metaEl){
+        metaEl.innerHTML = '<span style="color:#f59e0b">⚠ '+prefix+' · кэш '+ageStr+' назад</span>'+
+                           (c.meta ? ' · <span style="opacity:0.7">'+escHtml(c.meta)+'</span>' : '');
+      }
+      return true;
+    }
+  } catch(e){}
+  return false;
+}
+
+function _scheduleAutoRetry(){
+  // Exponential backoff: 5s → 10s → 20s → 40s → max 60s
+  if(_balRetryDelay === 0) _balRetryDelay = 5000;
+  else _balRetryDelay = Math.min(_balRetryDelay * 2, 60000);
+  setTimeout(function(){ if(!_balLoading) loadBalance(true); }, _balRetryDelay);
+}
 
 function loadBalance(force){
   if(_balLoading && !force) return;
   _balLoading = true;
   if(refreshBtn) refreshBtn.disabled = true;
 
-  // Таймаут 38 секунд — с кэшем почти никогда не срабатывает; резерв для первого холодного запроса
+  // AbortController — даём отменить запрос если пришёл свежий
+  var abortCtrl = (typeof AbortController === 'function') ? new AbortController() : null;
   var timedOut = false;
   var timeoutId = setTimeout(function(){
     timedOut = true;
+    if(abortCtrl) try { abortCtrl.abort(); } catch(e){}
     _balLoading = false;
     if(refreshBtn) refreshBtn.disabled = false;
-    if(balEl) balEl.innerHTML = '<span style="color:#f87171">Таймаут ответа</span>';
-    if(metaEl && metaEl.textContent === 'загружается...') metaEl.textContent = '';
+    // НЕ пишем «Таймаут ответа» поверх данных — если есть кэш, держим его
+    if(!_showStale('Таймаут')){
+      if(balEl) balEl.innerHTML = '<span style="color:#f59e0b">Таймаут — повтор...</span>';
+    }
+    _scheduleAutoRetry();
   }, 38000);
 
-  fetch('/account/'+ACCOUNT_ID+'/balance')
+  var fetchOpts = abortCtrl ? {signal: abortCtrl.signal} : {};
+  fetch('/account/'+ACCOUNT_ID+'/balance', fetchOpts)
     .then(function(r){ return r.json(); })
     .then(function(d){
       if(timedOut) return;
@@ -471,8 +517,12 @@ function loadBalance(force){
       if(refreshBtn) refreshBtn.disabled = false;
 
       if(d.error){
-        if(balEl) balEl.innerHTML = '<span style="color:#f87171;font-size:1rem">⚠ Ошибка</span>';
-        if(metaEl) metaEl.textContent = '';
+        // Ошибка от API — но если есть кэш, показываем его как stale, не «⚠ Ошибка»
+        var hadCache = _showStale('Банк недоступен');
+        if(!hadCache){
+          if(balEl) balEl.innerHTML = '<span style="color:#f87171;font-size:1rem">⚠ Ошибка</span>';
+          if(metaEl) metaEl.textContent = '';
+        }
         if(errBox){
           var meta = d.error_meta || {};
           errBox.style.display='block';
@@ -482,7 +532,12 @@ function loadBalance(force){
             (meta.suggestion ? '<p style="margin:0.5rem 0 0;font-size:0.85rem">'+escHtml(meta.suggestion)+' <a href="/account/'+ACCOUNT_ID+'/edit" class="alert-link">Настройки</a></p>' : '')+
             '</div>';
         }
+        _scheduleAutoRetry();
       } else {
+        // Успех — сбрасываем backoff
+        _balRetryDelay = 0;
+        _balLastSuccessTs = Math.floor(Date.now()/1000);
+
         var balText = fmt(d.balance) + ' ARS';
         var metaParts = [];
         if(d.cvu_number) metaParts.push('CVU: '+d.cvu_number);
@@ -490,13 +545,12 @@ function loadBalance(force){
         var metaText = metaParts.join(' · ');
 
         if(balEl) balEl.textContent = balText;
-        // Показываем owner_name если есть (PersonalPay)
         var metaFull = metaText;
         if(d.owner_name) metaFull = d.owner_name + (metaText ? ' · ' + metaText : '');
         if(metaEl) metaEl.textContent = metaFull;
         if(errBox) errBox.style.display='none';
 
-        // Обновляем прогресс-бар лимита из свежих данных
+        // Прогресс-бар лимита
         if(typeof d.account_withdraw_count === 'number' && typeof d.account_withdraw_limit === 'number') {
           var used  = d.account_withdraw_count;
           var limit = d.account_withdraw_limit;
@@ -515,18 +569,28 @@ function loadBalance(force){
           if(rowEl)   rowEl.className = 'limit-counter' + (pct >= 100 ? ' danger' : pct >= 80 ? ' warn' : '');
         }
 
-        // Кешируем для мгновенного показа при следующей загрузке страницы
-        // Используем metaFull (включает owner_name) для корректного отображения
-        try { sessionStorage.setItem(_balCacheKey, JSON.stringify({text: balText, meta: metaFull || metaText})); } catch(e){}
+        // sessionStorage cache с timestamp — чтобы _showStale показал «X мин назад»
+        try {
+          sessionStorage.setItem(_balCacheKey, JSON.stringify({
+            text: balText,
+            meta: metaFull || metaText,
+            ts:   _balLastSuccessTs,
+          }));
+        } catch(e){}
       }
     })
-    .catch(function(){
+    .catch(function(err){
       if(timedOut) return;
       clearTimeout(timeoutId);
       _balLoading = false;
       if(refreshBtn) refreshBtn.disabled = false;
-      if(balEl) balEl.innerHTML = '<span style="color:#f87171">Недоступен</span>';
-      if(metaEl) metaEl.textContent = '';
+      // AbortError на abort() — игнор. Сетевой fail → показываем stale + retry
+      if(err && err.name === 'AbortError') return;
+      if(!_showStale('Сеть недоступна')){
+        if(balEl) balEl.innerHTML = '<span style="color:#f87171">Недоступен</span>';
+        if(metaEl) metaEl.textContent = '';
+      }
+      _scheduleAutoRetry();
     });
 }
 
@@ -601,6 +665,13 @@ if(pinRefreshBtn){
       } else if(data.type === 'token.refreshed'){
         // Токен обновлён в фоне — баннер expiry-предупреждения должен пропасть
         _throttledReload(function(){ loadBalance(true); });
+      } else if(data.type === 'auto_withdraw.executed'){
+        // Scheduler выполнил chunk автоматически — обновить баланс и историю
+        _throttledReload(function(){
+          loadBalance(true);
+          if(typeof loadActivities === 'function'){ loadActivities(); }
+        });
+        showToast('🔄 Auto-withdraw: выполнен шаг ' + (data.amount || ''), 'success');
       }
     });
     src.addEventListener('error', function(){
@@ -704,8 +775,10 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
         if(d.error){
           if(txError){
             txError.style.display='block';
-            txError.innerHTML='<p style="color:#f87171;padding:0.5rem 0">Не удалось загрузить историю: '+escHtml(d.error)+'</p>';
+            txError.innerHTML='<p style="color:#f87171;padding:0.5rem 0">⚠ Не удалось загрузить историю — повторим через 10 сек: '+escHtml(d.error)+'</p>';
           }
+          // Auto-retry через 10 сек
+          setTimeout(function(){ loadActivities(); }, 10000);
           return;
         }
         if(txControls) txControls.style.display='flex';
@@ -744,8 +817,10 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
         if(txLoading) txLoading.style.display='none';
         if(txError){
           txError.style.display='block';
-          txError.innerHTML='<p style="color:#f87171">Ошибка сети при загрузке истории.</p>';
+          txError.innerHTML='<p style="color:#f87171">⚠ Ошибка сети при загрузке истории — повторим через 10 сек.</p>';
         }
+        // Auto-retry на network error
+        setTimeout(function(){ loadActivities(); }, 10000);
       });
   }
 
