@@ -127,7 +127,12 @@
           try { sessionStorage.setItem('bal_sb_' + el.getAttribute('data-account-id'), text); } catch(e){}
         }
 
-        function refreshAllSidebarBalances() {
+        // Retry-расписание для null'ов (после server-render'а cache холодный):
+        // 1.5с → 4с → 8с → 15с → 25с — потом periodic loop подхватит
+        var _sbRetryDelays = [1500, 4000, 8000, 15000, 25000];
+        var _sbRetryCount = 0;
+
+        function refreshAllSidebarBalances(isRetry) {
           var els = document.querySelectorAll('.sidebar-balance[data-account-id]');
           if(!els.length) return;
           var ids = [];
@@ -141,20 +146,42 @@
             .then(function(r){ return r.json(); })
             .then(function(d){
               var balances = (d && d.balances) || {};
-              ids.forEach(function(id){ _applyBalanceToCard(byId[id], balances[id]); });
+              var nullCount = 0;
+              ids.forEach(function(id){
+                var data = balances[id];
+                if(data){
+                  _applyBalanceToCard(byId[id], data);
+                } else {
+                  nullCount++;
+                }
+              });
+              // Если есть null'ы — кэш ещё не прогрет, ретраим с backoff
+              if(nullCount > 0 && _sbRetryCount < _sbRetryDelays.length) {
+                var delay = _sbRetryDelays[_sbRetryCount];
+                _sbRetryCount++;
+                setTimeout(function(){ refreshAllSidebarBalances(true); }, delay);
+              } else if(nullCount === 0 && isRetry) {
+                // Сбрасываем счётчик ретраев на следующее обновление
+                _sbRetryCount = 0;
+              }
             })
             .catch(function(){
               // Сеть упала — оставляем server-rendered значения
+              if(_sbRetryCount < _sbRetryDelays.length) {
+                _sbRetryCount++;
+                setTimeout(function(){ refreshAllSidebarBalances(true); }, 5000);
+              }
             });
         }
 
-        // Первый refresh через 1 сек (server-render уже показал кэш — не торопимся)
-        setTimeout(refreshAllSidebarBalances, 1000);
+        // Первый refresh через 800мс — server-render уже показал кэш, JS добивает null'ы
+        setTimeout(function(){ _sbRetryCount = 0; refreshAllSidebarBalances(false); }, 800);
         // Periodic refresh: 30-50 сек jitter
         (function scheduleSidebarRefresh(){
           var delay = 30000 + Math.floor(Math.random() * 20000);
           setTimeout(function(){
-            refreshAllSidebarBalances();
+            _sbRetryCount = 0;   // новый refresh-цикл — счётчик ретраев сбрасываем
+            refreshAllSidebarBalances(false);
             scheduleSidebarRefresh();
           }, delay);
         })();
