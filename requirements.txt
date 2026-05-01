@@ -4,3 +4,4 @@ jinja2
 python-multipart
 requests[socks]
 httpx
+cryptography  # for at-rest encryption of credentials (opt-in via BANKS_MASTER_KEY env)
