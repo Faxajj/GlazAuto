@@ -11,16 +11,20 @@
     </span>
   </h2>
   <p class="form-hint" style="margin-bottom:1.25rem">
-    Здесь хранится каталог прокси для системы. Healthy прокси автоматически проверяются и
-    помечаются 🟢. Мёртвые прокси (3+ fail подряд) автоматически отключаются.
-    Прокси отдельных аккаунтов всё равно настраиваются в карточке аккаунта (Edit) — этот пул
-    используется только для будущего failover-mechanism (см. roadmap).
+    🤖 <strong>Полная автоматизация:</strong>
+    health-check каждые 90 сек, auto-disable после 3 fail'ов подряд.
+    Когда прокси отключается — все аккаунты на нём <strong>сразу переезжают</strong>
+    на healthy из пула (least-loaded). Дополнительно раз в 10 минут фон сам сканирует
+    и переназначает любые карты, оставшиеся на мёртвых прокси. Кнопка ниже —
+    для немедленного запуска вручную.
   </p>
 
   {% if request.query_params.get('error') == 'invalid' %}
   <div class="alert alert-error">Не удалось добавить прокси. Проверьте формат host:port.</div>
   {% elif request.query_params.get('error') == 'duplicate' %}
   <div class="alert alert-error">Прокси (host:port:user) уже существует.</div>
+  {% elif request.query_params.get('error') == 'no_healthy' %}
+  <div class="alert alert-error">⚠ Нет ни одного healthy-прокси в пуле. Добавь и дождись health-check (90 сек).</div>
   {% elif request.query_params.get('success') == 'added' %}
   <div class="alert alert-success">✅ Прокси добавлен.</div>
   {% elif request.query_params.get('success') == 'bulk' %}
@@ -30,11 +34,67 @@
     дубликатов: {{ request.query_params.get('skipped', 0) }},
     невалидных строк: {{ request.query_params.get('invalid', 0) }}.
   </div>
+  {% elif request.query_params.get('reassigned') is not none %}
+  <div class="alert alert-success">
+    🔄 Мягкое переназначение завершено:
+    <strong>обновлено карт: {{ request.query_params.get('reassigned', 0) }}</strong>,
+    уже на healthy: {{ request.query_params.get('skipped_healthy', 0) }},
+    UC-карт без прокси: {{ request.query_params.get('skipped_uc', 0) }}.
+  </div>
+  {% elif request.query_params.get('force_reassigned') is not none %}
+  <div class="alert alert-success">
+    🔥 ПРИНУДИТЕЛЬНОЕ переназначение завершено:
+    <strong>обновлено ВСЕХ PP/AP карт: {{ request.query_params.get('force_reassigned', 0) }}</strong>,
+    UC-карт пропущено: {{ request.query_params.get('skipped_uc', 0) }}.
+    Все карты теперь на свежих прокси из пула.
+  </div>
   {% elif request.query_params.get('success') == 'deleted' %}
   <div class="alert alert-success">🗑 Прокси удалён.</div>
   {% elif request.query_params.get('success') == 'checked' %}
   <div class="alert alert-success">🔄 Health-check выполнен.</div>
   {% endif %}
+
+  {# ── Bulk re-assignment карт на свежие прокси из пула ───────────── #}
+  <div style="background:#1e293b;border:1px solid #334155;border-radius:10px;padding:1rem;margin-bottom:0.75rem">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap">
+      <div>
+        <strong style="color:#e2e8f0">🔄 Мягкое переназначение (только мёртвые)</strong>
+        <p class="form-hint" style="margin:0.25rem 0 0">
+          Карты с мёртвой или удалённой прокси-настройкой получат свежий
+          healthy-прокси из пула (least-loaded). Карты с уже healthy прокси не трогаются.
+        </p>
+      </div>
+      <form method="post" action="/admin/proxies/reassign-all" class="form-inline" style="margin:0"
+            data-confirm="Переназначить healthy-прокси из пула на все карты с мёртвыми прокси? Это безопасная операция — старые рабочие прокси сохраняются.">
+        {{ csrf_input(request) }}
+        <button type="submit" class="btn-primary" style="white-space:nowrap">
+          🔄 Переназначить
+        </button>
+      </form>
+    </div>
+  </div>
+
+  {# ── ПРИНУДИТЕЛЬНОЕ переназначение всех карт без исключений ─── #}
+  <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.4);border-radius:10px;padding:1rem;margin-bottom:1.25rem">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap">
+      <div>
+        <strong style="color:#fca5a5">🔥 ПРИНУДИТЕЛЬНО — переписать прокси на ВСЕХ PP/AP картах</strong>
+        <p class="form-hint" style="margin:0.25rem 0 0;color:#fca5a5;opacity:0.85">
+          Замена выполняется <strong>безусловно</strong>: даже карты добавленные месяц назад
+          с прокси, которой нет в текущем пуле — получат свежие. Распределяется равномерно
+          (round-robin по healthy-пулу). Используй после первоначальной заливки пула или когда
+          мягкий режим не помог. UC-карты не трогаются (у них нет прокси).
+        </p>
+      </div>
+      <form method="post" action="/admin/proxies/force-reassign-all" class="form-inline" style="margin:0"
+            data-confirm="🔥 ВНИМАНИЕ: переписать прокси на ВСЕХ PP/AP картах сейчас? Все текущие настройки прокси на карточках будут заменены свежими из healthy-пула. Это нужно когда у старых аккаунтов прокси не в списке и они не определяются как healthy.">
+        {{ csrf_input(request) }}
+        <button type="submit" class="btn-danger" style="white-space:nowrap">
+          🔥 Перезалить всё
+        </button>
+      </form>
+    </div>
+  </div>
 
   {# ── Список прокси ──────────────────────────────────────────────── #}
   {% if proxies %}
