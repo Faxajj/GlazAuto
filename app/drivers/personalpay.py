@@ -139,6 +139,10 @@ def _request_with_proxy_fallback(method: str, c: dict, url: str, **kwargs):
        1. Через настроенный прокси (credentials.proxy)
        2. При ProxyError → healthy proxy из пула (proxies таблица, status='ok')
        3. При повторном ProxyError → direct (без прокси)
+
+    Sticky failover: если pool-прокси сработал, мутирует c['proxy'] in-place,
+    чтобы СЛЕДУЮЩИЕ вызовы в той же сессии (балансы, активности) не пробовали
+    мёртвый прокси заново. Запись в БД делает main.py через _balance_cache invalidation.
     """
     session = _session(c)
     try:
@@ -155,7 +159,12 @@ def _request_with_proxy_fallback(method: str, c: dict, url: str, **kwargs):
                 pool_creds["proxy"] = pool_creds["http_proxy"] = pool_creds["https_proxy"] = pool_url
                 session_pool = _session(pool_creds)
                 try:
-                    return session_pool.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+                    response = session_pool.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+                    # Sticky: помечаем что прокси сменился — main.py при сохранении кэша
+                    # увидит несовпадение и обновит credentials в БД
+                    c["_failover_to_proxy"] = pool_url
+                    c["proxy"] = c["http_proxy"] = c["https_proxy"] = pool_url
+                    return response
                 except req_exc.ProxyError:
                     logger.warning("PP request: pool proxy also failed, falling through to direct")
         except Exception as e:
