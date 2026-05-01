@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+
+{% block title %}Перенос аккаунтов — Banks Dashboard{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h2>📦 Перенос аккаунтов между кабинетами</h2>
+  <p class="form-hint" style="margin-bottom:1rem">
+    Выберите карты галочками и укажите целевой кабинет. Все ссылки и связи (auto-rules,
+    лимиты, история) сохраняются автоматически — переносится только метка кабинета.
+  </p>
+
+  {% if request.query_params.get('moved') %}
+  <div class="alert alert-success">
+    ✅ Перенесено карт: <strong>{{ request.query_params.get('moved') }}</strong>
+  </div>
+  {% elif request.query_params.get('error') == 'invalid_window' %}
+  <div class="alert alert-error">Неверный target_window.</div>
+  {% endif %}
+
+  <form method="post" action="/admin/migrate/move" id="migrate-form">
+    {{ csrf_input(request) }}
+
+    <div class="form-row" style="display:flex;gap:1rem;align-items:end;margin-bottom:1.5rem">
+      <div style="flex:1">
+        <label for="target_window">Перенести выбранные в кабинет:</label>
+        <select id="target_window" name="target_window" required style="width:100%">
+          {% for slug, name in window_list %}
+          <option value="{{ slug }}">{{ name }} ({{ slug }})</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button type="submit" class="btn-primary-lg" style="white-space:nowrap">
+        ✓ Перенести выбранные
+      </button>
+    </div>
+
+    {# Группировка по текущему кабинету #}
+    {% for w_slug, w_name in window_list %}
+    {% set w_accounts = groups.get(w_slug, []) %}
+    {% if w_accounts %}
+    <div style="margin-bottom:1.25rem">
+      <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.5rem">
+        <h3 style="margin:0;font-size:0.95rem;color:#94a3b8;text-transform:uppercase;letter-spacing:0.05em">
+          {{ w_name }}
+        </h3>
+        <span style="color:#475569;font-size:0.8rem">({{ w_accounts|length }} карт)</span>
+        <label style="margin-left:auto;font-size:0.8rem;color:#94a3b8;cursor:pointer">
+          <input type="checkbox" class="js-select-all" data-window="{{ w_slug }}" />
+          выбрать все
+        </label>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:0.5rem">
+        {% for acc in w_accounts %}
+        <label style="display:flex;align-items:center;gap:0.5rem;background:#1e293b;border:1px solid #334155;border-radius:8px;padding:0.6rem 0.75rem;cursor:pointer">
+          <input type="checkbox" name="account_ids" value="{{ acc.id }}"
+                 data-window="{{ w_slug }}" />
+          <span style="flex:1;color:#e2e8f0;font-size:0.9rem">{{ acc.label }}</span>
+          <span style="color:#64748b;font-size:0.75rem">{{ acc.bank_type }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+    {% endfor %}
+
+    {% if not accounts %}
+    <p style="color:#64748b">Аккаунтов нет.</p>
+    {% endif %}
+  </form>
+</section>
+
+<script>
+// Чекбокс «выбрать все» в группе
+document.querySelectorAll('.js-select-all').forEach(function(cb){
+  cb.addEventListener('change', function(){
+    var w = cb.getAttribute('data-window');
+    document.querySelectorAll('input[name="account_ids"][data-window="'+w+'"]').forEach(function(c){
+      c.checked = cb.checked;
+    });
+  });
+});
+</script>
+{% endblock %}

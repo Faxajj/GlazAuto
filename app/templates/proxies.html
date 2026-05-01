@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+
+{% block title %}Прокси — Banks Dashboard{% endblock %}
+
+{% block content %}
+<section class="card">
+  <h2 style="display:flex;align-items:center;gap:0.75rem">
+    🌐 Прокси-пул
+    <span style="font-size:0.85rem;color:#94a3b8;font-weight:400">
+      (auto-check каждые 90 сек)
+    </span>
+  </h2>
+  <p class="form-hint" style="margin-bottom:1.25rem">
+    Здесь хранится каталог прокси для системы. Healthy прокси автоматически проверяются и
+    помечаются 🟢. Мёртвые прокси (3+ fail подряд) автоматически отключаются.
+    Прокси отдельных аккаунтов всё равно настраиваются в карточке аккаунта (Edit) — этот пул
+    используется только для будущего failover-mechanism (см. roadmap).
+  </p>
+
+  {% if request.query_params.get('error') == 'invalid' %}
+  <div class="alert alert-error">Не удалось добавить прокси. Проверьте формат host:port.</div>
+  {% elif request.query_params.get('error') == 'duplicate' %}
+  <div class="alert alert-error">Прокси (host:port:user) уже существует.</div>
+  {% elif request.query_params.get('success') == 'added' %}
+  <div class="alert alert-success">✅ Прокси добавлен.</div>
+  {% elif request.query_params.get('success') == 'deleted' %}
+  <div class="alert alert-success">🗑 Прокси удалён.</div>
+  {% elif request.query_params.get('success') == 'checked' %}
+  <div class="alert alert-success">🔄 Health-check выполнен.</div>
+  {% endif %}
+
+  {# ── Список прокси ──────────────────────────────────────────────── #}
+  {% if proxies %}
+  <div class="proxies-table-wrap" style="overflow-x:auto;margin-bottom:1.5rem">
+    <table class="proxies-table" style="width:100%;border-collapse:collapse">
+      <thead>
+        <tr style="border-bottom:2px solid #1e293b">
+          <th style="text-align:left;padding:0.5rem;color:#94a3b8;font-weight:500;font-size:0.85rem">Статус</th>
+          <th style="text-align:left;padding:0.5rem;color:#94a3b8;font-weight:500;font-size:0.85rem">Label</th>
+          <th style="text-align:left;padding:0.5rem;color:#94a3b8;font-weight:500;font-size:0.85rem">Endpoint</th>
+          <th style="text-align:left;padding:0.5rem;color:#94a3b8;font-weight:500;font-size:0.85rem">Регион</th>
+          <th style="text-align:right;padding:0.5rem;color:#94a3b8;font-weight:500;font-size:0.85rem">Latency</th>
+          <th style="text-align:right;padding:0.5rem;color:#94a3b8;font-weight:500;font-size:0.85rem">Fails</th>
+          <th style="text-align:left;padding:0.5rem;color:#94a3b8;font-weight:500;font-size:0.85rem">Last check</th>
+          <th style="text-align:right;padding:0.5rem;color:#94a3b8;font-weight:500;font-size:0.85rem">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in proxies %}
+        <tr style="border-bottom:1px solid #1e293b">
+          <td style="padding:0.6rem 0.5rem">
+            {% if not p.enabled %}
+              <span class="proxy-badge proxy-badge--disabled">⏸ Disabled</span>
+            {% elif p.status == 'ok' %}
+              <span class="proxy-badge proxy-badge--ok">🟢 OK</span>
+            {% elif p.status == 'fail' %}
+              <span class="proxy-badge proxy-badge--fail">🔴 Fail</span>
+            {% else %}
+              <span class="proxy-badge proxy-badge--unknown">⚪ Unknown</span>
+            {% endif %}
+          </td>
+          <td style="padding:0.6rem 0.5rem">{{ p.label or '—' }}</td>
+          <td style="padding:0.6rem 0.5rem;font-family:monospace;font-size:0.85rem">
+            <span style="color:#94a3b8">{{ p.type }}://</span>{{ p.host }}<span style="color:#94a3b8">:</span>{{ p.port }}
+            {% if p.username %}<span style="color:#475569"> · {{ p.username }}</span>{% endif %}
+          </td>
+          <td style="padding:0.6rem 0.5rem">{{ p.region or '—' }}</td>
+          <td style="padding:0.6rem 0.5rem;text-align:right;font-family:monospace">
+            {% if p.last_latency_ms %}{{ p.last_latency_ms }} ms{% else %}—{% endif %}
+          </td>
+          <td style="padding:0.6rem 0.5rem;text-align:right;{% if p.fail_count > 0 %}color:#f87171{% endif %}">
+            {{ p.fail_count }}
+          </td>
+          <td style="padding:0.6rem 0.5rem;font-size:0.8rem;color:#94a3b8">
+            {% if p.last_check_ts %}{{ p.last_check_ts | timeago }}{% else %}никогда{% endif %}
+            {% if p.last_error %}<br><span style="color:#f87171" title="{{ p.last_error }}">⚠ ошибка</span>{% endif %}
+          </td>
+          <td style="padding:0.6rem 0.5rem;text-align:right;white-space:nowrap">
+            <form method="post" action="/admin/proxies/{{ p.id }}/check" class="form-inline" style="margin:0;display:inline">
+              {{ csrf_input(request) }}
+              <button type="submit" class="btn-table btn-edit" title="Проверить сейчас">🔄</button>
+            </form>
+            <form method="post" action="/admin/proxies/{{ p.id }}/toggle" class="form-inline" style="margin:0;display:inline">
+              {{ csrf_input(request) }}
+              <button type="submit" class="btn-table {% if p.enabled %}btn-edit{% else %}btn-open{% endif %}"
+                      title="{% if p.enabled %}Выключить{% else %}Включить{% endif %}">
+                {% if p.enabled %}⏸{% else %}▶{% endif %}
+              </button>
+            </form>
+            <form method="post" action="/admin/proxies/{{ p.id }}/delete" class="form-inline" style="margin:0;display:inline"
+                  data-confirm="Удалить прокси {{ p.host }}:{{ p.port }}?">
+              {{ csrf_input(request) }}
+              <button type="submit" class="btn-table btn-danger">✕</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p style="color:#64748b">Прокси-пул пуст. Добавьте первый ниже.</p>
+  {% endif %}
+
+  {# ── Добавление нового прокси ──────────────────────────────────── #}
+  <details {% if not proxies %}open{% endif %} style="margin-top:1.5rem">
+    <summary style="cursor:pointer;font-weight:600;color:#e2e8f0;padding:0.5rem 0">+ Добавить прокси</summary>
+    <form method="post" action="/admin/proxies/add" class="form" style="margin-top:1rem">
+      {{ csrf_input(request) }}
+      <div class="form-row" style="display:flex;gap:0.5rem;align-items:end">
+        <div style="flex:0 0 130px">
+          <label for="px-type">Тип *</label>
+          <select id="px-type" name="type" style="width:100%">
+            <option value="socks5h" selected>SOCKS5h</option>
+            <option value="socks5">SOCKS5</option>
+            <option value="http">HTTP</option>
+            <option value="https">HTTPS</option>
+          </select>
+        </div>
+        <div style="flex:1 1 auto">
+          <label for="px-host">Host *</label>
+          <input id="px-host" name="host" type="text" required placeholder="135.106.40.29" />
+        </div>
+        <div style="flex:0 0 90px">
+          <label for="px-port">Port *</label>
+          <input id="px-port" name="port" type="number" required placeholder="63137" min="1" max="65535" />
+        </div>
+      </div>
+      <div class="form-row" style="display:flex;gap:0.5rem">
+        <div style="flex:1">
+          <label for="px-user">Username</label>
+          <input id="px-user" name="username" type="text" placeholder="опционально" />
+        </div>
+        <div style="flex:1">
+          <label for="px-pass">Password</label>
+          <input id="px-pass" name="password" type="password" placeholder="опционально" autocomplete="new-password" />
+        </div>
+      </div>
+      <div class="form-row" style="display:flex;gap:0.5rem">
+        <div style="flex:1">
+          <label for="px-label">Label</label>
+          <input id="px-label" name="label" type="text" placeholder="напр.: AR-1" />
+        </div>
+        <div style="flex:0 0 120px">
+          <label for="px-region">Регион</label>
+          <input id="px-region" name="region" type="text" placeholder="AR / EU / US" maxlength="8" />
+        </div>
+      </div>
+      <button type="submit" class="btn-primary-lg" style="margin-top:0.75rem">+ Добавить</button>
+    </form>
+  </details>
+</section>
+{% endblock %}
