@@ -1,5 +1,9 @@
 """
 SQLite хранилище: аккаунты, сессии, пользователи, правила автовывода, лимиты выводов.
+
+Credentials (поле accounts.credentials) шифруется at-rest через app.crypto если
+переменная окружения BANKS_MASTER_KEY задана. Поведение по умолчанию — plaintext
+(обратно совместимо с существующими инсталляциями). Подробнее — app/crypto.py.
 """
 import hashlib
 import json
@@ -8,6 +12,8 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
+
+from app.crypto import encrypt_credentials, decrypt_credentials
 
 DB_PATH = os.getenv("DB_PATH", "/var/www/app/accounts.db")
 
@@ -221,8 +227,28 @@ def init_db() -> None:
             account_id    INTEGER NOT NULL,
             withdraw_date TEXT NOT NULL,
             count         INTEGER NOT NULL DEFAULT 0,
+            count_a       INTEGER NOT NULL DEFAULT 0,
+            count_b       INTEGER NOT NULL DEFAULT 0,
             UNIQUE(account_id, withdraw_date)
         );
+        CREATE TABLE IF NOT EXISTS withdraw_attempts (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            idempotency_key TEXT UNIQUE NOT NULL,
+            account_id      INTEGER NOT NULL,
+            destination     TEXT NOT NULL,
+            amount          REAL NOT NULL,
+            group_key       TEXT,
+            status          TEXT NOT NULL DEFAULT 'PENDING',
+            bank_tx_id      TEXT,
+            error_message   TEXT,
+            business_date   TEXT NOT NULL,
+            created_at      INTEGER NOT NULL,
+            completed_at    INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_withdraw_attempts_status
+            ON withdraw_attempts(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_withdraw_attempts_account
+            ON withdraw_attempts(account_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_accounts_window_created
             ON accounts(window, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_auto_withdraw_active
@@ -247,6 +273,29 @@ def init_db() -> None:
             sell_avg  REAL
         );
         CREATE INDEX IF NOT EXISTS idx_rate_history_ts ON rate_history(ts DESC);
+        CREATE TABLE IF NOT EXISTS accounts_state (
+            account_id        INTEGER PRIMARY KEY,
+            last_keepalive_at INTEGER NOT NULL DEFAULT 0,
+            last_token_state  TEXT,
+            fail_count        INTEGER NOT NULL DEFAULT 0,
+            last_error        TEXT,
+            updated_at        INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          INTEGER NOT NULL,
+            user_id     INTEGER,
+            username    TEXT,
+            ip          TEXT,
+            action      TEXT NOT NULL,
+            target_type TEXT,
+            target_id   INTEGER,
+            details     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_action_ts ON audit_log(action, ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_type, target_id, ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id, ts DESC);
         """)
         conn.commit()
         _run_migrations(conn)
@@ -254,8 +303,11 @@ def init_db() -> None:
 
 def _run_migrations(conn: sqlite3.Connection) -> None:
     migrations = [
-        ("accounts",            "window",      "TEXT NOT NULL DEFAULT 'glazars'"),
-        ("auto_withdraw_rules", "min_balance",  "REAL NOT NULL DEFAULT 0"),
+        ("accounts",                "window",       "TEXT NOT NULL DEFAULT 'glazars'"),
+        ("auto_withdraw_rules",     "min_balance",  "REAL NOT NULL DEFAULT 0"),
+        # Group A/B per-card counters — независимые лимиты для PP-internal vs остальных
+        ("account_withdraw_limits", "count_a",      "INTEGER NOT NULL DEFAULT 0"),
+        ("account_withdraw_limits", "count_b",      "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, col, definition in migrations:
         try:
@@ -263,6 +315,18 @@ def _run_migrations(conn: sqlite3.Connection) -> None:
             conn.commit()
         except sqlite3.OperationalError:
             pass
+
+    # Backfill: старые строки с count > 0 но count_a=count_b=0 — переносим в group B
+    # (на момент миграции считаем что вся история была "внешними" выводами).
+    try:
+        conn.execute(
+            "UPDATE account_withdraw_limits "
+            "SET count_b = count "
+            "WHERE count > 0 AND count_a = 0 AND count_b = 0"
+        )
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -348,11 +412,13 @@ def cleanup_sessions() -> None:
 # ---------------------------------------------------------------------------
 
 def _row_to_account(r: sqlite3.Row) -> dict:
+    # decrypt_credentials автоматически распознаёт маркер enc:v1: и расшифровывает,
+    # либо парсит старый plaintext JSON (обратная совместимость).
     return {
         "id":          r["id"],
         "bank_type":   r["bank_type"],
         "label":       r["label"],
-        "credentials": json.loads(r["credentials"]),
+        "credentials": decrypt_credentials(r["credentials"] or ""),
         "created_at":  r["created_at"],
         "window":      r["window"] if "window" in r.keys() else "glazars",
     }
@@ -388,11 +454,12 @@ def get_account(account_id: int) -> Optional[dict]:
 
 
 def add_account(bank_type: str, label: str, credentials: dict, window: str = "glazars") -> int:
+    """Создаёт аккаунт. credentials автоматически шифруется если BANKS_MASTER_KEY задан."""
     window = normalize_window_slug(window)
     with _get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO accounts (bank_type, label, credentials, window) VALUES (?, ?, ?, ?)",
-            (bank_type, label, json.dumps(credentials), window),
+            (bank_type, label, encrypt_credentials(credentials), window),
         )
         conn.commit()
         return cur.lastrowid
@@ -404,6 +471,7 @@ def update_account(
     credentials: Optional[dict] = None,
     window: Optional[str] = None,
 ) -> bool:
+    """Обновляет поля аккаунта. credentials всегда шифруется при записи (если ключ задан)."""
     with _get_conn() as conn:
         cur = conn.cursor()
         if label is not None:
@@ -411,7 +479,7 @@ def update_account(
         if credentials is not None:
             cur.execute(
                 "UPDATE accounts SET credentials = ? WHERE id = ?",
-                (json.dumps(credentials), account_id),
+                (encrypt_credentials(credentials), account_id),
             )
         if window is not None:
             cur.execute("UPDATE accounts SET window = ? WHERE id = ?", (normalize_window_slug(window), account_id))
@@ -511,18 +579,30 @@ def update_auto_withdraw_progress(
 
 
 # ---------------------------------------------------------------------------
-# Лимиты выводов (15 в день на CVU, сброс в 09:30 МСК)
+# Лимиты выводов (15 в день на CVU + 15 в день на карту по группам, сброс в 07:30 МСК)
 # ---------------------------------------------------------------------------
+
+# Группы лимита (per-card, независимые счётчики):
+#   "a" — destination starts with 00000765 (PP internal)
+#   "b" — все остальные направления
+# AstroPay-внутренние (00001775*) обрабатываются на уровне main._group_key_for —
+# они остаются exempt (передаётся group_key=None и счётчик не увеличивается).
+
+GROUP_A = "a"
+GROUP_B = "b"
+GROUP_KEYS = (GROUP_A, GROUP_B)
+
 
 def _msk_date_str() -> str:
     """Операционный день по МСК.
 
-    Сброс лимитов — в 09:30 МСК (фактически с 09:30 до 10:00 идёт обновление).
-    До 09:30 считаем, что действует предыдущий операционный день.
+    Сброс лимитов и историй — в 07:30 МСК (UTC+3).
+    До 07:30 считаем, что действует предыдущий операционный день.
+    Часовой пояс закодирован жёстко (UTC+3) — не зависит от системного TZ сервера.
     """
     msk = timezone(timedelta(hours=3))
     now = datetime.now(msk)
-    reset_point = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    reset_point = now.replace(hour=7, minute=30, second=0, microsecond=0)
     business_day = now.date() if now >= reset_point else (now - timedelta(days=1)).date()
     return business_day.isoformat()
 
@@ -537,7 +617,43 @@ def get_withdraw_count(cvu: str, account_id: int) -> int:
     return int(row["count"]) if row else 0
 
 
+def try_reserve_withdraw_count(cvu: str, account_id: int) -> Optional[int]:
+    """Атомарно резервирует слот в per-CVU лимите (15/день).
+    Возвращает новое значение count если зарезервировано, None если лимит достигнут.
+    Использует ON CONFLICT...DO UPDATE WHERE...RETURNING — одной транзакцией.
+    """
+    today = _msk_date_str()
+    with _get_conn() as conn:
+        row = conn.execute(
+            "INSERT INTO withdraw_limits (cvu, account_id, withdraw_date, count) "
+            "VALUES (?,?,?,1) "
+            "ON CONFLICT(cvu, account_id, withdraw_date) "
+            "DO UPDATE SET count = count + 1 "
+            "WHERE count < ? "
+            "RETURNING count",
+            (cvu, account_id, today, DAILY_WITHDRAW_LIMIT),
+        ).fetchone()
+        conn.commit()
+    return int(row["count"]) if row else None
+
+
+def release_withdraw_count(cvu: str, account_id: int) -> None:
+    """Возвращает 1 слот в per-CVU лимит (откат после неудачного вывода)."""
+    today = _msk_date_str()
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE withdraw_limits SET count = count - 1 "
+            "WHERE cvu=? AND account_id=? AND withdraw_date=? AND count > 0",
+            (cvu, account_id, today),
+        )
+        conn.commit()
+
+
 def increment_withdraw_count(cvu: str, account_id: int) -> int:
+    """Backward-compat: legacy инкремент без атомарной проверки лимита.
+    Используется только в местах где лимит проверяется ДО (auto-withdraw).
+    Новый код должен использовать try_reserve_withdraw_count + release_withdraw_count.
+    """
     today = _msk_date_str()
     with _get_conn() as conn:
         conn.execute(
@@ -557,21 +673,82 @@ def is_withdraw_limit_reached(cvu: str, account_id: int) -> bool:
     return get_withdraw_count(cvu, account_id) >= DAILY_WITHDRAW_LIMIT
 
 
-def get_account_withdraw_count(account_id: int) -> int:
+def get_account_withdraw_count(account_id: int, group_key: Optional[str] = None) -> int:
+    """Возвращает счётчик выводов карты за текущий бизнес-день.
+    group_key=None  → суммарный (count_a + count_b), для UI display
+    group_key='a'   → только PP-internal
+    group_key='b'   → только остальные
+    """
     today = _msk_date_str()
     try:
         with _get_conn() as conn:
             row = conn.execute(
-                "SELECT count FROM account_withdraw_limits WHERE account_id=? AND withdraw_date=?",
+                "SELECT COALESCE(count_a,0) AS ca, COALESCE(count_b,0) AS cb "
+                "FROM account_withdraw_limits WHERE account_id=? AND withdraw_date=?",
                 (account_id, today),
             ).fetchone()
-        return int(row["count"]) if row else 0
+        if not row:
+            return 0
+        if group_key == GROUP_A:
+            return int(row["ca"])
+        if group_key == GROUP_B:
+            return int(row["cb"])
+        return int(row["ca"]) + int(row["cb"])
     except sqlite3.OperationalError:
-        # Безопасный fallback для серверов со старой БД/неприменённой миграцией.
         return 0
 
 
-def increment_account_withdraw_count(account_id: int) -> int:
+def try_reserve_account_withdraw_count(account_id: int, group_key: str) -> Optional[int]:
+    """Атомарно резервирует слот в per-card лимите для указанной группы.
+    Возвращает новое значение счётчика группы если зарезервировано, иначе None.
+    """
+    if group_key not in GROUP_KEYS:
+        raise ValueError(f"invalid group_key: {group_key}")
+    today = _msk_date_str()
+    col = "count_a" if group_key == GROUP_A else "count_b"
+    init_a = 1 if group_key == GROUP_A else 0
+    init_b = 1 if group_key == GROUP_B else 0
+    try:
+        with _get_conn() as conn:
+            # Один атомарный INSERT...ON CONFLICT с условием WHERE на нужной колонке.
+            row = conn.execute(
+                f"INSERT INTO account_withdraw_limits "
+                f"(account_id, withdraw_date, count, count_a, count_b) "
+                f"VALUES (?, ?, 1, ?, ?) "
+                f"ON CONFLICT(account_id, withdraw_date) "
+                f"DO UPDATE SET {col} = {col} + 1, count = count + 1 "
+                f"WHERE {col} < ? "
+                f"RETURNING {col}",
+                (account_id, today, init_a, init_b, DAILY_WITHDRAW_LIMIT),
+            ).fetchone()
+            conn.commit()
+        return int(row[0]) if row else None
+    except sqlite3.OperationalError:
+        # Старая БД без count_a/count_b — fallback на legacy счётчик
+        return _legacy_increment_account(account_id)
+
+
+def release_account_withdraw_count(account_id: int, group_key: str) -> None:
+    """Откатывает резерв слота в per-card лимите."""
+    if group_key not in GROUP_KEYS:
+        return
+    today = _msk_date_str()
+    col = "count_a" if group_key == GROUP_A else "count_b"
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                f"UPDATE account_withdraw_limits "
+                f"SET {col} = {col} - 1, count = MAX(0, count - 1) "
+                f"WHERE account_id=? AND withdraw_date=? AND {col} > 0",
+                (account_id, today),
+            )
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def _legacy_increment_account(account_id: int) -> int:
+    """Fallback для очень старых БД без count_a/count_b — увеличивает только count."""
     today = _msk_date_str()
     try:
         with _get_conn() as conn:
@@ -587,12 +764,347 @@ def increment_account_withdraw_count(account_id: int) -> int:
             ).fetchone()
         return int(row["count"]) if row else 1
     except sqlite3.OperationalError:
-        # Не роняем выводы, если таблица лимитов карты ещё не доступна.
-        return get_account_withdraw_count(account_id)
+        return 0
 
 
-def is_account_withdraw_limit_reached(account_id: int) -> bool:
-    return get_account_withdraw_count(account_id) >= DAILY_WITHDRAW_LIMIT
+def increment_account_withdraw_count(account_id: int, group_key: Optional[str] = None) -> int:
+    """Backward-compat обёртка. Если group_key передан — атомарный резерв,
+    иначе legacy инкремент общего счётчика count.
+    Возвращает новое значение счётчика группы (или legacy total).
+    """
+    if group_key in GROUP_KEYS:
+        result = try_reserve_account_withdraw_count(account_id, group_key)
+        if result is not None:
+            return result
+        # Лимит достигнут — но legacy-вызовы не ожидают None, возвращаем текущий счётчик
+        return get_account_withdraw_count(account_id, group_key)
+    # Без группы — старое поведение (для миграции/legacy кода)
+    return _legacy_increment_account(account_id)
+
+
+def is_account_withdraw_limit_reached(account_id: int, group_key: Optional[str] = None) -> bool:
+    """Проверка лимита.
+    group_key=None  → True только если ОБЕ группы достигли лимита
+                     (т.е. карта вообще не может ничего вывести)
+    group_key='a'   → True если group A достиг 15
+    group_key='b'   → True если group B достиг 15
+    """
+    if group_key in GROUP_KEYS:
+        return get_account_withdraw_count(account_id, group_key) >= DAILY_WITHDRAW_LIMIT
+    a_reached = get_account_withdraw_count(account_id, GROUP_A) >= DAILY_WITHDRAW_LIMIT
+    b_reached = get_account_withdraw_count(account_id, GROUP_B) >= DAILY_WITHDRAW_LIMIT
+    return a_reached and b_reached
+
+
+# ---------------------------------------------------------------------------
+# Idempotency для withdraw — защита от двойного списания
+# ---------------------------------------------------------------------------
+
+def try_create_withdraw_attempt(
+    idempotency_key: str,
+    account_id: int,
+    destination: str,
+    amount: float,
+    group_key: Optional[str] = None,
+) -> Tuple[bool, Optional[dict]]:
+    """Атомарно создаёт запись попытки вывода.
+    Returns (created, existing):
+      created=True, existing=None   — новая попытка зарегистрирована
+      created=False, existing=dict  — попытка с этим ключом уже была, вернуть прошлый результат
+    """
+    today = _msk_date_str()
+    now = int(time.time())
+    try:
+        with _get_conn() as conn:
+            try:
+                conn.execute(
+                    "INSERT INTO withdraw_attempts "
+                    "(idempotency_key, account_id, destination, amount, group_key, "
+                    " status, business_date, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)",
+                    (idempotency_key, account_id, destination, float(amount),
+                     group_key, today, now),
+                )
+                conn.commit()
+                return True, None
+            except sqlite3.IntegrityError:
+                # UNIQUE violation — попытка с этим ключом уже существует
+                row = conn.execute(
+                    "SELECT id, idempotency_key, account_id, destination, amount, "
+                    "       group_key, status, bank_tx_id, error_message, "
+                    "       business_date, created_at, completed_at "
+                    "FROM withdraw_attempts WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+                return False, dict(row) if row else None
+    except sqlite3.OperationalError:
+        # Старая БД без таблицы — fallback: всегда новая попытка (без idempotency)
+        return True, None
+
+
+def update_withdraw_attempt_status(
+    idempotency_key: str,
+    status: str,
+    bank_tx_id: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> None:
+    """Обновляет статус попытки вывода.
+    status ∈ {'PENDING','EXECUTING','SUCCESS','REJECTED','UNCERTAIN','STUCK'}
+    """
+    completed_at = int(time.time()) if status in ("SUCCESS", "REJECTED", "STUCK") else None
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE withdraw_attempts SET status=?, "
+                "bank_tx_id=COALESCE(?, bank_tx_id), "
+                "error_message=COALESCE(?, error_message), "
+                "completed_at=COALESCE(?, completed_at) "
+                "WHERE idempotency_key=?",
+                (status, bank_tx_id, (error_message or "")[:400] if error_message else None,
+                 completed_at, idempotency_key),
+            )
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def get_withdraw_attempt(idempotency_key: str) -> Optional[dict]:
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT id, idempotency_key, account_id, destination, amount, "
+                "       group_key, status, bank_tx_id, error_message, "
+                "       business_date, created_at, completed_at "
+                "FROM withdraw_attempts WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+        return dict(row) if row else None
+    except sqlite3.OperationalError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# audit_log — журнал критичных действий (для расследований/комплаенса)
+# ---------------------------------------------------------------------------
+# Что попадает: login/logout/fail, account create/edit/delete, withdraw success/fail,
+# auto-withdraw create/delete/execute, pin_refresh, token_refresh, admin actions.
+# НЕ попадает: чтение баланса, истории, диагностика — это шум.
+# Retention: 90 дней (cleanup_audit_log) — после этого записи удаляются.
+
+_AUDIT_MAX_DETAILS_BYTES = 4000   # обрезаем длинные details чтобы не раздувать БД
+
+
+def write_audit_entry(
+    action: str,
+    user_id: Optional[int] = None,
+    username: Optional[str] = None,
+    ip: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[int] = None,
+    details: Optional[dict] = None,
+) -> None:
+    """Записывает событие в audit_log. НИКОГДА не должно бросать исключение —
+    audit failure не должна ломать основной flow."""
+    try:
+        details_json = None
+        if details:
+            try:
+                details_json = json.dumps(details, ensure_ascii=False, default=str)
+                if len(details_json) > _AUDIT_MAX_DETAILS_BYTES:
+                    details_json = details_json[:_AUDIT_MAX_DETAILS_BYTES] + "...[truncated]"
+            except Exception:
+                details_json = str(details)[:_AUDIT_MAX_DETAILS_BYTES]
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO audit_log (ts, user_id, username, ip, action, "
+                "target_type, target_id, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (int(time.time()), user_id, username, ip, action,
+                 target_type, target_id, details_json),
+            )
+            conn.commit()
+    except Exception:
+        # Логируем через стандартный logger чтобы не получить рекурсию
+        import logging
+        logging.getLogger(__name__).warning("audit write failed: %s", action)
+
+
+def list_audit_log(
+    limit: int = 100,
+    offset: int = 0,
+    action_prefix: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[int] = None,
+    user_id: Optional[int] = None,
+    since_ts: Optional[int] = None,
+) -> List[dict]:
+    """Чтение журнала с фильтрами. Используется будущим админ-эндпоинтом."""
+    where = []
+    params: list = []
+    if action_prefix:
+        where.append("action LIKE ?")
+        params.append(action_prefix + "%")
+    if target_type:
+        where.append("target_type = ?")
+        params.append(target_type)
+    if target_id is not None:
+        where.append("target_id = ?")
+        params.append(target_id)
+    if user_id is not None:
+        where.append("user_id = ?")
+        params.append(user_id)
+    if since_ts is not None:
+        where.append("ts >= ?")
+        params.append(since_ts)
+    sql = "SELECT id, ts, user_id, username, ip, action, target_type, target_id, details FROM audit_log"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY ts DESC LIMIT ? OFFSET ?"
+    params.extend([max(1, min(limit, 1000)), max(0, offset)])
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
+def cleanup_audit_log(retention_days: int = 90) -> int:
+    """Удаляет записи старше retention_days. Возвращает кол-во удалённых строк."""
+    cutoff = int(time.time()) - retention_days * 24 * 3600
+    try:
+        with _get_conn() as conn:
+            cur = conn.execute("DELETE FROM audit_log WHERE ts < ?", (cutoff,))
+            conn.commit()
+        return cur.rowcount
+    except sqlite3.OperationalError:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# accounts_state — переживающее рестарты состояние per-account
+# ---------------------------------------------------------------------------
+# Хранит:
+#   last_keepalive_at  — unix ts последнего успешного PIN refresh
+#   last_token_state   — кэшированный JWT state (FRESH/AGING/STALE/EXPIRED/DEAD)
+#   fail_count         — сколько подряд keepalive не получил новый JWT
+#   last_error         — последняя ошибка (для UI/диагностики)
+# Без этой таблицы все эти данные жили в RAM и пропадали при рестарте, что
+# приводило к параллельному дудолбежу keepalive-loop'ом ВСЕХ аккаунтов разом.
+
+def get_account_state(account_id: int) -> dict:
+    """Возвращает состояние аккаунта (или дефолтное если ещё не сохранялось)."""
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT last_keepalive_at, last_token_state, fail_count, "
+                "       last_error, updated_at "
+                "FROM accounts_state WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        if row:
+            return {
+                "account_id":        account_id,
+                "last_keepalive_at": int(row["last_keepalive_at"] or 0),
+                "last_token_state":  row["last_token_state"] or "",
+                "fail_count":        int(row["fail_count"] or 0),
+                "last_error":        row["last_error"] or "",
+                "updated_at":        int(row["updated_at"] or 0),
+            }
+    except sqlite3.OperationalError:
+        pass
+    return {
+        "account_id": account_id, "last_keepalive_at": 0, "last_token_state": "",
+        "fail_count": 0, "last_error": "", "updated_at": 0,
+    }
+
+
+def update_account_state(
+    account_id: int,
+    last_keepalive_at: Optional[int] = None,
+    last_token_state: Optional[str] = None,
+    fail_count_inc: bool = False,
+    fail_count_reset: bool = False,
+    last_error: Optional[str] = None,
+) -> None:
+    """Обновляет состояние аккаунта. UPSERT — создаёт строку если нет.
+    fail_count_inc / fail_count_reset — атомарные инкремент/сброс счётчика ошибок.
+    """
+    now = int(time.time())
+    try:
+        with _get_conn() as conn:
+            # Используем UPSERT: одна строка per account_id
+            conn.execute(
+                "INSERT INTO accounts_state "
+                "(account_id, last_keepalive_at, last_token_state, fail_count, "
+                " last_error, updated_at) "
+                "VALUES (?, ?, ?, 0, ?, ?) "
+                "ON CONFLICT(account_id) DO UPDATE SET "
+                "  last_keepalive_at = COALESCE(?, last_keepalive_at), "
+                "  last_token_state  = COALESCE(?, last_token_state), "
+                "  fail_count        = CASE "
+                "    WHEN ? THEN fail_count + 1 "
+                "    WHEN ? THEN 0 "
+                "    ELSE fail_count END, "
+                "  last_error        = COALESCE(?, last_error), "
+                "  updated_at        = ?",
+                (
+                    account_id,
+                    last_keepalive_at or 0,
+                    last_token_state or None,
+                    last_error or None,
+                    now,
+                    last_keepalive_at,
+                    last_token_state,
+                    1 if fail_count_inc else 0,
+                    1 if fail_count_reset else 0,
+                    last_error,
+                    now,
+                ),
+            )
+            conn.commit()
+    except sqlite3.OperationalError:
+        # Миграция ещё не применена — игнорируем (in-memory fallback в main.py)
+        pass
+
+
+def list_uncertain_withdraw_attempts(max_age_seconds: int = 600) -> List[dict]:
+    """Возвращает попытки в статусе UNCERTAIN, созданные не позже max_age_seconds назад.
+    Используется reconciliation worker'ом — слишком новые (<30 сек) ещё могут получить
+    ответ от банка штатно, слишком старые (>10 мин) уже неинформативны.
+    """
+    cutoff_min = int(time.time()) - max_age_seconds
+    cutoff_max = int(time.time()) - 30   # не трогаем «свежие» — могут ещё дозавершиться
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, idempotency_key, account_id, destination, amount, "
+                "       group_key, status, bank_tx_id, error_message, "
+                "       business_date, created_at, completed_at "
+                "FROM withdraw_attempts "
+                "WHERE status = 'UNCERTAIN' "
+                "  AND created_at >= ? AND created_at <= ? "
+                "ORDER BY created_at ASC",
+                (cutoff_min, cutoff_max),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
+def cleanup_withdraw_attempts(retention_hours: int = 48) -> int:
+    """Удаляет завершённые попытки старше retention_hours."""
+    cutoff = int(time.time()) - retention_hours * 3600
+    try:
+        with _get_conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM withdraw_attempts "
+                "WHERE created_at < ? AND status IN ('SUCCESS','REJECTED','STUCK')",
+                (cutoff,),
+            )
+            conn.commit()
+        return cur.rowcount
+    except sqlite3.OperationalError:
+        return 0
 
 
 # ---------------------------------------------------------------------------

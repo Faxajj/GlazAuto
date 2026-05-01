@@ -4,6 +4,7 @@ Banks Dashboard — единый дашборд для нескольких ба
 import asyncio
 import base64
 import collections
+import hashlib
 import json
 import logging
 import secrets
@@ -17,19 +18,25 @@ from urllib.parse import quote
 import httpx
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.database import (
     DAILY_WITHDRAW_LIMIT,
+    GROUP_A,
+    GROUP_B,
     get_window_list,
     normalize_window_slug,
     accounts_by_window,
     add_account as db_add_account,
     add_auto_withdraw_rule,
     cleanup_sessions,
+    cleanup_withdraw_attempts,
+    get_account_state,
+    list_uncertain_withdraw_attempts,
+    update_account_state,
     create_session,
     create_user,
     delete_account as db_delete_account,
@@ -40,6 +47,7 @@ from app.database import (
     get_session,
     get_user_by_username,
     get_account_withdraw_count,
+    get_withdraw_attempt,
     get_withdraw_count,
     increment_account_withdraw_count,
     increment_withdraw_count,
@@ -48,8 +56,14 @@ from app.database import (
     is_withdraw_limit_reached,
     list_accounts,
     list_auto_withdraw_rules,
+    release_account_withdraw_count,
+    release_withdraw_count,
+    try_create_withdraw_attempt,
+    try_reserve_account_withdraw_count,
+    try_reserve_withdraw_count,
     update_account as db_update_account,
     update_auto_withdraw_progress,
+    update_withdraw_attempt_status,
     verify_password,
     add_window as db_add_window,
     update_window as db_update_window,
@@ -71,6 +85,8 @@ from app.drivers.personalpay import (
     consume_refreshed_token as pp_consume_refreshed_token,
     _DEFAULT_PIN_HASH as PP_DEFAULT_PIN_HASH,
 )
+from app.audit import audit
+from app.database import cleanup_audit_log
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -95,8 +111,12 @@ ERROR_MESSAGES: dict[str, str] = {
     "document_required": "❌ Документ получателя (CUIT/CUIL) обязателен для UniversalCoins.",
     "invalid_auto_rule": "❌ Неверные параметры автоправила. Проверьте суммы.",
     "invalid_amount_rule": "❌ Неверная сумма в правиле автовывода.",
-    "limit_reached": f"❌ Достигнут дневной лимит ({DAILY_WITHDRAW_LIMIT} выводов). Лимит обновляется ежедневно с 09:30 до 10:00 МСК.",
-    "account_limit_reached": f"❌ Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT} в день). Попробуйте после обновления лимитов с 09:30 до 10:00 МСК.",
+    "limit_reached": f"❌ Достигнут дневной лимит ({DAILY_WITHDRAW_LIMIT} выводов на CVU). Лимит обновляется ежедневно в 07:30 МСК.",
+    "account_limit_reached": f"❌ Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT} в день на группу). Лимит обновляется ежедневно в 07:30 МСК.",
+    "group_a_limit_reached": f"❌ Лимит для PP-внутренних переводов ({DAILY_WITHDRAW_LIMIT}/день) достигнут. Сброс в 07:30 МСК.",
+    "group_b_limit_reached": f"❌ Лимит для внешних переводов ({DAILY_WITHDRAW_LIMIT}/день) достигнут. Сброс в 07:30 МСК.",
+    "duplicate_withdraw": "❌ Этот вывод уже был отправлен. Проверьте историю операций.",
+    "withdraw_in_progress": "⏳ Этот вывод сейчас обрабатывается. Подождите.",
     "token_expired": "❌ Сессия банка истекла. Обновите токен в настройках карты.",
     "bank_unavailable": "❌ Банк временно недоступен. Попробуйте повторить через 1–2 минуты.",
 }
@@ -148,6 +168,160 @@ async def _security_headers_middleware(request: Request, call_next):
 
 
 # ---------------------------------------------------------------------------
+# CSRF protection — double-submit cookie pattern
+# ---------------------------------------------------------------------------
+# Защита от Cross-Site Request Forgery: на любой unsafe-метод (POST/PUT/PATCH/DELETE)
+# проверяется совпадение значения в cookie 'csrf_token' и в одном из:
+#   - заголовок X-CSRF-Token  (для fetch/JSON-запросов)
+#   - поле формы csrf_token   (для HTML-форм)
+#
+# Cookie выставляется на любой первый GET. JS читает cookie (httponly=False)
+# и передаёт в header. HTML-формы получают hidden input через Jinja-helper csrf_input(request).
+#
+# Exempt endpoints:
+#   - /login, /logout (auth boundary)
+#   - /static/* (статические файлы, GET)
+#   - /events/* (SSE — только GET)
+
+CSRF_COOKIE     = "csrf_token"
+CSRF_HEADER     = "x-csrf-token"
+CSRF_FORM_FIELD = "csrf_token"
+CSRF_COOKIE_TTL = 60 * 60 * 24 * 30   # 30 дней
+_CSRF_EXEMPT_PREFIXES = ("/static/", "/events/")
+_CSRF_EXEMPT_PATHS    = {"/login"}   # /logout — НЕ exempt (защита от force-logout CSRF)
+_CSRF_UNSAFE_METHODS  = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_CSRF_MAX_BODY_BYTES  = 5 * 1024 * 1024   # 5 MB — defence в DoS на парсинге
+
+
+def _csrf_is_exempt(path: str) -> bool:
+    if path in _CSRF_EXEMPT_PATHS:
+        return True
+    return any(path.startswith(p) for p in _CSRF_EXEMPT_PREFIXES)
+
+
+async def _csrf_extract_submitted(request: Request, body: bytes) -> str:
+    """Достаёт CSRF-токен из заголовка ИЛИ тела (urlencoded form / JSON)."""
+    # 1) Header (предпочтительно — для JS fetch и AJAX)
+    submitted = request.headers.get(CSRF_HEADER, "").strip()
+    if submitted:
+        return submitted
+    # 2) Body — парсим в зависимости от Content-Type
+    ct = request.headers.get("content-type", "").lower()
+    if not body:
+        return ""
+    if "application/json" in ct:
+        try:
+            data = json.loads(body.decode("utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                v = data.get(CSRF_FORM_FIELD) or data.get("csrfToken") or ""
+                return str(v).strip()
+        except Exception:
+            return ""
+    if "application/x-www-form-urlencoded" in ct:
+        try:
+            from urllib.parse import parse_qs
+            decoded = body.decode("utf-8", errors="ignore")
+            parts = parse_qs(decoded, keep_blank_values=False)
+            return (parts.get(CSRF_FORM_FIELD, [""])[0] or "").strip()
+        except Exception:
+            return ""
+    if "multipart/form-data" in ct:
+        # Простой grep по boundary'у — без полного парсинга
+        try:
+            text = body.decode("utf-8", errors="ignore")
+            # Ищем `name="csrf_token"\r\n\r\nVALUE\r\n--`
+            import re
+            m = re.search(r'name="' + CSRF_FORM_FIELD + r'"\s*\r?\n\r?\n([^\r\n]+)', text)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            return ""
+    return ""
+
+
+@app.middleware("http")
+async def _csrf_middleware(request: Request, call_next):
+    path = request.url.path
+    method = request.method.upper()
+
+    # Token: либо из cookie (если уже есть), либо генерируем новый
+    token_from_cookie = request.cookies.get(CSRF_COOKIE, "")
+    token = token_from_cookie or secrets.token_hex(32)
+    request.state.csrf_token = token   # для Jinja-helper
+
+    # Validate на unsafe методах
+    if method in _CSRF_UNSAFE_METHODS and not _csrf_is_exempt(path):
+        # Защита от DoS: не читаем тело больше лимита
+        cl = request.headers.get("content-length", "")
+        try:
+            cl_int = int(cl) if cl else 0
+        except ValueError:
+            cl_int = 0
+        if cl_int > _CSRF_MAX_BODY_BYTES:
+            return JSONResponse({"error": "request body too large"}, status_code=413)
+
+        # Читаем тело и кешируем — иначе downstream Form() не сможет прочесть
+        body = await request.body()
+
+        # Reinjection: подменяем receive чтобы FastAPI Form()/json() читали из кэша
+        async def _replay_receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+        request._receive = _replay_receive   # type: ignore[attr-defined]
+
+        submitted = await _csrf_extract_submitted(request, body)
+        if not token_from_cookie or not submitted or submitted != token_from_cookie:
+            logger.warning(
+                "csrf reject: path=%s ip=%s has_cookie=%s has_submitted=%s",
+                path, _get_client_ip(request) if "_get_client_ip" in globals() else "?",
+                bool(token_from_cookie), bool(submitted),
+            )
+            # Для AJAX запросов — JSON, для form-submit — HTML с инструкцией
+            if "application/json" in request.headers.get("accept", "") \
+               or "x-requested-with" in {k.lower() for k in request.headers.keys()}:
+                return JSONResponse({"error": "csrf token invalid"}, status_code=403)
+            html = ("<!DOCTYPE html><html><body style='font-family:sans-serif;padding:2rem'>"
+                    "<h2>403 — Сессия устарела</h2>"
+                    "<p>Защита от CSRF: токен не совпал. Это часто происходит если страница "
+                    "была открыта до перезапуска сервера или истёк cookie.</p>"
+                    "<p><a href='javascript:history.back()'>← Назад</a> | "
+                    "<a href='/'>На главную</a></p></body></html>")
+            return HTMLResponse(html, status_code=403)
+
+    response = await call_next(request)
+
+    # Всегда обновляем cookie (rolling expiration). Для безопасности:
+    #   httponly=False — нужно чтобы JS читал и отправлял в header
+    #   samesite=lax — соответствует session_token
+    #   path=/ — на весь сайт
+    response.set_cookie(
+        CSRF_COOKIE, token,
+        httponly=False,
+        samesite="lax",
+        path="/",
+        max_age=CSRF_COOKIE_TTL,
+    )
+    return response
+
+
+# Jinja helper: вставляет hidden input в любую форму через {{ csrf_input(request) }}
+def _csrf_input(request: Request) -> str:
+    token = getattr(request.state, "csrf_token", "") or request.cookies.get(CSRF_COOKIE, "")
+    return f'<input type="hidden" name="{CSRF_FORM_FIELD}" value="{token}">'
+
+
+def _csrf_meta(request: Request) -> str:
+    """Meta-tag для JS fetch: <meta name='csrf-token' content='...'>"""
+    token = getattr(request.state, "csrf_token", "") or request.cookies.get(CSRF_COOKIE, "")
+    return f'<meta name="csrf-token" content="{token}">'
+
+
+# Регистрируем Jinja-globals (нужен MarkupSafe чтобы HTML не эскейпился)
+from markupsafe import Markup as _Markup
+templates.env.globals["csrf_input"] = lambda request: _Markup(_csrf_input(request))
+templates.env.globals["csrf_meta"]  = lambda request: _Markup(_csrf_meta(request))
+
+
+# ---------------------------------------------------------------------------
 # Login rate limiting — защита от брутфорса (5 попыток / 15 мин на IP)
 # ---------------------------------------------------------------------------
 
@@ -187,21 +361,70 @@ def _clear_login_attempts(ip: str) -> None:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# Расширяемый список CVU-префиксов, освобождённых от лимита выводов.
-# Логика: переводы между картами одного банка (PP→PP, AP→AP) — внутренние.
-# Чтобы добавить новый банк — просто впишите его CVU-префикс в этот frozenset.
+# CVU-группировка (per-card лимиты)
 # ---------------------------------------------------------------------------
-_EXEMPT_CVU_PREFIXES: frozenset = frozenset({
-    "00000765",  # Personal Pay  (внутренние карты PP)
-    "00001775",  # AstroPay      (внутренние карты AP)
-})
+# Group A — destinations начинающиеся на 00000765 (PP-internal)
+#           имеют отдельный лимит 15/день, независимый от Group B.
+# Group B — все остальные направления (внешние переводы), лимит 15/день.
+# AstroPay-internal (00001775*) — НЕ ограничены лимитом (карта AP→AP бесплатно).
+#
+# Таким образом одна PP-карта может за день: 15 PP-internal + 15 внешних = 30 total.
+# Одна AP-карта: 15 внешних + сколько угодно AP-internal.
+# ---------------------------------------------------------------------------
+
+PP_INTERNAL_PREFIX = "00000765"   # Group A trigger
+AP_INTERNAL_PREFIX = "00001775"   # Exempt (no limit)
 
 
-def _is_limit_exempt(destination: str) -> bool:
-    """Возвращает True если CVU получателя освобождён от лимита 15 выводов.
-    Охватывает переводы между картами одного банка (PP→PP, AP→AP)."""
+def _group_key_for(bank_type: str, destination: str) -> Optional[str]:
+    """Определяет группу лимита для пары (карта-источник, направление).
+    Возвращает 'a' / 'b' / None.
+    None означает «лимит не применяется» (AP→AP).
+    """
     dest = (destination or "").strip()
-    return any(dest.startswith(prefix) for prefix in _EXEMPT_CVU_PREFIXES)
+    if bank_type == "personalpay":
+        return GROUP_A if dest.startswith(PP_INTERNAL_PREFIX) else GROUP_B
+    if bank_type == "astropay":
+        if dest.startswith(AP_INTERNAL_PREFIX):
+            return None     # AP→AP exempt — сохраняем существующее поведение
+        return GROUP_B
+    # universalcoins и любые другие — внешние, Group B
+    return GROUP_B
+
+
+def _make_idempotency_key(account_id: int, destination: str, amount: float,
+                          salt: str = "") -> str:
+    """Детерминированный ключ идемпотентности для (карта, цель, сумма, бизнес-день).
+    Один и тот же набор параметров в течение бизнес-дня → один ключ →
+    повторный submit не создаёт второй вывод.
+
+    salt позволяет искусственно различать legitimate-повторы (например, чанки
+    auto-withdraw используют seq как salt).
+    """
+    from app.database import _msk_date_str as _bd
+    business_date = _bd()
+    raw = f"{account_id}|{(destination or '').strip()}|{float(amount):.2f}|{business_date}|{salt}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+# ---------------------------------------------------------------------------
+# Per-account asyncio locks — сериализуют операции над одной картой
+# ---------------------------------------------------------------------------
+# Защищают от: одновременного withdraw + balance refresh + keepalive на одной карте.
+# Lock ключуется по account_id (НЕ device_id) — две карты на одном телефоне
+# работают независимо, но одна и та же карта не может быть в двух операциях сразу.
+
+_account_locks: dict = {}
+_account_locks_meta = asyncio.Lock()
+
+
+async def _get_account_lock(account_id: int) -> asyncio.Lock:
+    async with _account_locks_meta:
+        lock = _account_locks.get(account_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _account_locks[account_id] = lock
+        return lock
 
 
 
@@ -879,6 +1102,9 @@ async def _bg_refresh_balance(account_id: int) -> None:
         fresh_acc = get_account(account_id)
         if fresh_acc:
             await _fetch_and_cache_balance(account_id, fresh_acc)
+            _sse_emit(f"account:{account_id}", {
+                "type": "balance.updated", "account_id": account_id,
+            })
             logger.debug("bg_refresh_balance ok acc=%d", account_id)
     except Exception as e:
         logger.debug("bg_refresh_balance error acc=%d: %s", account_id, e)
@@ -977,6 +1203,96 @@ async def _proactive_refresh_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Event bus + SSE — лёгкий real-time push без внешних зависимостей
+# ---------------------------------------------------------------------------
+# Topics: "account:{id}" — события одного аккаунта
+# Events:
+#   {"type": "balance.updated",     "ts": <unix>, "account_id": <int>}
+#   {"type": "withdraw.completed",  "ts": <unix>, "account_id": <int>, "tid": "..."}
+#   {"type": "token.refreshed",     "ts": <unix>, "account_id": <int>}
+#
+# Доставка at-most-once в рамках процесса (без Redis). Клиенты переподключаются
+# по EventSource auto-reconnect при разрыве. Polling баланса остаётся как fallback.
+
+_sse_subscribers: dict = collections.defaultdict(set)   # topic → set[asyncio.Queue]
+_sse_lock = asyncio.Lock()
+_SSE_QUEUE_MAXSIZE = 32        # больше — drop oldest
+
+
+async def _sse_subscribe(topic: str) -> asyncio.Queue:
+    q: asyncio.Queue = asyncio.Queue(maxsize=_SSE_QUEUE_MAXSIZE)
+    async with _sse_lock:
+        _sse_subscribers[topic].add(q)
+    return q
+
+
+async def _sse_unsubscribe(topic: str, q: asyncio.Queue) -> None:
+    async with _sse_lock:
+        _sse_subscribers[topic].discard(q)
+        if not _sse_subscribers[topic]:
+            _sse_subscribers.pop(topic, None)
+
+
+def _sse_emit(topic: str, event: dict) -> None:
+    """Не-блокирующая публикация события всем подписчикам топика.
+    Если подписчик не успевает читать — drop oldest message в его очереди."""
+    if not _sse_subscribers.get(topic):
+        return
+    payload = dict(event)
+    payload.setdefault("ts", int(time.time()))
+    for q in list(_sse_subscribers.get(topic, ())):
+        try:
+            q.put_nowait(payload)
+        except asyncio.QueueFull:
+            # Подписчик завис — освобождаем место и дропаем самое старое
+            try:
+                q.get_nowait()
+                q.put_nowait(payload)
+            except Exception:
+                pass
+
+
+@app.get("/events/account/{account_id}")
+async def sse_account_events(account_id: int, request: Request):
+    """Server-Sent Events для одного аккаунта.
+    Клиент подписывается через EventSource('/events/account/42')."""
+    if not _current_user(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not get_account(account_id):
+        return JSONResponse({"error": "account not found"}, status_code=404)
+
+    topic = f"account:{account_id}"
+    queue = await _sse_subscribe(topic)
+
+    async def _gen():
+        try:
+            # Initial hello — клиент знает что соединение установлено
+            yield f"event: hello\ndata: {json.dumps({'account_id': account_id, 'ts': int(time.time())})}\n\n"
+            # Heartbeat каждые 25 сек чтобы прокси/nginx не закрыли idle-connection
+            last_heartbeat = time.monotonic()
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=5.0)
+                    yield f"event: message\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    # Timeout — проверяем нужен ли heartbeat
+                    if time.monotonic() - last_heartbeat >= 25.0:
+                        yield f": heartbeat {int(time.time())}\n\n"
+                        last_heartbeat = time.monotonic()
+        finally:
+            await _sse_unsubscribe(topic, queue)
+
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",   # отключает буферизацию nginx
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(_gen(), media_type="text/event-stream", headers=headers)
+
+
+# ---------------------------------------------------------------------------
 # Фоновый сбор курса USDT/ARS каждые 10 минут
 # ---------------------------------------------------------------------------
 
@@ -1021,12 +1337,14 @@ async def _rate_collector_loop():
 # Фоновый PIN keep-alive для PersonalPay — каждые 8 часов
 # ---------------------------------------------------------------------------
 
-_pp_last_keepalive: dict = {}   # account_id → timestamp последнего успешного PIN-refresh
-
 async def _pp_keepalive_loop():
     """Фоновая задача: каждые 20 минут проверяет все PP аккаунты с pin_hash.
     Если прошло > 5 часов с последнего PIN-refresh — делает его автоматически.
-    Интервал 5ч при 12-часовом JWT даёт ~2 refresh'а в окне жизни токена с запасом."""
+    Интервал 5ч при 12-часовом JWT даёт ~2 refresh'а в окне жизни токена с запасом.
+
+    Состояние last_keepalive_at теперь персистентно (таблица accounts_state) —
+    переживает рестарты, не дудолбит банк после каждого перезапуска uvicorn.
+    """
     await asyncio.sleep(60)   # первый запуск через 1 мин после старта
     PP_INTERVAL    = 5 * 3600  # 5 часов между keep-alive (было 8h — слишком мало запаса)
     CHECK_INTERVAL = 1200      # проверяем раз в 20 минут (было 30 мин)
@@ -1040,7 +1358,9 @@ async def _pp_keepalive_loop():
             now = time.time()
             for acc in pp_accs:
                 acc_id = acc["id"]
-                last = _pp_last_keepalive.get(acc_id, 0)
+                # Читаем состояние из БД (переживает рестарты)
+                state = get_account_state(acc_id)
+                last  = int(state.get("last_keepalive_at") or 0)
 
                 creds = acc.get("credentials") or {}
                 token = creds.get("auth_token", "")
@@ -1061,7 +1381,8 @@ async def _pp_keepalive_loop():
 
                 try:
                     new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
-                    _pp_last_keepalive[acc_id] = now
+                    # Персистим last_keepalive_at в БД (атрибут пытались)
+                    update_account_state(acc_id, last_keepalive_at=int(now))
                     if new_token and new_token != token:
                         # Получен НОВЫЙ JWT — сохраняем в БД
                         # Перечитываем свежие credentials из БД перед записью:
@@ -1073,15 +1394,29 @@ async def _pp_keepalive_loop():
                             fresh_creds["auth_token"] = new_token
                             db_update_account(acc_id, credentials=fresh_creds)
                             _balance_cache.pop(acc_id, None)
+                            update_account_state(acc_id, last_token_state="REFRESHED",
+                                                 fail_count_reset=True)
+                            audit("token.keepalive_refreshed",
+                                  target_type="account", target_id=acc_id,
+                                  details={"source": "background_keepalive"})
+                            _sse_emit(f"account:{acc_id}", {
+                                "type": "token.refreshed", "account_id": acc_id,
+                            })
                             logger.info("pp keepalive ok acc=%d: новый JWT сохранён", acc_id)
                     elif new_token == token:
                         # PP подтвердил сессию, но вернул тот же JWT (нет нового токена)
                         # НЕ пишем в БД: если пользователь вручную обновил токен пока
                         # мы делали keepalive — перезапись старым JWT сотрёт свежий токен
+                        update_account_state(acc_id, last_token_state="ALIVE",
+                                             fail_count_reset=True)
                         logger.info("pp keepalive ok acc=%d: сессия жива, новый JWT не получен", acc_id)
                     else:
+                        update_account_state(acc_id, fail_count_inc=True,
+                                             last_error="no_token_returned")
                         logger.warning("pp keepalive failed acc=%d: no token returned", acc_id)
                 except Exception as e:
+                    update_account_state(acc_id, fail_count_inc=True,
+                                         last_error=str(e)[:300])
                     logger.warning("pp keepalive error acc=%d: %s", acc_id, e)
         except Exception as e:
             logger.warning("pp keepalive loop error: %s", e)
@@ -1102,31 +1437,243 @@ async def _session_cleanup_loop():
         await asyncio.sleep(3600)   # каждый час
 
 
-async def _pp_migrate_default_pin():
-    """Одноразовая миграция: проставляем pin_hash=464646 всем PP-аккаунтам без пин-кода."""
+# ---------------------------------------------------------------------------
+# Cleanup фоновые задачи: idempotent withdraw attempts + audit log
+# ---------------------------------------------------------------------------
+async def _withdraw_attempts_cleanup_loop():
+    """Раз в 6 часов удаляет завершённые попытки старше 48 часов."""
+    await asyncio.sleep(600)   # первый запуск через 10 мин после старта
+    while True:
+        try:
+            removed = cleanup_withdraw_attempts(retention_hours=48)
+            if removed:
+                logger.info("withdraw_attempts cleanup: removed %d old rows", removed)
+        except Exception as e:
+            logger.warning("withdraw_attempts cleanup error: %s", e)
+        await asyncio.sleep(6 * 3600)
+
+
+async def _audit_log_cleanup_loop():
+    """Раз в 24 часа удаляет audit-записи старше 90 дней."""
+    await asyncio.sleep(900)   # первый запуск через 15 мин после старта
+    while True:
+        try:
+            removed = cleanup_audit_log(retention_days=90)
+            if removed:
+                logger.info("audit_log cleanup: removed %d old rows", removed)
+        except Exception as e:
+            logger.warning("audit_log cleanup error: %s", e)
+        await asyncio.sleep(24 * 3600)
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation worker — разбирает UNCERTAIN-попытки выводов
+# ---------------------------------------------------------------------------
+# Сценарий: вывод стартовал, банк ответил timeout — мы не знаем, прошёл ли он.
+# Резервы лимитов УЖЕ откачены (release_*) на момент исключения, статус=UNCERTAIN.
+# Worker раз в 30 сек:
+#   1. Берёт UNCERTAIN attempts старше 30 сек (банку дано время дописать activity).
+#   2. Загружает свежие activities аккаунта и ищет совпадение по
+#      (amount + destination + ts близко к created_at).
+#   3. Match found → SUCCESS + bank_tx_id (и пере-резервируем лимит).
+#   4. Match not found, attempt старше 5 мин → STUCK (требует ручного разбора).
+#
+# Принцип: «лучше STUCK чем ложный SUCCESS». Match строгий — иначе не трогаем.
+
+_RECONCILE_INTERVAL = 30          # проверка каждые 30 сек
+_RECONCILE_STUCK_AFTER = 300      # 5 мин — после этого срока без match → STUCK
+_RECONCILE_AMOUNT_TOLERANCE = 0.51  # центы могут округлиться, ±50 копеек терпим
+
+
+def _activity_matches_attempt(activity: dict, attempt: dict) -> bool:
+    """Проверяет, является ли activity тем самым выводом, что запустила attempt.
+    Match по: outgoing + amount (точно) + destination prefix (12+ цифр) + ts close."""
+    if not isinstance(activity, dict):
+        return False
+    norm = _normalize_activity(activity)
+    if not norm or not norm.get("is_outgoing"):
+        return False
+    # Сумма: считаем модуль (PP активити возвращает отрицательную для outgoing)
+    a_amount_raw = norm.get("amount")
     try:
-        all_accs = list_accounts()
-        for acc in all_accs:
-            if acc.get("bank_type") != "personalpay":
-                continue
-            creds = acc.get("credentials") or {}
-            if creds.get("pin_hash"):
-                continue  # уже есть
-            new_creds = dict(creds)
-            new_creds["pin_hash"] = PP_DEFAULT_PIN_HASH
-            db_update_account(acc["id"], credentials=new_creds)
-            logger.info("pp migrate: добавлен default pin_hash для аккаунта id=%s (%s)", acc["id"], acc.get("label", ""))
-    except Exception as e:
-        logger.warning("pp migrate default pin error: %s", e)
+        a_amt = abs(float(a_amount_raw))
+    except (TypeError, ValueError):
+        return False
+    target_amt = abs(float(attempt.get("amount") or 0))
+    if abs(a_amt - target_amt) > _RECONCILE_AMOUNT_TOLERANCE:
+        return False
+
+    # Время — activity должна быть не раньше attempt.created_at - 2 мин
+    # и не позже + 5 мин (PP может задержать запись в activity-list)
+    a_ts = _activity_unix_ts(activity, norm)
+    if a_ts is None:
+        return False
+    created_at = int(attempt.get("created_at") or 0)
+    if a_ts < created_at - 120 or a_ts > created_at + 600:
+        return False
+
+    # Destination — сверяем префикс (PP не всегда возвращает полный CVU в activity)
+    dest = (attempt.get("destination") or "").strip()
+    if dest:
+        # Ищем destination в любых полях activity по подстроке (CVU/alias/account)
+        haystack = " ".join(filter(None, [
+            str(norm.get("recipient") or ""),
+            str(norm.get("recipient_lastname") or ""),
+            str(activity.get("destinationAccount") or ""),
+            str(activity.get("targetAccount") or ""),
+            json.dumps(activity, ensure_ascii=False)[:1000],
+        ]))
+        # Берём 8+ цифр из dest и проверяем что они есть в haystack
+        digits = "".join(c for c in dest if c.isdigit())
+        if len(digits) >= 8 and digits not in haystack:
+            return False
+
+    return True
+
+
+def _activity_unix_ts(activity: dict, normalized: dict) -> Optional[int]:
+    """Извлекает unix timestamp активности (несколько форматов)."""
+    # 1) Из normalized.date_str (ISO)
+    ds = (normalized or {}).get("date_str") or ""
+    if ds:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+            try:
+                return int(datetime.strptime(ds[:len(fmt) + 6], fmt).timestamp())
+            except (ValueError, TypeError):
+                pass
+    # 2) Из самого activity (возможны разные ключи)
+    for key in ("createdAt", "timestamp", "transactionDate", "date", "ts"):
+        v = activity.get(key)
+        if not v:
+            continue
+        if isinstance(v, (int, float)):
+            v_int = int(v)
+            return v_int // 1000 if v_int > 10**12 else v_int
+        if isinstance(v, str):
+            for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    return int(datetime.strptime(v[:26], fmt).timestamp())
+                except (ValueError, TypeError):
+                    pass
+    return None
+
+
+def _extract_bank_tx_id_from_activity(activity: dict) -> Optional[str]:
+    """Пытается достать bank_tx_id из activity (32-hex)."""
+    if not isinstance(activity, dict):
+        return None
+    # Прямой поиск 32-hex
+    candidate = _find_32char_hex_id(activity)
+    if candidate:
+        return candidate
+    # Fallback — стандартные ключи
+    for key in ("transactionId", "id", "transferId", "bankTransactionId", "operationId"):
+        v = activity.get(key)
+        if v and isinstance(v, str):
+            v = v.strip()
+            if len(v) == 32 and all(c in "0123456789abcdefABCDEF" for c in v):
+                return v
+    return None
+
+
+async def _reconcile_uncertain_loop():
+    """Фоновая reconciliation: разбирает зависшие UNCERTAIN выводы."""
+    await asyncio.sleep(45)   # первый запуск чуть позже старта
+    while True:
+        try:
+            attempts = list_uncertain_withdraw_attempts(max_age_seconds=_RECONCILE_STUCK_AFTER + 60)
+            if attempts:
+                logger.info("reconcile: scanning %d UNCERTAIN attempts", len(attempts))
+                # Группируем по account_id чтобы не дёргать банк лишний раз
+                by_acc: dict = collections.defaultdict(list)
+                for a in attempts:
+                    by_acc[int(a["account_id"])].append(a)
+
+                now = int(time.time())
+                for acc_id, acc_attempts in by_acc.items():
+                    acc = get_account(acc_id)
+                    if not acc:
+                        continue
+                    bank = acc.get("bank_type")
+                    if bank not in ("personalpay", "astropay"):
+                        # UC не поддерживаем reconciliation — сразу STUCK после timeout
+                        for att in acc_attempts:
+                            if now - int(att["created_at"]) >= _RECONCILE_STUCK_AFTER:
+                                update_withdraw_attempt_status(
+                                    att["idempotency_key"], "STUCK",
+                                    error_message="reconcile: bank not supported",
+                                )
+                        continue
+
+                    # Загружаем свежий список активностей (через thread — это блокирующий I/O)
+                    try:
+                        if bank == "personalpay":
+                            data = await asyncio.to_thread(pp_activities_list, acc["credentials"], 0, 50)
+                            raw_acts = _extract_activities_raw(data)
+                        else:
+                            from app.drivers.astropay import get_activities as ap_get_activities
+                            data = await asyncio.to_thread(ap_get_activities, acc["credentials"], 1, 50)
+                            raw_acts = data.get("data") or []
+                    except Exception as e:
+                        logger.warning("reconcile: cannot fetch activities for acc=%d: %s", acc_id, e)
+                        continue
+
+                    if not isinstance(raw_acts, list):
+                        continue
+
+                    for att in acc_attempts:
+                        matched = None
+                        for activity in raw_acts:
+                            if _activity_matches_attempt(activity, att):
+                                matched = activity
+                                break
+                        if matched is not None:
+                            tid = _extract_bank_tx_id_from_activity(matched)
+                            update_withdraw_attempt_status(
+                                att["idempotency_key"], "SUCCESS", bank_tx_id=tid,
+                            )
+                            # Восстанавливаем лимит — он же реально был использован
+                            cvu = att.get("destination") or ""
+                            try_reserve_withdraw_count(cvu, acc_id)
+                            grp = att.get("group_key")
+                            if grp in (GROUP_A, GROUP_B):
+                                try_reserve_account_withdraw_count(acc_id, grp)
+                            # Инвалидируем кэш для свежего отображения
+                            _balance_cache.pop(acc_id, None)
+                            _activities_cache.pop(acc_id, None)
+                            _sse_emit(f"account:{acc_id}", {
+                                "type": "withdraw.completed", "account_id": acc_id,
+                                "tid": tid, "via": "reconcile",
+                            })
+                            logger.info("reconcile: matched attempt %s → SUCCESS tid=%s",
+                                        att["idempotency_key"][:12], tid)
+                        elif now - int(att["created_at"]) >= _RECONCILE_STUCK_AFTER:
+                            update_withdraw_attempt_status(
+                                att["idempotency_key"], "STUCK",
+                                error_message="reconcile: no matching activity within 5min window",
+                            )
+                            logger.warning("reconcile: attempt %s → STUCK (no match)",
+                                           att["idempotency_key"][:12])
+        except Exception as e:
+            logger.warning("reconcile loop error: %s", e)
+
+        await asyncio.sleep(_RECONCILE_INTERVAL)
 
 
 @app.on_event("startup")
 async def startup_event():
+    # ВНИМАНИЕ: _pp_migrate_default_pin() удалён сознательно — он перезаписывал
+    # реальные PIN-хэши пользователей дефолтом 464646, ломая keepalive.
+    # Дефолтный PIN остаётся как fallback в _norm_creds (drivers/personalpay.py),
+    # но НЕ затирает данные в БД.
     asyncio.create_task(_rate_collector_loop())
     asyncio.create_task(_pp_keepalive_loop())
-    asyncio.create_task(_pp_migrate_default_pin())
     asyncio.create_task(_session_cleanup_loop())
     asyncio.create_task(_proactive_refresh_loop())
+    asyncio.create_task(_withdraw_attempts_cleanup_loop())
+    asyncio.create_task(_audit_log_cleanup_loop())
+    asyncio.create_task(_reconcile_uncertain_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -1144,25 +1691,15 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
         update_auto_withdraw_progress(rule["id"], last_error="Некорректная сумма", is_active=False)
         return False, "Некорректная сумма"
 
-    # Лимиты не применяются для внутренних переводов (PP→PP, AP→AP)
-    cvu = rule.get("cvu", "")
-    if not _is_limit_exempt(cvu):
-        if is_account_withdraw_limit_reached(acc["id"]):
-            msg = f"Карта достигла лимита выводов ({DAILY_WITHDRAW_LIMIT})"
-            update_auto_withdraw_progress(rule["id"], last_error=msg)
-            return False, msg
-
-        # Проверка дневного лимита по CVU
-        if is_withdraw_limit_reached(cvu, acc["id"]):
-            msg = f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут для CVU {cvu}"
-            update_auto_withdraw_progress(rule["id"], last_error=msg)
-            return False, msg
+    cvu       = rule.get("cvu", "")
+    bank_type = acc["bank_type"]
+    group_key = _group_key_for(bank_type, cvu)   # 'a' / 'b' / None
 
     # Проверка минимального баланса
     min_balance = float(rule.get("min_balance") or 0)
     if min_balance > 0:
         try:
-            balance_info = driver_balance(acc["bank_type"], acc["credentials"])
+            balance_info = driver_balance(bank_type, acc["credentials"])
             current_balance = float(balance_info.get("balance") or 0)
         except Exception as e:
             err = f"Не удалось получить баланс: {e}"
@@ -1171,21 +1708,81 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
         if current_balance < min_balance:
             return False, f"Баланс {current_balance:,.0f} < порога {min_balance:,.0f} — ожидание"
 
+    if bank_type == "universalcoins":
+        update_auto_withdraw_progress(rule["id"],
+                                      last_error="Автовывод не поддерживается для UniversalCoins",
+                                      is_active=False)
+        return False, "Автовывод не поддерживается для UniversalCoins"
+
+    # ── Idempotency для авто-чанков: salt включает paid_amount, чтобы каждый
+    #     новый чанк имел уникальный ключ, но повтор того же чанка — нет ──
+    paid_so_far = float(rule.get("paid_amount", 0))
+    idem_key = _make_idempotency_key(acc["id"], cvu, chunk,
+                                     salt=f"auto:{rule['id']}:{paid_so_far:.2f}")
+    created, prior = try_create_withdraw_attempt(
+        idem_key, acc["id"], cvu, chunk, group_key=group_key,
+    )
+    if not created and prior:
+        st = prior.get("status")
+        if st == "SUCCESS":
+            # Чанк уже прошёл — не делаем повторно, но прогресс зафиксируем
+            update_auto_withdraw_progress(rule["id"], paid_delta=chunk, last_error="")
+            return True, prior.get("bank_tx_id") or ""
+        if st in ("PENDING", "EXECUTING"):
+            return False, "Чанк уже выполняется (idempotency-lock)"
+        if st == "REJECTED":
+            update_auto_withdraw_progress(rule["id"],
+                                          last_error=prior.get("error_message") or "rejected")
+            return False, prior.get("error_message") or "rejected"
+        # UNCERTAIN — пропускаем, нужна reconciliation
+        return False, "Предыдущий чанк в неопределённом состоянии"
+
+    # ── Атомарные резервы лимитов ──
+    if try_reserve_withdraw_count(cvu, acc["id"]) is None:
+        msg = f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут для CVU {cvu}"
+        update_withdraw_attempt_status(idem_key, "REJECTED", error_message=msg)
+        update_auto_withdraw_progress(rule["id"], last_error=msg)
+        return False, msg
+
+    if group_key is not None:
+        if try_reserve_account_withdraw_count(acc["id"], group_key) is None:
+            release_withdraw_count(cvu, acc["id"])
+            grp_label = "PP-внутренних" if group_key == GROUP_A else "внешних"
+            msg = f"Лимит карты ({DAILY_WITHDRAW_LIMIT} {grp_label}) достигнут"
+            update_withdraw_attempt_status(idem_key, "REJECTED", error_message=msg)
+            update_auto_withdraw_progress(rule["id"], last_error=msg)
+            return False, msg
+
+    update_withdraw_attempt_status(idem_key, "EXECUTING")
     try:
-        if acc["bank_type"] == "universalcoins":
-            raise ValueError("Автовывод не поддерживается для UniversalCoins")
         result = driver_withdraw(
-            acc["bank_type"], acc["credentials"],
+            bank_type, acc["credentials"],
             destination=cvu, amount=chunk, comments="Auto withdraw",
         )
-        increment_withdraw_count(cvu, acc["id"])
-        increment_account_withdraw_count(acc["id"])
+        # Кэш сбрасываем чтобы UI увидел свежий баланс
+        _balance_cache.pop(acc["id"], None)
+        _activities_cache.pop(acc["id"], None)
         update_auto_withdraw_progress(rule["id"], paid_delta=chunk, last_error="")
     except Exception as e:
-        update_auto_withdraw_progress(rule["id"], last_error=str(e))
-        return False, str(e)
+        # Откат резервов: вывод не прошёл
+        err_msg = str(e)
+        release_withdraw_count(cvu, acc["id"])
+        if group_key is not None:
+            release_account_withdraw_count(acc["id"], group_key)
+        low = err_msg.lower()
+        if any(x in low for x in ("rechazad", "rejected", "rechazo", "denied", "denegad")):
+            update_withdraw_attempt_status(idem_key, "REJECTED", error_message=err_msg[:400])
+        else:
+            update_withdraw_attempt_status(idem_key, "UNCERTAIN", error_message=err_msg[:400])
+        update_auto_withdraw_progress(rule["id"], last_error=err_msg)
+        return False, err_msg
 
     tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
+    update_withdraw_attempt_status(idem_key, "SUCCESS", bank_tx_id=tid)
+    audit("withdraw.auto.success",
+          target_type="account", target_id=acc["id"],
+          details={"rule_id": rule["id"], "cvu": cvu, "amount": chunk,
+                   "tid": tid, "group": group_key})
     return True, (tid or "")
 
 
@@ -1217,6 +1814,8 @@ async def login_post(request: Request, username: str = Form(""), password: str =
         attempts = _record_failed_login(ip)
         left = max(0, _LOGIN_MAX_ATTEMPTS - attempts)
         warn = f" Осталось попыток: {left}." if left <= 2 else ""
+        audit("login.failed", request=request,
+              details={"username": username[:60], "attempts": attempts})
         return templates.TemplateResponse(
             "login.html",
             {"request": request, "error": f"Неверный логин или пароль.{warn}"},
@@ -1226,6 +1825,8 @@ async def login_post(request: Request, username: str = Form(""), password: str =
     _clear_login_attempts(ip)
     token = secrets.token_urlsafe(32)
     create_session(token, user["id"], user["username"], int(time.time() + SESSION_TTL))
+    audit("login.success", request=request,
+          user={"user_id": user["id"], "username": user["username"]})
     response = RedirectResponse(url="/", status_code=302)
     response.set_cookie(
         key=SESSION_COOKIE, value=token,
@@ -1237,8 +1838,10 @@ async def login_post(request: Request, username: str = Form(""), password: str =
 @app.post("/logout", response_class=RedirectResponse)
 async def logout(request: Request):
     token = request.cookies.get(SESSION_COOKIE)
+    user = _current_user(request)
     if token:
         delete_session(token)
+    audit("logout", request=request, user=user)
     response = RedirectResponse(url="/login", status_code=302)
     response.delete_cookie(SESSION_COOKIE)
     return response
@@ -1445,7 +2048,7 @@ async def api_balance(account_id: int):
 
 
 @app.post("/account/{account_id}/pin-refresh")
-async def api_pin_refresh(account_id: int):
+async def api_pin_refresh(request: Request, account_id: int):
     """Пробует продлить сессию PersonalPay через PIN-валидацию.
     Требует поля pin_hash в credentials (SHA-256 от PIN-кода).
     Если получен новый JWT — сохраняет его в БД и возвращает ok:true."""
@@ -1485,6 +2088,10 @@ async def api_pin_refresh(account_id: int):
                 msg = "Сессия продлена через PIN ✓"
             else:
                 msg = "PIN принят, но новый токен не получен. Обновите auth_token вручную."
+            audit("token.pin_refresh", request=request, user=_current_user(request),
+                  target_type="account", target_id=account_id,
+                  details={"got_new_jwt": new_token != old_token,
+                           "hours_left": hours_left, "is_fresh": is_fresh})
             return JSONResponse({"ok": is_fresh, "message": msg})
         return JSONResponse({
             "ok": False,
@@ -1756,41 +2363,99 @@ async def multi_withdraw(request: Request):
     async def _do_one(acc_id):
         acc = get_account(int(acc_id))
         if not acc:
-            return {"account_id": acc_id, "label": "?", "ok": False, "error": "Счёт не найден", "tid": None}
-        # Лимиты не применяются для внутренних переводов (PP→PP, AP→AP)
-        if not _is_limit_exempt(destination):
-            if is_account_withdraw_limit_reached(acc["id"]):
-                return {
-                    "account_id": acc_id, "label": acc["label"], "ok": False,
-                    "error": "Карта достигла лимита выводов", "tid": None,
-                }
-            if is_withdraw_limit_reached(destination, acc["id"]):
-                return {
-                    "account_id": acc_id, "label": acc["label"], "ok": False,
-                    "error": f"Дневной лимит ({DAILY_WITHDRAW_LIMIT}) достигнут", "tid": None,
-                }
-        try:
-            if acc["bank_type"] == "universalcoins":
-                result = await asyncio.to_thread(
-                    driver_withdraw, acc["bank_type"], acc["credentials"],
-                    cvu_recipient=destination, amount=amt, concept=concept,
-                )
-            else:
-                result = await asyncio.to_thread(
-                    driver_withdraw, acc["bank_type"], acc["credentials"],
-                    destination=destination, amount=amt, comments=comments,
-                )
-            increment_withdraw_count(destination, acc["id"])
-            increment_account_withdraw_count(acc["id"])
-            # Инвалидируем кэш баланса / активностей
-            _balance_cache.pop(acc["id"], None)
-            _activities_cache.pop(acc["id"], None)
-            tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
-            return {"account_id": acc_id, "label": acc["label"], "ok": True, "error": None, "tid": tid}
-        except Exception as e:
-            return {"account_id": acc_id, "label": acc["label"], "ok": False, "error": str(e), "tid": None}
+            return {"account_id": acc_id, "label": "?", "ok": False,
+                    "error": "Счёт не найден", "tid": None}
 
-    # Выполняем все выводы параллельно
+        bank_type = acc["bank_type"]
+        group_key = _group_key_for(bank_type, destination)
+
+        # Per-account lock: на одну карту — одна операция за раз.
+        # Параллелизм сохраняется между разными account_id.
+        lock = await _get_account_lock(acc["id"])
+        async with lock:
+            # Idempotency: повторный multi-withdraw на ту же сумму/направление
+            # в один бизнес-день не пройдёт второй раз.
+            idem_key = _make_idempotency_key(acc["id"], destination, amt or 0,
+                                             salt="multi")
+            created, prior = try_create_withdraw_attempt(
+                idem_key, acc["id"], destination, amt or 0, group_key=group_key,
+            )
+            if not created and prior:
+                status = prior.get("status")
+                if status == "SUCCESS":
+                    return {"account_id": acc_id, "label": acc["label"], "ok": True,
+                            "error": None, "tid": prior.get("bank_tx_id")}
+                if status in ("PENDING", "EXECUTING"):
+                    return {"account_id": acc_id, "label": acc["label"], "ok": False,
+                            "error": "Этот вывод сейчас обрабатывается", "tid": None}
+                if status == "REJECTED":
+                    return {"account_id": acc_id, "label": acc["label"], "ok": False,
+                            "error": prior.get("error_message") or "rejected_by_bank",
+                            "tid": None}
+                return {"account_id": acc_id, "label": acc["label"], "ok": False,
+                        "error": "Дубликат вывода", "tid": None}
+
+            # Атомарный резерв per-CVU
+            if try_reserve_withdraw_count(destination, acc["id"]) is None:
+                update_withdraw_attempt_status(idem_key, "REJECTED",
+                                               error_message="cvu_limit_reached")
+                return {"account_id": acc_id, "label": acc["label"], "ok": False,
+                        "error": f"Лимит {DAILY_WITHDRAW_LIMIT} на CVU достигнут",
+                        "tid": None}
+
+            # Атомарный резерв per-card-group
+            if group_key is not None:
+                if try_reserve_account_withdraw_count(acc["id"], group_key) is None:
+                    release_withdraw_count(destination, acc["id"])
+                    grp_label = "PP-внутренних" if group_key == GROUP_A else "внешних"
+                    update_withdraw_attempt_status(idem_key, "REJECTED",
+                                                   error_message=f"group_{group_key}_limit_reached")
+                    return {"account_id": acc_id, "label": acc["label"], "ok": False,
+                            "error": f"Лимит {DAILY_WITHDRAW_LIMIT} {grp_label} достигнут",
+                            "tid": None}
+
+            update_withdraw_attempt_status(idem_key, "EXECUTING")
+            try:
+                if bank_type == "universalcoins":
+                    result = await asyncio.to_thread(
+                        driver_withdraw, bank_type, acc["credentials"],
+                        cvu_recipient=destination, amount=amt, concept=concept,
+                    )
+                else:
+                    result = await asyncio.to_thread(
+                        driver_withdraw, bank_type, acc["credentials"],
+                        destination=destination, amount=amt, comments=comments,
+                    )
+                _balance_cache.pop(acc["id"], None)
+                _activities_cache.pop(acc["id"], None)
+                tid = _find_32char_hex_id(result) if isinstance(result, dict) else None
+                update_withdraw_attempt_status(idem_key, "SUCCESS", bank_tx_id=tid)
+                audit("withdraw.multi.success", request=request, user=_current_user(request),
+                      target_type="account", target_id=acc["id"],
+                      details={"destination": destination, "amount": amt,
+                               "tid": tid, "group": group_key})
+                _sse_emit(f"account:{acc['id']}", {
+                    "type": "withdraw.completed", "account_id": acc["id"], "tid": tid,
+                })
+                return {"account_id": acc_id, "label": acc["label"], "ok": True,
+                        "error": None, "tid": tid}
+            except Exception as e:
+                err_msg = str(e)
+                # Откат резервов
+                release_withdraw_count(destination, acc["id"])
+                if group_key is not None:
+                    release_account_withdraw_count(acc["id"], group_key)
+                low = err_msg.lower()
+                if any(x in low for x in ("rechazad", "rejected", "rechazo", "denied", "denegad")):
+                    update_withdraw_attempt_status(idem_key, "REJECTED",
+                                                   error_message=err_msg[:400])
+                else:
+                    update_withdraw_attempt_status(idem_key, "UNCERTAIN",
+                                                   error_message=err_msg[:400])
+                return {"account_id": acc_id, "label": acc["label"], "ok": False,
+                        "error": err_msg, "tid": None}
+
+    # Выполняем все выводы параллельно (lock внутри сериализует одинаковые account_id)
     results = list(await asyncio.gather(*[_do_one(acc_id) for acc_id in account_ids]))
     return JSONResponse({"results": results})
 
@@ -1825,66 +2490,147 @@ async def withdraw(
     if not dest:
         return RedirectResponse(url=f"/?account_id={account_id}&error=no_destination", status_code=302)
 
-    # Лимиты не применяются для внутренних переводов (PP→PP, AP→AP)
-    if not _is_limit_exempt(dest):
-        if is_account_withdraw_limit_reached(account_id):
-            return RedirectResponse(url=f"/?account_id={account_id}&error=account_limit_reached", status_code=302)
+    bank_type = acc["bank_type"]
+    group_key = _group_key_for(bank_type, dest)   # 'a' / 'b' / None (None=AP→AP exempt)
 
-        # Проверка дневного лимита
-        if is_withdraw_limit_reached(dest, account_id):
-            return RedirectResponse(url=f"/?account_id={account_id}&error=limit_reached", status_code=302)
+    # ── Сериализуем все операции на одной карте через per-account lock ─────
+    account_lock = await _get_account_lock(account_id)
+    async with account_lock:
 
-    try:
-        if acc["bank_type"] == "universalcoins":
-            doc_clean = (document or "").strip().replace("-", "").replace(" ", "")
-            if not doc_clean or len(doc_clean) < 10:
-                return RedirectResponse(url=f"/?account_id={account_id}&error=document_required", status_code=302)
-            result = await asyncio.to_thread(
-                driver_withdraw,
-                acc["bank_type"], acc["credentials"],
-                cvu_recipient=dest, amount=amt, concept=concept,
-                alias_recipient=alias.strip() or None,
-                document_recipient=doc_clean,
-                name_recipient=name.strip() or None,
-                bank_recipient=bank.strip() or None,
+        # ── Идемпотентность: один и тот же (acc, dest, amount, business_date)
+        #     не должен обрабатываться повторно при refresh-replay браузера.
+        idem_key = _make_idempotency_key(account_id, dest, amt or 0)
+        created, prior = try_create_withdraw_attempt(
+            idem_key, account_id, dest, amt or 0, group_key=group_key,
+        )
+        if not created and prior:
+            status = prior.get("status")
+            if status == "SUCCESS":
+                # Повторный submit того же вывода — отдадим прошлый чек
+                tid = prior.get("bank_tx_id")
+                if tid:
+                    return RedirectResponse(
+                        url=f"/account/{account_id}/receipt?transaction_id={tid}",
+                        status_code=302,
+                    )
+                return RedirectResponse(
+                    url=f"/?account_id={account_id}&success=1", status_code=302,
+                )
+            if status in ("PENDING", "EXECUTING"):
+                return RedirectResponse(
+                    url=f"/?account_id={account_id}&error=withdraw_in_progress",
+                    status_code=302,
+                )
+            if status == "REJECTED":
+                err_param = quote((prior.get("error_message") or "rejected_by_bank")[:200], safe="")
+                return RedirectResponse(
+                    url=f"/?account_id={account_id}&error={err_param}", status_code=302,
+                )
+            # UNCERTAIN/STUCK — даём пользователю явный сигнал
+            return RedirectResponse(
+                url=f"/?account_id={account_id}&error=duplicate_withdraw", status_code=302,
             )
-        else:
-            result = await asyncio.to_thread(
-                driver_withdraw,
-                acc["bank_type"], acc["credentials"],
-                destination=dest, amount=amt, comments=comments,
-            )
-        increment_withdraw_count(dest, account_id)
-        increment_account_withdraw_count(account_id)
-        # Инвалидируем кэш — следующий запрос баланса покажет актуальные данные
-        _balance_cache.pop(account_id, None)
-        _activities_cache.pop(account_id, None)
-    except Exception as e:
-        err_msg = str(e)
-        if any(x in err_msg.lower() for x in ("rechazad", "rejected", "rechazo", "denied", "denegad")):
-            error_param = "rejected_by_bank"
-        else:
-            error_param = quote(err_msg[:200], safe="")
-        return RedirectResponse(url=f"/?account_id={account_id}&error={error_param}", status_code=302)
 
-    tid = None
-    if acc["bank_type"] in ("personalpay", "astropay") and isinstance(result, dict):
-        tid = _find_32char_hex_id(result)
-        if not tid:
-            raw = (
-                result.get("transactionId") or result.get("id")
-                or result.get("transfer_id") or result.get("request_id")
-                or (result.get("transference") or {}).get("id")
-                or (result.get("data") or {}).get("transactionId")
-            )
-            if raw:
-                raw = str(raw).strip()
-                if "-" not in raw and len(raw) == 32 and all(c in "0123456789ABCDEFabcdef" for c in raw):
-                    tid = raw
+        # ── Per-CVU лимит: атомарный резерв (15 на CVU за день) ─────────────
+        cvu_count = try_reserve_withdraw_count(dest, account_id)
+        if cvu_count is None:
+            update_withdraw_attempt_status(idem_key, "REJECTED",
+                                           error_message="cvu_limit_reached")
+            return RedirectResponse(url=f"/?account_id={account_id}&error=limit_reached",
+                                    status_code=302)
 
-    if tid:
-        return RedirectResponse(url=f"/account/{account_id}/receipt?transaction_id={tid}", status_code=302)
-    return RedirectResponse(url=f"/?account_id={account_id}&success=1", status_code=302)
+        # ── Per-card лимит по группе (если группа применима) ────────────────
+        if group_key is not None:
+            grp_count = try_reserve_account_withdraw_count(account_id, group_key)
+            if grp_count is None:
+                # Откатываем CVU-резерв, чтобы не сжигать слот
+                release_withdraw_count(dest, account_id)
+                err = "group_a_limit_reached" if group_key == GROUP_A else "group_b_limit_reached"
+                update_withdraw_attempt_status(idem_key, "REJECTED", error_message=err)
+                return RedirectResponse(url=f"/?account_id={account_id}&error={err}",
+                                        status_code=302)
+
+        # ── Вызов банка ─────────────────────────────────────────────────────
+        update_withdraw_attempt_status(idem_key, "EXECUTING")
+        try:
+            if bank_type == "universalcoins":
+                doc_clean = (document or "").strip().replace("-", "").replace(" ", "")
+                if not doc_clean or len(doc_clean) < 10:
+                    # Откат обоих резервов
+                    release_withdraw_count(dest, account_id)
+                    if group_key is not None:
+                        release_account_withdraw_count(account_id, group_key)
+                    update_withdraw_attempt_status(idem_key, "REJECTED",
+                                                   error_message="document_required")
+                    return RedirectResponse(
+                        url=f"/?account_id={account_id}&error=document_required",
+                        status_code=302,
+                    )
+                result = await asyncio.to_thread(
+                    driver_withdraw,
+                    bank_type, acc["credentials"],
+                    cvu_recipient=dest, amount=amt, concept=concept,
+                    alias_recipient=alias.strip() or None,
+                    document_recipient=doc_clean,
+                    name_recipient=name.strip() or None,
+                    bank_recipient=bank.strip() or None,
+                )
+            else:
+                result = await asyncio.to_thread(
+                    driver_withdraw,
+                    bank_type, acc["credentials"],
+                    destination=dest, amount=amt, comments=comments,
+                )
+            # Успех — кэш баланса/истории сбрасываем
+            _balance_cache.pop(account_id, None)
+            _activities_cache.pop(account_id, None)
+        except Exception as e:
+            # ── Откат резервов: вывод не прошёл, лимит не должен быть истрачен ──
+            err_msg = str(e)
+            release_withdraw_count(dest, account_id)
+            if group_key is not None:
+                release_account_withdraw_count(account_id, group_key)
+            if any(x in err_msg.lower() for x in ("rechazad", "rejected", "rechazo", "denied", "denegad")):
+                error_param = "rejected_by_bank"
+                update_withdraw_attempt_status(idem_key, "REJECTED",
+                                               error_message="rejected_by_bank")
+            else:
+                error_param = quote(err_msg[:200], safe="")
+                # Сетевые ошибки → UNCERTAIN (не знаем прошёл ли вывод на стороне банка)
+                update_withdraw_attempt_status(idem_key, "UNCERTAIN",
+                                               error_message=err_msg[:400])
+            return RedirectResponse(url=f"/?account_id={account_id}&error={error_param}",
+                                    status_code=302)
+
+        # ── Успех: извлекаем bank_tx_id и фиксируем SUCCESS в idempotency-таблице ──
+        tid = None
+        if bank_type in ("personalpay", "astropay") and isinstance(result, dict):
+            tid = _find_32char_hex_id(result)
+            if not tid:
+                raw = (
+                    result.get("transactionId") or result.get("id")
+                    or result.get("transfer_id") or result.get("request_id")
+                    or (result.get("transference") or {}).get("id")
+                    or (result.get("data") or {}).get("transactionId")
+                )
+                if raw:
+                    raw = str(raw).strip()
+                    if "-" not in raw and len(raw) == 32 and all(c in "0123456789ABCDEFabcdef" for c in raw):
+                        tid = raw
+
+        update_withdraw_attempt_status(idem_key, "SUCCESS", bank_tx_id=tid)
+        audit("withdraw.success", request=request, user=_current_user(request),
+              target_type="account", target_id=account_id,
+              details={"destination": dest, "amount": amt, "tid": tid,
+                       "group": group_key, "concept": concept})
+        _sse_emit(f"account:{account_id}", {
+            "type": "withdraw.completed", "account_id": account_id, "tid": tid,
+        })
+
+        if tid:
+            return RedirectResponse(url=f"/account/{account_id}/receipt?transaction_id={tid}",
+                                    status_code=302)
+        return RedirectResponse(url=f"/?account_id={account_id}&success=1", status_code=302)
 
 
 # ---------------------------------------------------------------------------
@@ -1952,6 +2698,7 @@ async def add_account_page(request: Request, window: str = ""):
 
 @app.post("/add", response_class=RedirectResponse)
 async def add_account_post(
+    request: Request,
     bank_type:        str = Form(...),
     label:            str = Form(...),
     credentials_json: str = Form("{}"),
@@ -1978,6 +2725,9 @@ async def add_account_post(
     if not label.strip():
         label = f"{BANK_TYPES[bank_type]['name']} — {bank_type}"
     new_id = db_add_account(bank_type, label.strip(), credentials, window=window)
+    audit("account.created", request=request, user=_current_user(request),
+          target_type="account", target_id=new_id,
+          details={"bank_type": bank_type, "label": label.strip(), "window": window})
     return RedirectResponse(url=f"/?account_id={new_id}", status_code=302)
 
 
@@ -2003,6 +2753,7 @@ async def edit_account_page(request: Request, account_id: int):
 
 @app.post("/account/{account_id}/edit", response_class=RedirectResponse)
 async def edit_account_post(
+    request: Request,
     account_id:       int,
     label:            str = Form(...),
     credentials_json: str = Form("{}"),
@@ -2050,12 +2801,27 @@ async def edit_account_post(
         _bg_refreshing_bal.add(account_id)
         asyncio.create_task(_bg_refresh_balance(account_id))
 
+    # В audit пишем только что было обновлено — БЕЗ значений credentials
+    audit("account.updated", request=request, user=_current_user(request),
+          target_type="account", target_id=account_id,
+          details={
+              "label_changed": bool(label.strip()),
+              "credentials_changed": bool(credentials),
+              "window_changed": bool(window_custom or window),
+          })
+
     return RedirectResponse(url=f"/?account_id={account_id}&success=updated", status_code=302)
 
 
 @app.post("/account/{account_id}/delete", response_class=RedirectResponse)
-async def delete_account(account_id: int, redirect_window: Optional[str] = Form(None)):
+async def delete_account(request: Request, account_id: int,
+                         redirect_window: Optional[str] = Form(None)):
+    acc = get_account(account_id)
     db_delete_account(account_id)
+    audit("account.deleted", request=request, user=_current_user(request),
+          target_type="account", target_id=account_id,
+          details={"label": (acc or {}).get("label"),
+                   "bank_type": (acc or {}).get("bank_type")})
     if redirect_window:
         return RedirectResponse(url=f"/?window={normalize_window_slug(redirect_window)}", status_code=302)
     return RedirectResponse(url="/", status_code=302)
