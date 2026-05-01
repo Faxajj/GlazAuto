@@ -2329,10 +2329,11 @@ async def api_balances_batch(ids: str = ""):
             data["_cache_age_sec"] = int(now - cached["ts"])
             result[str(acc_id)] = data
         else:
-            # Кэша нет → запускаем фоновое прогревание (не ждём здесь)
+            # Кэша нет → запускаем фоновое прогревание для ЛЮБОГО bank_type
+            # (раньше было только PP/AP — UC-карты никогда не показывали баланс)
             if acc_id not in _bg_refreshing_bal:
                 acc = get_account(acc_id)
-                if acc and acc.get("bank_type") in ("personalpay", "astropay"):
+                if acc and acc.get("bank_type"):
                     _bg_refreshing_bal.add(acc_id)
                     asyncio.create_task(_bg_refresh_balance(acc_id))
             result[str(acc_id)] = None
