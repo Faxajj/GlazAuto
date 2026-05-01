@@ -23,6 +23,13 @@
   <div class="alert alert-error">Прокси (host:port:user) уже существует.</div>
   {% elif request.query_params.get('success') == 'added' %}
   <div class="alert alert-success">✅ Прокси добавлен.</div>
+  {% elif request.query_params.get('success') == 'bulk' %}
+  <div class="alert alert-success">
+    📥 Bulk-импорт:
+    <strong>добавлено: {{ request.query_params.get('added', 0) }}</strong>,
+    дубликатов: {{ request.query_params.get('skipped', 0) }},
+    невалидных строк: {{ request.query_params.get('invalid', 0) }}.
+  </div>
   {% elif request.query_params.get('success') == 'deleted' %}
   <div class="alert alert-success">🗑 Прокси удалён.</div>
   {% elif request.query_params.get('success') == 'checked' %}
@@ -102,9 +109,57 @@
   <p style="color:#64748b">Прокси-пул пуст. Добавьте первый ниже.</p>
   {% endif %}
 
-  {# ── Добавление нового прокси ──────────────────────────────────── #}
-  <details {% if not proxies %}open{% endif %} style="margin-top:1.5rem">
-    <summary style="cursor:pointer;font-weight:600;color:#e2e8f0;padding:0.5rem 0">+ Добавить прокси</summary>
+  {# ── BULK-добавление: вставь много прокси одной кучей ─────────── #}
+  <details open style="margin-top:1.5rem">
+    <summary style="cursor:pointer;font-weight:600;color:#e2e8f0;padding:0.5rem 0">
+      📋 Массовое добавление (bulk paste)
+    </summary>
+    <form method="post" action="/admin/proxies/add-bulk" class="form" style="margin-top:1rem">
+      {{ csrf_input(request) }}
+      <div class="form-row">
+        <label for="bulk-list">Список прокси (по одному на строке)</label>
+        <textarea id="bulk-list" name="bulk_list" rows="10" class="textarea-json" required
+          placeholder="193.200.61.28:63517:smY9hX1m:6vrTNk8q
+135.106.40.29:63137:user2:pass2
+1.2.3.4:1080
+socks5h://user:pass@5.6.7.8:9999"></textarea>
+        <p class="form-hint">
+          Поддерживаемые форматы (на строку):<br>
+          • <code>host:port:user:pass</code> — стандартный<br>
+          • <code>host:port</code> — без авторизации<br>
+          • <code>socks5h://user:pass@host:port</code> — полный URL<br>
+          • <code>http://host:port</code> — HTTP-прокси<br>
+          Пустые строки и комментарии (#) игнорируются.
+        </p>
+      </div>
+      <div class="form-row" style="display:flex;gap:0.5rem">
+        <div style="flex:0 0 160px">
+          <label for="bulk-type">Тип по умолчанию</label>
+          <select id="bulk-type" name="default_type" style="width:100%">
+            <option value="socks5h" selected>SOCKS5h</option>
+            <option value="socks5">SOCKS5</option>
+            <option value="http">HTTP</option>
+            <option value="https">HTTPS</option>
+          </select>
+          <p class="form-hint" style="font-size:0.75rem;margin-top:0.25rem">Используется если в строке нет схемы</p>
+        </div>
+        <div style="flex:0 0 120px">
+          <label for="bulk-region">Регион (для всех)</label>
+          <input id="bulk-region" name="region" type="text" placeholder="AR" maxlength="8" />
+        </div>
+        <div style="flex:1">
+          <label for="bulk-label-prefix">Label-префикс (опционально)</label>
+          <input id="bulk-label-prefix" name="label_prefix" type="text" placeholder="AR-" />
+          <p class="form-hint" style="font-size:0.75rem;margin-top:0.25rem">К каждому добавится номер: AR-1, AR-2...</p>
+        </div>
+      </div>
+      <button type="submit" class="btn-primary-lg" style="margin-top:0.75rem">📥 Импортировать список</button>
+    </form>
+  </details>
+
+  {# ── Одиночное добавление (классическая форма) ──────────────────── #}
+  <details style="margin-top:1.5rem">
+    <summary style="cursor:pointer;font-weight:600;color:#94a3b8;padding:0.5rem 0">+ Добавить одну прокси (форма)</summary>
     <form method="post" action="/admin/proxies/add" class="form" style="margin-top:1rem">
       {{ csrf_input(request) }}
       <div class="form-row" style="display:flex;gap:0.5rem;align-items:end">
