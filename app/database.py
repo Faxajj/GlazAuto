@@ -296,6 +296,27 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_audit_log_action_ts ON audit_log(action, ts DESC);
         CREATE INDEX IF NOT EXISTS idx_audit_log_target ON audit_log(target_type, target_id, ts DESC);
         CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id, ts DESC);
+        CREATE TABLE IF NOT EXISTS proxies (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            label           TEXT,
+            type            TEXT NOT NULL DEFAULT 'socks5h',
+            host            TEXT NOT NULL,
+            port            INTEGER NOT NULL,
+            username        TEXT,
+            password        TEXT,
+            region          TEXT,
+            status          TEXT NOT NULL DEFAULT 'unknown',
+            last_check_ts   INTEGER NOT NULL DEFAULT 0,
+            last_latency_ms INTEGER,
+            last_error      TEXT,
+            fail_count      INTEGER NOT NULL DEFAULT 0,
+            enabled         INTEGER NOT NULL DEFAULT 1,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            UNIQUE(host, port, username)
+        );
+        CREATE INDEX IF NOT EXISTS idx_proxies_status_enabled
+            ON proxies(status, enabled);
         """)
         conn.commit()
         _run_migrations(conn)
@@ -425,11 +446,13 @@ def _row_to_account(r: sqlite3.Row) -> dict:
 
 
 def list_accounts() -> List[dict]:
+    """Список всех аккаунтов. Порядок: window ASC, created_at ASC (старые
+    сверху, новые снизу — UI требование «новые добавляются в конец списка»)."""
     with _get_conn() as conn:
         rows = conn.execute(
             "SELECT id, bank_type, label, credentials, created_at, "
             "COALESCE(window, 'glazars') AS window "
-            "FROM accounts ORDER BY window, created_at DESC"
+            "FROM accounts ORDER BY window, created_at ASC, id ASC"
         ).fetchall()
     return [_row_to_account(r) for r in rows]
 
@@ -1169,3 +1192,139 @@ def get_rate_history(hours: int = 24) -> list:
             (since,),
         ).fetchall()
     return [{"ts": r["ts"], "b": r["buy_avg"], "s": r["sell_avg"]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Proxy management — каталог, health-check, статус
+# ---------------------------------------------------------------------------
+
+def list_proxies(only_enabled: bool = False, only_healthy: bool = False) -> List[dict]:
+    sql = "SELECT id, label, type, host, port, username, password, region, status, " \
+          "last_check_ts, last_latency_ms, last_error, fail_count, enabled, " \
+          "created_at, updated_at FROM proxies"
+    where = []
+    if only_enabled:
+        where.append("enabled = 1")
+    if only_healthy:
+        where.append("status = 'ok'")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY status DESC, label, id"
+    try:
+        with _get_conn() as conn:
+            rows = conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_proxy(proxy_id: int) -> Optional[dict]:
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT id, label, type, host, port, username, password, region, status, "
+                "last_check_ts, last_latency_ms, last_error, fail_count, enabled, "
+                "created_at, updated_at FROM proxies WHERE id = ?",
+                (proxy_id,),
+            ).fetchone()
+        return dict(row) if row else None
+    except sqlite3.OperationalError:
+        return None
+
+
+def add_proxy(
+    type: str, host: str, port: int,
+    username: Optional[str] = None, password: Optional[str] = None,
+    label: Optional[str] = None, region: Optional[str] = None,
+    enabled: bool = True,
+) -> Optional[int]:
+    now = int(time.time())
+    try:
+        with _get_conn() as conn:
+            cur = conn.execute(
+                "INSERT INTO proxies (label, type, host, port, username, password, "
+                "region, status, enabled, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?, ?)",
+                (label, type, host.strip(), int(port),
+                 username or None, password or None,
+                 region, 1 if enabled else 0, now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+    except sqlite3.IntegrityError:
+        return None
+    except sqlite3.OperationalError:
+        return None
+
+
+def update_proxy(
+    proxy_id: int,
+    type: Optional[str] = None,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    label: Optional[str] = None,
+    region: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> bool:
+    fields, params = [], []
+    if type is not None:     fields.append("type = ?");     params.append(type)
+    if host is not None:     fields.append("host = ?");     params.append(host.strip())
+    if port is not None:     fields.append("port = ?");     params.append(int(port))
+    if username is not None: fields.append("username = ?"); params.append(username or None)
+    if password is not None: fields.append("password = ?"); params.append(password or None)
+    if label is not None:    fields.append("label = ?");    params.append(label)
+    if region is not None:   fields.append("region = ?");   params.append(region)
+    if enabled is not None:  fields.append("enabled = ?");  params.append(1 if enabled else 0)
+    if not fields:
+        return False
+    fields.append("updated_at = ?")
+    params.append(int(time.time()))
+    params.append(proxy_id)
+    try:
+        with _get_conn() as conn:
+            cur = conn.execute(f"UPDATE proxies SET {', '.join(fields)} WHERE id = ?", tuple(params))
+            conn.commit()
+        return cur.rowcount > 0
+    except sqlite3.OperationalError:
+        return False
+
+
+def delete_proxy(proxy_id: int) -> bool:
+    try:
+        with _get_conn() as conn:
+            cur = conn.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+            conn.commit()
+        return cur.rowcount > 0
+    except sqlite3.OperationalError:
+        return False
+
+
+def mark_proxy_status(
+    proxy_id: int,
+    status: str,                   # 'ok' / 'fail'
+    latency_ms: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Обновляет результат health-check. На 'fail' инкрементит fail_count, на 'ok' сбрасывает."""
+    now = int(time.time())
+    try:
+        with _get_conn() as conn:
+            if status == "ok":
+                conn.execute(
+                    "UPDATE proxies SET status='ok', last_check_ts=?, "
+                    "last_latency_ms=?, last_error=NULL, fail_count=0, updated_at=? "
+                    "WHERE id=?",
+                    (now, latency_ms, now, proxy_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE proxies SET status=?, last_check_ts=?, "
+                    "last_latency_ms=?, last_error=?, fail_count=fail_count+1, "
+                    "updated_at=? WHERE id=?",
+                    (status, now, latency_ms, (error or "")[:300], now, proxy_id),
+                )
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass

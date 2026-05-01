@@ -86,7 +86,20 @@ from app.drivers.personalpay import (
     _DEFAULT_PIN_HASH as PP_DEFAULT_PIN_HASH,
 )
 from app.audit import audit
-from app.database import cleanup_audit_log
+from app.database import (
+    cleanup_audit_log,
+    list_proxies as db_list_proxies,
+    get_proxy as db_get_proxy,
+    add_proxy as db_add_proxy,
+    update_proxy as db_update_proxy,
+    delete_proxy as db_delete_proxy,
+    mark_proxy_status as db_mark_proxy_status,
+)
+from app.proxies import (
+    proxy_url as build_proxy_url,
+    health_check_one as proxy_health_check_one,
+    HEALTH_CHECK_INTERVAL as PROXY_HEALTH_INTERVAL,
+)
 
 # ---------------------------------------------------------------------------
 # Конфигурация
@@ -135,6 +148,29 @@ init_db()
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 templates.env.filters["ars"]    = lambda value, decimals=2: _format_ars(value, decimals)
+
+
+def _timeago(unix_ts) -> str:
+    """Человекочитаемое «N сек/мин/ч/дн назад» для unix-таймштампа."""
+    try:
+        ts = int(unix_ts)
+    except (TypeError, ValueError):
+        return "—"
+    if ts <= 0:
+        return "—"
+    delta = int(time.time()) - ts
+    if delta < 0:
+        return "в будущем"
+    if delta < 60:
+        return f"{delta} сек назад"
+    if delta < 3600:
+        return f"{delta // 60} мин назад"
+    if delta < 86400:
+        return f"{delta // 3600} ч назад"
+    return f"{delta // 86400} дн назад"
+
+
+templates.env.filters["timeago"] = _timeago
 
 
 # ---------------------------------------------------------------------------
@@ -361,34 +397,38 @@ def _clear_login_attempts(ip: str) -> None:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# CVU-группировка (per-card лимиты)
+# CVU-группировка (per-card лимиты) — LIMIT BYPASS RULES
 # ---------------------------------------------------------------------------
-# Group A — destinations начинающиеся на 00000765 (PP-internal)
-#           имеют отдельный лимит 15/день, независимый от Group B.
-# Group B — все остальные направления (внешние переводы), лимит 15/день.
-# AstroPay-internal (00001775*) — НЕ ограничены лимитом (карта AP→AP бесплатно).
+# EXEMPT (None) — destinations НЕ ограничены лимитом 15/день, можно выводить
+#                 неограниченно даже после исчерпания дневного счётчика:
+#   00000765* — PP-internal (PP→PP)
+#   00001775* — AP-internal (AP→AP)
 #
-# Таким образом одна PP-карта может за день: 15 PP-internal + 15 внешних = 30 total.
-# Одна AP-карта: 15 внешних + сколько угодно AP-internal.
+# Group B (b)   — все остальные направления (внешние переводы), 15/день.
+#
+# Group A (a)   — оставлен в БД для обратной совместимости (count_a колонка),
+#                 но новый код в группу A никого не помещает. Старые данные
+#                 (если были) продолжают читаться через get_account_withdraw_count.
+#
+# Поведение: после 15 внешних выводов карта продолжает работать на 00000765/00001775
+# адреса без блокировки. Это "limit bypass" функционал.
 # ---------------------------------------------------------------------------
 
-PP_INTERNAL_PREFIX = "00000765"   # Group A trigger
-AP_INTERNAL_PREFIX = "00001775"   # Exempt (no limit)
+PP_INTERNAL_PREFIX = "00000765"   # PP→PP — exempt
+AP_INTERNAL_PREFIX = "00001775"   # AP→AP — exempt
 
 
 def _group_key_for(bank_type: str, destination: str) -> Optional[str]:
-    """Определяет группу лимита для пары (карта-источник, направление).
-    Возвращает 'a' / 'b' / None.
-    None означает «лимит не применяется» (AP→AP).
+    """Определяет группу лимита для пары (банк-источник, направление).
+    Returns:
+        None  — exempt (нет лимита). Для PP-internal и AP-internal направлений.
+        'b'   — Group B (стандартный 15-лимит/день/карта).
     """
     dest = (destination or "").strip()
-    if bank_type == "personalpay":
-        return GROUP_A if dest.startswith(PP_INTERNAL_PREFIX) else GROUP_B
-    if bank_type == "astropay":
-        if dest.startswith(AP_INTERNAL_PREFIX):
-            return None     # AP→AP exempt — сохраняем существующее поведение
-        return GROUP_B
-    # universalcoins и любые другие — внешние, Group B
+    # Bypass: PP-internal и AP-internal — без лимитов
+    if dest.startswith(PP_INTERNAL_PREFIX) or dest.startswith(AP_INTERNAL_PREFIX):
+        return None
+    # Все остальные — стандартный лимит Group B
     return GROUP_B
 
 
@@ -425,6 +465,37 @@ async def _get_account_lock(account_id: int) -> asyncio.Lock:
             lock = asyncio.Lock()
             _account_locks[account_id] = lock
         return lock
+
+
+def _pick_least_loaded_healthy_proxy() -> Optional[dict]:
+    """Auto-assignment: возвращает healthy proxy с минимальной текущей нагрузкой.
+    Считаем «нагрузку» = количество аккаунтов где этот proxy URL уже прописан в creds.
+    Возвращает dict-строку proxies или None если нет healthy."""
+    try:
+        pool = db_list_proxies(only_enabled=True, only_healthy=True)
+        if not pool:
+            return None
+        # Считаем сколько аккаунтов используют каждый прокси
+        all_accs = list_accounts()
+        usage: dict = {}   # proxy_url → count
+        for acc in all_accs:
+            cr = acc.get("credentials") or {}
+            url = (cr.get("proxy") or cr.get("https_proxy") or cr.get("http_proxy") or "").strip()
+            if url:
+                usage[url] = usage.get(url, 0) + 1
+        # Сортируем pool по: latency ASC, usage ASC, fail_count ASC
+        def _score(p):
+            url = build_proxy_url(p)
+            return (
+                usage.get(url, 0),                       # меньше нагрузка = выше
+                int(p.get("last_latency_ms") or 99999),  # быстрее = выше
+                int(p.get("fail_count") or 0),
+            )
+        pool.sort(key=_score)
+        return pool[0]
+    except Exception as e:
+        logger.debug("_pick_least_loaded_healthy_proxy error: %s", e)
+        return None
 
 
 
@@ -469,25 +540,55 @@ def _parse_amount(raw: str) -> Optional[float]:
         return None
 
 
-def _jwt_expiry(credentials: dict) -> Tuple[bool, Optional[float]]:
+def _jwt_expiry(credentials: dict, account_id: Optional[int] = None) -> Tuple[bool, Optional[float]]:
+    """Возвращает (token_expired, hours_left).
+
+    Учитывает ДВА источника:
+    1) JWT payload exp — embedded в токене
+    2) accounts_state.last_keepalive_at — успешный PIN refresh продлевает
+       серверную сессию на ~12 часов даже без выдачи нового JWT.
+
+    Если PIN refresh был недавно (< 12h), считаем сессию активной независимо
+    от JWT exp — потому что HAR показал, что PP не выдаёт новый JWT в response.
+    """
     token = (credentials.get("auth_token") or "").strip()
     if token.upper().startswith("BEARER "):
         token = token[7:].strip()
-    if not token or not token.startswith("eyJ"):
+
+    # JWT exp
+    jwt_hours_left: Optional[float] = None
+    if token and token.startswith("eyJ"):
+        parts = token.split(".")
+        if len(parts) >= 2:
+            try:
+                pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                payload = json.loads(base64.urlsafe_b64decode(pad))
+                exp = payload.get("exp")
+                if exp:
+                    jwt_hours_left = max(0.0, (float(exp) - time.time()) / 3600.0)
+            except Exception:
+                pass
+
+    # accounts_state — серверная сессия после PIN refresh жива ~12 часов
+    server_session_hours_left: Optional[float] = None
+    if account_id is not None:
+        try:
+            state = get_account_state(account_id)
+            last_ka = int(state.get("last_keepalive_at") or 0)
+            if last_ka > 0:
+                age_hours = (time.time() - last_ka) / 3600.0
+                # Серверная сессия после успешного PIN refresh держится ~12 часов
+                server_session_hours_left = max(0.0, 12.0 - age_hours)
+        except Exception:
+            pass
+
+    # Эффективное оставшееся время = max из двух источников
+    candidates = [v for v in (jwt_hours_left, server_session_hours_left) if v is not None]
+    if not candidates:
         return False, None
-    parts = token.split(".")
-    if len(parts) < 2:
-        return False, None
-    try:
-        pad = parts[1] + "=" * (4 - len(parts[1]) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(pad))
-    except Exception:
-        return False, None
-    exp = payload.get("exp")
-    if not exp:
-        return False, None
-    now = time.time()
-    return (now >= exp), max(0.0, (exp - now) / 3600.0)
+    effective_hours_left = max(candidates)
+    expired = effective_hours_left <= 0
+    return expired, effective_hours_left
 
 
 def _normalize_balance(balance_info: dict, bank_type: str) -> dict:
@@ -1024,10 +1125,12 @@ _activities_cache: dict = {}   # {account_id: {"acts": list, "ts": float}}
 _bg_refreshing_bal: set = set()  # id аккаунтов с активным фоновым обновлением баланса
 _bg_refreshing_act: set = set()  # id аккаунтов с активным фоновым обновлением активностей
 
-_BALANCE_TTL    = 25    # сек — кэш «свежий», не обновлять
-_BALANCE_STALE  = 300   # сек — кэш «устаревший», обновить в фоне
+_BALANCE_TTL    = 25      # сек — кэш «свежий», не обновлять
+_BALANCE_STALE  = 1800    # сек (30 мин) — кэш «устаревший», но ещё годный для отдачи
+                          # Большое окно нужно потому что при падающем банке нет
+                          # альтернативы — лучше показать 5-минутный кэш чем «Ошибка»
 _ACTIVITIES_TTL   = 60
-_ACTIVITIES_STALE = 600
+_ACTIVITIES_STALE = 1800  # 30 мин — та же логика для истории
 
 
 async def _fetch_and_cache_balance(account_id: int, acc: dict) -> dict:
@@ -1381,35 +1484,35 @@ async def _pp_keepalive_loop():
 
                 try:
                     new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
-                    # Персистим last_keepalive_at в БД (атрибут пытались)
-                    update_account_state(acc_id, last_keepalive_at=int(now))
-                    if new_token and new_token != token:
-                        # Получен НОВЫЙ JWT — сохраняем в БД
-                        # Перечитываем свежие credentials из БД перед записью:
-                        # если пользователь обновил токен вручную пока мы делали refresh,
-                        # берём его credentials как базу (не перезаписываем прокси и другие поля)
-                        fresh_acc = get_account(acc_id)
-                        if fresh_acc:
-                            fresh_creds = dict(fresh_acc.get("credentials") or creds)
-                            fresh_creds["auth_token"] = new_token
-                            db_update_account(acc_id, credentials=fresh_creds)
-                            _balance_cache.pop(acc_id, None)
-                            update_account_state(acc_id, last_token_state="REFRESHED",
-                                                 fail_count_reset=True)
-                            audit("token.keepalive_refreshed",
-                                  target_type="account", target_id=acc_id,
-                                  details={"source": "background_keepalive"})
-                            _sse_emit(f"account:{acc_id}", {
-                                "type": "token.refreshed", "account_id": acc_id,
-                            })
-                            logger.info("pp keepalive ok acc=%d: новый JWT сохранён", acc_id)
-                    elif new_token == token:
-                        # PP подтвердил сессию, но вернул тот же JWT (нет нового токена)
-                        # НЕ пишем в БД: если пользователь вручную обновил токен пока
-                        # мы делали keepalive — перезапись старым JWT сотрёт свежий токен
-                        update_account_state(acc_id, last_token_state="ALIVE",
-                                             fail_count_reset=True)
-                        logger.info("pp keepalive ok acc=%d: сессия жива, новый JWT не получен", acc_id)
+                    # HAR показал: PP в pin/validate ответе НЕ выдаёт новый JWT.
+                    # Успех = серверная сессия продлена, существующий JWT валиден.
+                    # Записываем last_keepalive_at — UI использует его чтобы показать
+                    # «Сессия активна» вместо «0 минут» (даже если JWT exp в прошлом).
+                    if new_token:
+                        update_account_state(
+                            acc_id,
+                            last_keepalive_at=int(now),
+                            last_token_state="ALIVE",
+                            fail_count_reset=True,
+                        )
+                        _balance_cache.pop(acc_id, None)
+                        # Если PP внезапно выдал ДРУГОЙ JWT — сохраним с CAS
+                        if new_token != token:
+                            fresh_acc = get_account(acc_id)
+                            if fresh_acc:
+                                stored = (fresh_acc.get("credentials") or {}).get("auth_token", "")
+                                if stored == token:
+                                    fresh_creds = dict(fresh_acc.get("credentials") or creds)
+                                    fresh_creds["auth_token"] = new_token
+                                    db_update_account(acc_id, credentials=fresh_creds)
+                        audit("token.keepalive_refreshed",
+                              target_type="account", target_id=acc_id,
+                              details={"source": "background_keepalive",
+                                       "new_jwt": new_token != token})
+                        _sse_emit(f"account:{acc_id}", {
+                            "type": "token.refreshed", "account_id": acc_id,
+                        })
+                        logger.info("pp keepalive ok acc=%d: серверная сессия продлена", acc_id)
                     else:
                         update_account_state(acc_id, fail_count_inc=True,
                                              last_error="no_token_returned")
@@ -1464,6 +1567,148 @@ async def _audit_log_cleanup_loop():
         except Exception as e:
             logger.warning("audit_log cleanup error: %s", e)
         await asyncio.sleep(24 * 3600)
+
+
+# ---------------------------------------------------------------------------
+# Proxy health checker — каждые 90 сек тестирует все enabled прокси
+# ---------------------------------------------------------------------------
+# Real-connection check: HTTP HEAD к https://mapi.astropaycard.com через прокси.
+# Любой response code < 600 = прокси жив. Timeout/ProxyError = прокси мёртв.
+# После 3 fail'ов подряд → auto-disable (enabled=0). Можно re-enable вручную.
+
+async def _proxy_health_check_loop():
+    """Background: проверяет живость всех enabled прокси."""
+    await asyncio.sleep(180)   # warm-up: даём системе подняться
+    while True:
+        try:
+            proxies = db_list_proxies(only_enabled=True)
+            if proxies:
+                logger.info("proxy health-check: testing %d proxies", len(proxies))
+                # Обходим в потоках чтобы один медленный не блокировал остальных
+                async def _check_and_mark(p):
+                    status, latency, err = await asyncio.to_thread(
+                        proxy_health_check_one, p,
+                    )
+                    db_mark_proxy_status(p["id"], status, latency, err)
+                    if status == "fail":
+                        # auto-disable если fail_count после инкремента >= 3
+                        fresh = db_get_proxy(p["id"])
+                        if fresh and fresh.get("fail_count", 0) >= 3:
+                            db_update_proxy(p["id"], enabled=False)
+                            logger.warning("proxy %d (%s:%d) auto-disabled after 3 fails",
+                                           p["id"], p["host"], p["port"])
+                # Параллельно по 5 прокси за раз чтобы не перегрузить
+                semaphore = asyncio.Semaphore(5)
+                async def _with_sem(p):
+                    async with semaphore:
+                        await _check_and_mark(p)
+                await asyncio.gather(*[_with_sem(p) for p in proxies], return_exceptions=True)
+        except Exception as e:
+            logger.warning("proxy health-check loop error: %s", e)
+        await asyncio.sleep(PROXY_HEALTH_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Auto-withdraw scheduler — фоновое выполнение правил БЕЗ ручного триггера
+# ---------------------------------------------------------------------------
+# Каждые 60 сек обходит все is_active правила и выполняет ОДИН chunk если:
+#   - правило ещё активно (paid < total_limit)
+#   - кэшированный баланс достаточен (>= chunk + min_balance)
+#   - per-CVU лимит не достигнут
+#   - per-card лимит не достигнут (если group_key применим)
+#
+# Защита от штормов: между чанками одного правила минимум 30 сек
+# (даже если бы scheduler запустился раньше). Отказы записываются в
+# rule.last_error, повторные попытки — на следующей итерации.
+#
+# Survives restart: вся state в БД (auto_withdraw_rules, withdraw_attempts).
+# На рестарт scheduler стартует с нуля и продолжает с paid_amount из БД.
+
+_AUTO_SCHEDULER_INTERVAL    = 60     # сек между прохождениями всего списка
+_AUTO_MIN_INTERVAL_PER_RULE = 30     # сек между чанками одного правила
+
+
+async def _auto_withdraw_scheduler_loop():
+    """Каждые 60 сек: для каждого активного правила — проверка условий +
+    выполнение одного chunk если все условия выполнены."""
+    # Прогрев: даём 2 минуты на инициализацию balance cache
+    await asyncio.sleep(120)
+    last_chunk_at: dict = {}     # {rule_id: unix_ts последнего chunk}
+
+    while True:
+        try:
+            rules = list_auto_withdraw_rules()
+            now_ts = time.time()
+            for rule in rules:
+                if not rule.get("is_active"):
+                    continue
+                rule_id = int(rule["id"])
+
+                # Throttle на rule
+                last = last_chunk_at.get(rule_id, 0)
+                if now_ts - last < _AUTO_MIN_INTERVAL_PER_RULE:
+                    continue
+
+                acc_id = int(rule["account_id"])
+                acc = get_account(acc_id)
+                if not acc:
+                    continue
+
+                # Завершено? — сбросить is_active и пропустить
+                paid  = float(rule.get("paid_amount", 0))
+                total = float(rule.get("total_limit", 0))
+                if total > 0 and paid >= total:
+                    update_auto_withdraw_progress(rule_id, is_active=False)
+                    continue
+
+                chunk = float(rule.get("chunk_amount", 0))
+                if chunk <= 0:
+                    continue
+
+                # Проверка баланса — берём из кэша (быстро, без HTTP)
+                cached = _balance_cache.get(acc_id)
+                if not cached:
+                    # Кэш ещё не прогрет — попросим прогрев и пропустим итерацию
+                    if acc_id not in _bg_refreshing_bal:
+                        _bg_refreshing_bal.add(acc_id)
+                        asyncio.create_task(_bg_refresh_balance(acc_id))
+                    continue
+                balance = float(cached["data"].get("balance") or 0)
+                min_balance = float(rule.get("min_balance") or 0)
+                if balance < (chunk + min_balance):
+                    continue   # ждём пополнения
+
+                # Pre-check лимитов (быстро, без блокировок)
+                cvu = rule.get("cvu", "")
+                if is_withdraw_limit_reached(cvu, acc_id):
+                    continue
+                group_key = _group_key_for(acc["bank_type"], cvu)
+                if group_key is not None and is_account_withdraw_limit_reached(acc_id, group_key):
+                    continue   # карта в лимите внешних → ждём 07:30 МСК
+
+                # Поехали — забираем lock и выполняем chunk
+                last_chunk_at[rule_id] = now_ts
+                lock = await _get_account_lock(acc_id)
+                async with lock:
+                    try:
+                        ok, msg = await asyncio.to_thread(_run_auto_withdraw_rule, acc, rule)
+                        if ok:
+                            logger.info("auto-scheduler: rule=%d acc=%d chunk=%.2f → OK",
+                                        rule_id, acc_id, chunk)
+                            _sse_emit(f"account:{acc_id}", {
+                                "type": "auto_withdraw.executed",
+                                "account_id": acc_id, "rule_id": rule_id,
+                                "amount": chunk,
+                            })
+                        else:
+                            logger.info("auto-scheduler: rule=%d acc=%d → skip: %s",
+                                        rule_id, acc_id, msg)
+                    except Exception as e:
+                        logger.warning("auto-scheduler: rule=%d exception: %s", rule_id, e)
+        except Exception as e:
+            logger.warning("auto-scheduler loop error: %s", e)
+
+        await asyncio.sleep(_AUTO_SCHEDULER_INTERVAL)
 
 
 # ---------------------------------------------------------------------------
@@ -1674,6 +1919,8 @@ async def startup_event():
     asyncio.create_task(_withdraw_attempts_cleanup_loop())
     asyncio.create_task(_audit_log_cleanup_loop())
     asyncio.create_task(_reconcile_uncertain_loop())
+    asyncio.create_task(_auto_withdraw_scheduler_loop())
+    asyncio.create_task(_proxy_health_check_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -1747,7 +1994,7 @@ def _run_auto_withdraw_rule(acc: dict, rule: dict) -> Tuple[bool, str]:
     if group_key is not None:
         if try_reserve_account_withdraw_count(acc["id"], group_key) is None:
             release_withdraw_count(cvu, acc["id"])
-            grp_label = "PP-внутренних" if group_key == GROUP_A else "внешних"
+            grp_label = "внешних"
             msg = f"Лимит карты ({DAILY_WITHDRAW_LIMIT} {grp_label}) достигнут"
             update_withdraw_attempt_status(idem_key, "REJECTED", error_message=msg)
             update_auto_withdraw_progress(rule["id"], last_error=msg)
@@ -1898,7 +2145,9 @@ async def _index_impl(request: Request, account_id: Optional[int], window: Optio
     token_expires_in_hours = None
     if selected and selected.get("credentials", {}).get("auth_token"):
         try:
-            token_expired, token_expires_in_hours = _jwt_expiry(selected["credentials"])
+            token_expired, token_expires_in_hours = _jwt_expiry(
+                selected["credentials"], account_id=selected.get("id"),
+            )
         except Exception:
             pass
 
@@ -2066,33 +2315,28 @@ async def api_pin_refresh(request: Request, account_id: int):
         old_token = creds.get("auth_token", "")
         new_token = await asyncio.to_thread(refresh_session_with_pin, creds)
         if new_token:
-            # Сохраняем только если получили НОВЫЙ JWT (не тот же старый как fallback)
+            # Согласно HAR: PP не выдаёт новый JWT — pin/validate просто продлевает
+            # серверную сессию. Поэтому success = "сессия активна на ближайшие ~12ч".
             if new_token != old_token:
                 new_creds = dict(creds)
                 new_creds["auth_token"] = new_token
                 db_update_account(account_id, credentials=new_creds)
-            # В любом случае сбрасываем кэш и прогреваем с актуальными credentials
             _balance_cache.pop(account_id, None)
             _activities_cache.pop(account_id, None)
+            # Записываем last_keepalive_at чтобы UI показывал «Сессия активна»
+            update_account_state(account_id, last_keepalive_at=int(time.time()),
+                                 last_token_state="ALIVE", fail_count_reset=True)
             if account_id not in _bg_refreshing_bal:
                 _bg_refreshing_bal.add(account_id)
                 asyncio.create_task(_bg_refresh_balance(account_id))
-            # Проверяем свежесть токена по JWT exp
-            check_token = new_token if new_token != old_token else old_token
-            new_exp    = _pp_jwt_exp(check_token)
-            is_fresh   = bool(new_exp and new_exp > time.time() + 60)
-            hours_left = round((new_exp - time.time()) / 3600, 1) if new_exp else None
-            if is_fresh and hours_left:
-                msg = f"Сессия продлена ✓  Токен действует ещё {hours_left} ч."
-            elif is_fresh:
-                msg = "Сессия продлена через PIN ✓"
-            else:
-                msg = "PIN принят, но новый токен не получен. Обновите auth_token вручную."
             audit("token.pin_refresh", request=request, user=_current_user(request),
                   target_type="account", target_id=account_id,
-                  details={"got_new_jwt": new_token != old_token,
-                           "hours_left": hours_left, "is_fresh": is_fresh})
-            return JSONResponse({"ok": is_fresh, "message": msg})
+                  details={"got_new_jwt": new_token != old_token})
+            _sse_emit(f"account:{account_id}", {
+                "type": "token.refreshed", "account_id": account_id,
+            })
+            msg = "Сессия продлена через PIN ✓ Серверная сессия активна на ~12 часов."
+            return JSONResponse({"ok": True, "message": msg})
         return JSONResponse({
             "ok": False,
             "message": "PIN не принят — ответ от сервера пустой. Обновите auth_token вручную."
@@ -2407,7 +2651,7 @@ async def multi_withdraw(request: Request):
             if group_key is not None:
                 if try_reserve_account_withdraw_count(acc["id"], group_key) is None:
                     release_withdraw_count(destination, acc["id"])
-                    grp_label = "PP-внутренних" if group_key == GROUP_A else "внешних"
+                    grp_label = "внешних"
                     update_withdraw_attempt_status(idem_key, "REJECTED",
                                                    error_message=f"group_{group_key}_limit_reached")
                     return {"account_id": acc_id, "label": acc["label"], "ok": False,
@@ -2719,6 +2963,12 @@ async def add_account_post(
         return RedirectResponse(url="/add?error=invalid_json", status_code=302)
     if bank_type in ("personalpay", "astropay"):
         proxy_url = _proxy_from_parts(proxy_host, proxy_port, proxy_user, proxy_password, proxy_type, proxy_raw)
+        # AUTO-ASSIGNMENT: если в форме прокси не указан — берём healthy из пула
+        if not proxy_url:
+            try:
+                proxy_url = build_proxy_url(_pick_least_loaded_healthy_proxy() or {}) or ""
+            except Exception:
+                proxy_url = ""
         credentials = _apply_proxy_to_credentials(proxy_url, credentials)
     if bank_type == "personalpay" and not credentials.get("pin_hash"):
         credentials["pin_hash"] = PP_DEFAULT_PIN_HASH
@@ -2727,7 +2977,8 @@ async def add_account_post(
     new_id = db_add_account(bank_type, label.strip(), credentials, window=window)
     audit("account.created", request=request, user=_current_user(request),
           target_type="account", target_id=new_id,
-          details={"bank_type": bank_type, "label": label.strip(), "window": window})
+          details={"bank_type": bank_type, "label": label.strip(), "window": window,
+                   "proxy_assigned": bool(proxy_url) if bank_type in ("personalpay","astropay") else None})
     return RedirectResponse(url=f"/?account_id={new_id}", status_code=302)
 
 
@@ -2944,6 +3195,143 @@ async def discover(account_id: int, destination: str = ""):
 # ---------------------------------------------------------------------------
 # Управление кабинетами (Windows) через интерфейс
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Admin: Migration — массовое перемещение аккаунтов между кабинетами
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/migrate", response_class=HTMLResponse)
+async def migrate_page(request: Request):
+    """Страница массового переноса аккаунтов между кабинетами."""
+    return templates.TemplateResponse("migrate.html", {
+        "request":      request,
+        "accounts":     list_accounts(),
+        "groups":       accounts_by_window(),
+        "window_list":  get_window_list(),
+        "current_user": _current_user(request),
+        "selected":     None,
+        "account_id":   None,
+        "window_slug":  None,
+    })
+
+
+@app.post("/admin/migrate/move", response_class=RedirectResponse)
+async def migrate_move(
+    request: Request,
+    target_window: str = Form(...),
+    account_ids:   list[str] = Form(default=[]),
+):
+    """Перенести выбранные account_ids в target_window."""
+    target = normalize_window_slug(target_window)
+    if not target:
+        return RedirectResponse(url="/admin/migrate?error=invalid_window", status_code=302)
+    moved = 0
+    for raw in account_ids:
+        try:
+            acc_id = int(raw)
+        except (ValueError, TypeError):
+            continue
+        acc = get_account(acc_id)
+        if not acc:
+            continue
+        old_window = acc.get("window") or "glazars"
+        if old_window == target:
+            continue
+        db_update_account(acc_id, window=target)
+        audit("account.moved", request=request, user=_current_user(request),
+              target_type="account", target_id=acc_id,
+              details={"from_window": old_window, "to_window": target})
+        moved += 1
+    return RedirectResponse(url=f"/admin/migrate?moved={moved}", status_code=302)
+
+
+# ---------------------------------------------------------------------------
+# Admin: Proxy management
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/proxies", response_class=HTMLResponse)
+async def proxies_page(request: Request):
+    """Список прокси с health-статусом + форма добавления."""
+    proxies = db_list_proxies()
+    return templates.TemplateResponse("proxies.html", {
+        "request":      request,
+        "proxies":      proxies,
+        "current_user": _current_user(request),
+        "groups":       accounts_by_window(),
+        "window_list":  get_window_list(),
+        "accounts":     list_accounts(),
+        "selected":     None,
+        "account_id":   None,
+        "window_slug":  None,
+    })
+
+
+@app.post("/admin/proxies/add", response_class=RedirectResponse)
+async def proxies_add(
+    request:  Request,
+    type:     str = Form("socks5h"),
+    host:     str = Form(...),
+    port:     str = Form(...),
+    username: str = Form(""),
+    password: str = Form(""),
+    label:    str = Form(""),
+    region:   str = Form(""),
+):
+    try:
+        port_i = int(port)
+        if port_i < 1 or port_i > 65535 or not host.strip():
+            raise ValueError
+    except (ValueError, TypeError):
+        return RedirectResponse(url="/admin/proxies?error=invalid", status_code=302)
+    new_id = db_add_proxy(
+        type=type.strip() or "socks5h",
+        host=host.strip(),
+        port=port_i,
+        username=username.strip() or None,
+        password=password.strip() or None,
+        label=label.strip() or None,
+        region=(region.strip().upper() or None),
+    )
+    if not new_id:
+        return RedirectResponse(url="/admin/proxies?error=duplicate", status_code=302)
+    audit("proxy.created", request=request, user=_current_user(request),
+          target_type="proxy", target_id=new_id,
+          details={"host": host.strip(), "port": port_i, "type": type})
+    return RedirectResponse(url="/admin/proxies?success=added", status_code=302)
+
+
+@app.post("/admin/proxies/{proxy_id}/check", response_class=RedirectResponse)
+async def proxies_check(request: Request, proxy_id: int):
+    """Manual recheck — для быстрой проверки без ожидания background loop."""
+    p = db_get_proxy(proxy_id)
+    if not p:
+        return RedirectResponse(url="/admin/proxies", status_code=302)
+    status, latency, err = await asyncio.to_thread(proxy_health_check_one, p)
+    db_mark_proxy_status(proxy_id, status, latency, err)
+    return RedirectResponse(url="/admin/proxies?success=checked", status_code=302)
+
+
+@app.post("/admin/proxies/{proxy_id}/toggle", response_class=RedirectResponse)
+async def proxies_toggle(request: Request, proxy_id: int):
+    """Включить/выключить прокси (enabled flag)."""
+    p = db_get_proxy(proxy_id)
+    if p:
+        db_update_proxy(proxy_id, enabled=not bool(p.get("enabled")))
+        audit("proxy.toggled", request=request, user=_current_user(request),
+              target_type="proxy", target_id=proxy_id,
+              details={"new_enabled": not bool(p.get("enabled"))})
+    return RedirectResponse(url="/admin/proxies", status_code=302)
+
+
+@app.post("/admin/proxies/{proxy_id}/delete", response_class=RedirectResponse)
+async def proxies_delete(request: Request, proxy_id: int):
+    p = db_get_proxy(proxy_id)
+    db_delete_proxy(proxy_id)
+    audit("proxy.deleted", request=request, user=_current_user(request),
+          target_type="proxy", target_id=proxy_id,
+          details={"host": (p or {}).get("host"), "port": (p or {}).get("port")})
+    return RedirectResponse(url="/admin/proxies?success=deleted", status_code=302)
+
 
 @app.get("/windows", response_class=HTMLResponse)
 async def windows_page(request: Request):
