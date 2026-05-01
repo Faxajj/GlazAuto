@@ -695,17 +695,22 @@ textarea:focus {
    Соответствует скриншоту реального чека: белая карточка, lavender лого,
    крупная синяя сумма с superscript-центами, серые лейблы / тёмные значения.
    ============================================================================ */
+/* Точные цвета извлечены из PDF stream (RG operator):
+   border/title #073B4C  ← rgb(.0275 .2314 .298)
+   divider     #ECEBEB  ← rgb(.9255 .9216 .9216)                                 */
 .pp-receipt {
   background: #ffffff;
-  border: 1px solid #e5e7eb;
-  border-radius: 14px;
-  padding: 1.5rem 1.75rem 2rem;
-  max-width: 460px;
+  border: 1px solid #073b4c;
+  border-radius: 12px;
+  padding: 2rem 2rem 2.5rem;
+  max-width: 480px;
   margin: 0 auto;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI Variable', 'Segoe UI',
-               Roboto, 'Helvetica Neue', Arial, sans-serif;
-  color: #2d4a6e;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI Variable',
+               'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  color: #073b4c;
+  box-shadow: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 /* ── Логотип «personal pay» (lavender) ───────────────────────────────────── */
@@ -741,33 +746,35 @@ textarea:focus {
 /* ── Заголовок «Enviaste dinero» / «Recibiste dinero» ────────────────────── */
 .pp-receipt__title {
   text-align: center;
-  font-size: 1rem;
+  font-size: 0.95rem;
   font-weight: 700;
-  color: #111827;
-  margin: 0.25rem 0 1rem;
+  color: #073b4c;            /* PDF-derived */
+  margin: 1rem 0 0.5rem;
   letter-spacing: -0.005em;
+  line-height: 1.3;
 }
 
-/* ── Сумма: крупная, тонкая, синяя (PP brand blue) ───────────────────────── */
+/* ── Сумма: крупная, очень тонкая, brand blue ────────────────────────────── */
 .pp-receipt__amount {
   text-align: center;
-  font-size: 3.2rem;
+  font-size: 3rem;
   font-weight: 300;
-  letter-spacing: -2px;
+  letter-spacing: -1.5px;
   line-height: 1;
-  margin: 0.25rem 0 1.5rem;
+  margin: 0.5rem 0 1.75rem;
   font-feature-settings: "tnum" on, "lnum" on;
+  font-variant-numeric: tabular-nums lining-nums;
 }
-.pp-receipt__amount--out { color: #3461ff; }   /* PP brand blue — исходящие */
-.pp-receipt__amount--in  { color: #1ea672; }   /* зелёный — входящие */
+.pp-receipt__amount--out { color: #2647d8; }   /* PP brand blue (precise from screenshot) */
+.pp-receipt__amount--in  { color: #1ea672; }
 
-/* superscript для центов — маленький, правее основной суммы */
+/* superscript для центов — маленькие */
 .pp-receipt__cents {
-  font-size: 0.36em;
+  font-size: 0.35em;
   font-weight: 400;
   vertical-align: super;
   letter-spacing: 0;
-  margin-left: 2px;
+  margin-left: 1px;
   position: relative;
   top: -0.05em;
 }
@@ -783,28 +790,33 @@ textarea:focus {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  padding: 0.85rem 0;
-  border-bottom: 1px solid #eef0f3;
-  gap: 1rem;
+  padding: 0.95rem 0;
+  border-bottom: 1px solid #ecebeb;   /* PDF-derived */
+  gap: 1.25rem;
 }
 .pp-receipt__row:last-child { border-bottom: none; }
 
 .pp-receipt__label {
-  color: #6b7280;
+  color: #073b4c;                     /* PDF-derived (text color) */
+  opacity: 0.72;                      /* приглушённый — стилистика PP */
   font-size: 0.95rem;
   font-weight: 400;
   flex: 0 0 auto;
-  max-width: 40%;
+  max-width: 42%;
+  line-height: 1.35;
+  letter-spacing: -0.005em;
 }
 
 .pp-receipt__value {
-  color: #2d4a6e;
+  color: #073b4c;                     /* PDF-derived (text color) */
   font-size: 0.95rem;
   font-weight: 500;
   text-align: right;
   word-break: break-word;
   margin: 0;
   flex: 1 1 auto;
+  line-height: 1.35;
+  letter-spacing: -0.005em;
 }
 
 /* ── Print стили: компактный чёрно-белый вывод ───────────────────────────── */
@@ -864,6 +876,31 @@ textarea:focus {
   background: rgba(248, 113, 113, 0.2);
   color: #f87171;
 }
+/* Активное авто-правило — пульсирующий синий бэйдж "🔄 Авто" */
+.tx-badge.tx-running {
+  background: rgba(59, 130, 246, 0.2);
+  color: #60a5fa;
+  animation: tx-running-pulse 2s ease-in-out infinite;
+}
+@keyframes tx-running-pulse {
+  0%, 100% { opacity: 0.85; }
+  50%      { opacity: 1; box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.15); }
+}
+
+/* Proxy badges */
+.proxy-badge {
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 0.18rem 0.55rem;
+  border-radius: 5px;
+  white-space: nowrap;
+  letter-spacing: 0.01em;
+}
+.proxy-badge--ok       { background: rgba(34, 197, 94, 0.18);  color: #4ade80; }
+.proxy-badge--fail     { background: rgba(248, 113, 113, 0.18); color: #f87171; }
+.proxy-badge--unknown  { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
+.proxy-badge--disabled { background: rgba(100, 116, 139, 0.18); color: #64748b; text-decoration: line-through; }
 .tx-amount {
   font-weight: 600;
   color: #e2e8f0;
