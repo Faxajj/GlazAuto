@@ -135,18 +135,38 @@ def _session(c: dict) -> requests.Session:
 
 
 def _request_with_proxy_fallback(method: str, c: dict, url: str, **kwargs):
-    """Выполняет запрос через прокси (если задан), и при ProxyError ретраит без прокси."""
+    """Выполняет запрос с failover-логикой:
+       1. Через настроенный прокси (credentials.proxy)
+       2. При ProxyError → healthy proxy из пула (proxies таблица, status='ok')
+       3. При повторном ProxyError → direct (без прокси)
+    """
     session = _session(c)
     try:
         return session.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
-    except req_exc.ProxyError:
-        # Если прокси сломан/заблокирован, делаем один безопасный retry напрямую.
-        if c.get("proxy") or c.get("http_proxy") or c.get("https_proxy"):
+    except req_exc.ProxyError as primary_err:
+        configured = c.get("proxy") or c.get("http_proxy") or c.get("https_proxy")
+        # Pool failover — пробуем healthy proxy из БД
+        try:
+            from app.proxies import get_healthy_proxy_url
+            pool_url = get_healthy_proxy_url()
+            if pool_url and pool_url != configured:
+                logger.warning("PP request: configured proxy failed, trying pool proxy")
+                pool_creds = dict(c)
+                pool_creds["proxy"] = pool_creds["http_proxy"] = pool_creds["https_proxy"] = pool_url
+                session_pool = _session(pool_creds)
+                try:
+                    return session_pool.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+                except req_exc.ProxyError:
+                    logger.warning("PP request: pool proxy also failed, falling through to direct")
+        except Exception as e:
+            logger.debug("PP request: pool failover skipped: %s", e)
+        # Direct fallback (без прокси) — последняя надежда
+        if configured:
             direct = dict(c)
             direct["proxy"] = direct["http_proxy"] = direct["https_proxy"] = ""
-            session2 = _session(direct)
-            return session2.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
-        raise
+            session_direct = _session(direct)
+            return session_direct.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+        raise primary_err
 
 def _get_token_direct(c: dict) -> tuple:
     """Возвращает (token, paygilant) напрямую из credentials — без авто-обновления.
@@ -213,6 +233,13 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
 
     try:
         token, paygilant = _get_token_direct(c)
+        # Точный порядок и заголовки извлечены из реального HAR-трассинга PP-приложения:
+        #   GET  /identity/auth/pin/status            (304/200)
+        #   POST /identity/auth/session/focus/changed (201)
+        #   GET  /identity/auth/v3/session/status     (304/200)
+        #   POST /identity/auth/pin/validate          (201, body {data:{message:"pin validated"}})
+        # PP НЕ возвращает новый JWT в ответах — pin/validate просто продлевает
+        # серверную сессию, а существующий JWT после этого снова валиден.
         base_hdrs = _base_headers(c) | {
             "Authorization": token,
             "x-fraud-paygilant-session-id": paygilant,
@@ -222,7 +249,7 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
             "x-fraud-paygilant-session-id": paygilant,
         }
 
-        # Шаг 1 — проверяем статус PIN
+        # Шаг 1 — pin/status (warm-up + ETag)
         try:
             r1 = _request_with_proxy_fallback(
                 "GET", c, f"{c['base_url']}/identity/auth/pin/status",
@@ -232,22 +259,33 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
         except Exception as e:
             logger.warning("pp pin_refresh [%s] step1 pin/status error: %s", acc_label, e)
 
-        # Шаг 2 — имитируем возврат в приложение
+        # Шаг 2 — focus/changed (имитация возврата в приложение)
         try:
             r2 = _request_with_proxy_fallback(
                 "POST", c, f"{c['base_url']}/identity/auth/session/focus/changed",
                 headers=post_hdrs,
                 json={
-                    "deviceId": device_id,
+                    "deviceId":  device_id,
                     "sessionId": _paygilant_id(device_id),
-                    "type": "focusIn",
+                    "type":      "focusIn",
                 },
             )
             logger.debug("pp pin_refresh [%s] step2 focus/changed → %s", acc_label, r2.status_code)
         except Exception as e:
             logger.warning("pp pin_refresh [%s] step2 focus/changed error: %s", acc_label, e)
 
-        # Шаг 3 — валидируем PIN
+        # Шаг 3 — session/status (порядок ВАЖЕН, идёт ДО pin/validate согласно HAR)
+        try:
+            r_status = _request_with_proxy_fallback(
+                "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
+                headers=base_hdrs,
+            )
+            logger.debug("pp pin_refresh [%s] step3 session/status → %s",
+                         acc_label, r_status.status_code)
+        except Exception as e:
+            logger.warning("pp pin_refresh [%s] step3 session/status error: %s", acc_label, e)
+
+        # Шаг 4 — pin/validate (валидируем PIN, продлеваем серверную сессию)
         try:
             r_pin = _request_with_proxy_fallback(
                 "POST", c, f"{c['base_url']}/identity/auth/pin/validate",
@@ -269,65 +307,11 @@ def _do_pin_refresh(c: dict) -> Optional[str]:
         if r_pin.status_code not in (200, 201):
             raise RuntimeError(f"pin/validate вернул {r_pin.status_code}: {r_pin.text[:200]}")
 
-        # Вспомогательная функция: ищет JWT в любом dict/body
-        def _extract_jwt(body: dict) -> Optional[str]:
-            data = body.get("data") or body
-            for d in (data, body):
-                for key in ("idToken", "id_token", "accessToken", "access_token", "token",
-                            "jwtToken", "jwt_token", "authToken", "auth_token"):
-                    v = d.get(key) if isinstance(d, dict) else None
-                    if v and str(v).startswith("eyJ"):
-                        return str(v)
-            return None
-
-        # Шаг 4a — ищем новый JWT прямо в ответе pin/validate
-        existing_token = token
-        try:
-            pin_body = r_pin.json()
-            jwt_from_pin = _extract_jwt(pin_body)
-            if jwt_from_pin:
-                logger.info("pp pin_refresh [%s] новый JWT из pin/validate ответа", acc_label)
-                return jwt_from_pin
-        except Exception:
-            pass
-
-        # Шаг 4b — запрашиваем session/status для нового JWT
-        try:
-            r_status = _request_with_proxy_fallback(
-                "GET", c, f"{c['base_url']}/identity/auth/v3/session/status",
-                headers=base_hdrs,
-            )
-            logger.debug("pp pin_refresh [%s] session/status → %s", acc_label, r_status.status_code)
-            if r_status.status_code == 200:
-                try:
-                    jwt_from_status = _extract_jwt(r_status.json())
-                    if jwt_from_status:
-                        logger.info("pp pin_refresh [%s] новый JWT из session/status", acc_label)
-                        return jwt_from_status
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning("pp pin_refresh [%s] session/status error: %s", acc_label, e)
-
-        # Шаг 4c — пробуем получить свежий токен через token-эндпоинт
-        for token_path in ("/identity/auth/v3/token", "/identity/auth/token"):
-            try:
-                r_tok = _request_with_proxy_fallback(
-                    "GET", c, f"{c['base_url']}{token_path}",
-                    headers=base_hdrs,
-                )
-                if r_tok.status_code == 200:
-                    jwt_from_tok = _extract_jwt(r_tok.json())
-                    if jwt_from_tok:
-                        logger.info("pp pin_refresh [%s] новый JWT из %s", acc_label, token_path)
-                        return jwt_from_tok
-            except Exception:
-                pass
-
-        # PIN принят, но новый JWT не получен — возвращаем старый
-        # PP мог продлить серверную сессию, так что старый JWT может ещё работать
-        logger.info("pp pin_refresh [%s] сессия продлена (новый JWT не получен — используем текущий)", acc_label)
-        return existing_token
+        # Успех. Согласно HAR, тело ответа = {"data":{"message":"pin validated"}} —
+        # никакого нового JWT нет. Существующий token остаётся валидным на сервере.
+        # Возвращаем его как сигнал "сессия продлена".
+        logger.info("pp pin_refresh [%s] серверная сессия продлена через PIN ✓", acc_label)
+        return token
 
     finally:
         lock.release()

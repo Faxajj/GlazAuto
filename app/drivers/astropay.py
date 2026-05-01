@@ -147,23 +147,51 @@ def _do_refresh(credentials: dict, access_token: str, refresh_token: str):
     return new_access, new_refresh, expires_in
 
 
-def _session(credentials: dict) -> requests.Session:
-    """Создаёт requests.Session с актуальным токеном."""
+def _session(credentials: dict, proxy_override: Optional[str] = None) -> requests.Session:
+    """Создаёт requests.Session с актуальным токеном.
+    proxy_override используется в failover-логике (когда основной прокси умер)."""
     s = requests.Session()
     token = _get_valid_token(credentials)
     headers = _base_headers(credentials)
     headers["Authorization"] = "Bearer " + token
     s.headers.update(headers)
 
-    proxy = (
-        credentials.get("proxy") or
-        credentials.get("https_proxy") or
-        credentials.get("http_proxy") or ""
-    ).strip()
+    if proxy_override is not None:
+        proxy = proxy_override.strip()
+    else:
+        proxy = (
+            credentials.get("proxy") or
+            credentials.get("https_proxy") or
+            credentials.get("http_proxy") or ""
+        ).strip()
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
 
     return s
+
+
+def _request_with_failover(credentials: dict, method: str, url: str, **kwargs):
+    """Failover: configured proxy → healthy pool proxy → direct.
+    Используется для всех AP-запросов через _do_with_failover wrapper."""
+    s = _session(credentials)
+    try:
+        return getattr(s, method.lower())(url, **kwargs)
+    except requests.exceptions.ProxyError:
+        # Pool fallback
+        try:
+            from app.proxies import get_healthy_proxy_url
+            pool_url = get_healthy_proxy_url()
+            if pool_url:
+                s_pool = _session(credentials, proxy_override=pool_url)
+                try:
+                    return getattr(s_pool, method.lower())(url, **kwargs)
+                except requests.exceptions.ProxyError:
+                    pass
+        except Exception:
+            pass
+        # Direct fallback
+        s_direct = _session(credentials, proxy_override="")
+        return getattr(s_direct, method.lower())(url, **kwargs)
 
 
 def _handle_401(credentials: dict) -> Optional[str]:
