@@ -541,13 +541,13 @@ def get_activities_list(credentials: dict, offset: int = 0, limit: int = 15) -> 
         "x-fraud-paygilant-session-id": paygilant,
     }
     params = {"page[offset]": offset, "page[limit]": limit}
-    # Activities через прокси под нагрузкой может уходить >10 сек —
-    # явно поднимаем timeout до 30 сек чтобы не падать в TimeoutError.
+    # Activities через прокси под нагрузкой может уходить >30 сек —
+    # явно поднимаем timeout до 60 сек чтобы не падать в TimeoutError.
     r = _request_with_proxy_fallback(
         "GET", c, f"{c['base_url']}/platform/transactional-activity/v1/activities-list",
         headers=headers,
         params=params,
-        timeout=30,
+        timeout=60,
     )
     r.raise_for_status()
     return r.json()
