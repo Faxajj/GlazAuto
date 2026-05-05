@@ -5,3 +5,10 @@ python-multipart
 requests[socks]
 httpx
 cryptography  # for at-rest encryption of credentials (opt-in via BANKS_MASTER_KEY env)
+
+# ── anton-bot (Telegram bot для автовыводов) ─────────────────────────────
+python-telegram-bot==20.7
+apscheduler==3.10.4
+playwright       # headless Chromium для скриншотов чеков
+aiohttp
+pytz
