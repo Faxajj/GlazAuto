@@ -7,8 +7,10 @@ from typing import Dict, List, Optional
 
 from bot.config import (
     AP_INTERNAL_PREFIX,
+    CHAT_EXCHANGE,
     CHAT_OFFICE,
     DAILY_WITHDRAW_LIMIT,
+    EXCHANGE_OPERATORS_TAGS,
     LIMIT_RESPONSE_TIMEOUT_SEC,
     PP_INTERNAL_PREFIX,
     WITHDRAW_CHUNK,
@@ -169,21 +171,39 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
             # Скриншот чека
             if tid:
+                png = None
                 try:
                     png = await capture_receipt(card["id"], tid,
                                                 client.session_token,
                                                 client.csrf_token)
-                    if png:
+                except Exception as e:
+                    logger.warning("capture_receipt threw: %s", e)
+
+                if png:
+                    try:
                         from io import BytesIO
                         await bot.send_photo(
                             chat_id=CHAT_OFFICE,
                             photo=BytesIO(png),
                             caption=f"📄 Чек: {name} → {_fmt_ars_int(chunk_amount)} ARS",
                         )
-                    else:
-                        logger.info("no receipt screenshot for tid=%s", tid)
-                except Exception as e:
-                    logger.warning("capture/send receipt failed: %s", e)
+                    except Exception as e:
+                        logger.warning("send receipt photo failed: %s", e)
+                else:
+                    # Fallback: playwright не работает / chromium не установлен —
+                    # шлём текстовую ссылку на чек, оператор откроет на сайте.
+                    receipt_url = client.get_receipt_url(card["id"], tid)
+                    logger.info("no receipt screenshot for tid=%s — sending link", tid)
+                    try:
+                        await bot.send_message(
+                            chat_id=CHAT_OFFICE,
+                            text=(f"📄 Чек: {name} → {_fmt_ars_int(chunk_amount)} ARS\n"
+                                  f"🔗 {receipt_url}\n"
+                                  f"(скриншот недоступен — playwright/chromium не установлен)"),
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as e:
+                        logger.warning("send receipt link failed: %s", e)
 
             # Закрыт полностью?
             if remaining <= 0:
@@ -291,11 +311,25 @@ async def process_items(items: List[ParsedItem], bot, shift_id: int,
                         client: SiteClient) -> None:
     """Запускает execute_cvu параллельно для каждого item.
     Разные CVU обрабатываются параллельно; на одной карте — last-write-wins
-    через _account_locks."""
+    через _account_locks. После завершения всех CVU тегает операторов
+    в "Обмены" с просьбой следующих реквизитов."""
     if not items:
         return
     tasks = [execute_cvu(item, bot, shift_id, client) for item in items]
     await asyncio.gather(*tasks, return_exceptions=True)
+
+    # После закрытия батча — просим следующие реквизиты в "Обмены"
+    try:
+        tags = " ".join(EXCHANGE_OPERATORS_TAGS)
+        total_ars = sum(float(it.amount) for it in items)
+        n = len(items)
+        await bot.send_message(
+            chat_id=CHAT_EXCHANGE,
+            text=(f"✅ Закрыто {n} реквизит(ов) на {_fmt_ars_int(total_ars)} ARS.\n"
+                  f"{tags} — давайте следующие реквизиты 🙏"),
+        )
+    except Exception as e:
+        logger.warning("process_items: failed to ping for next requisites: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

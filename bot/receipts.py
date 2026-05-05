@@ -26,7 +26,11 @@ async def capture_receipt(
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        logger.error("playwright не установлен. pip install playwright + playwright install chromium")
+        logger.error(
+            "playwright НЕ установлен. На сервере выполни:\n"
+            "  /var/www/app/venv/bin/pip install playwright\n"
+            "  /var/www/app/venv/bin/playwright install --with-deps chromium"
+        )
         return None
 
     parsed = urlparse(SITE_URL)
@@ -35,7 +39,15 @@ async def capture_receipt(
 
     try:
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=True)
+            try:
+                browser = await pw.chromium.launch(headless=True)
+            except Exception as e:
+                logger.error(
+                    "playwright chromium не запускается (%s). На сервере выполни:\n"
+                    "  /var/www/app/venv/bin/playwright install --with-deps chromium",
+                    e,
+                )
+                return None
             context = await browser.new_context(
                 viewport={"width": 560, "height": 900},   # фиксированная ширина для чёткости чека
                 device_scale_factor=2,                    # retina-качество
