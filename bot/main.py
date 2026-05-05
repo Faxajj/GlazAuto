@@ -97,8 +97,11 @@ def _build_preview_text(parsed: ParseResult, sender_name: str) -> str:
         total_ars += it.amount
     lines.append("")
     lines.append(f"💰 Итого: {_fmt_ars_int(total_ars)} ARS")
-    chunks = max(1, int((total_ars + 999_999) // 1_000_000))
-    lines.append(f"🔄 ~{chunks} переводов по 1,000,000")
+    if total_ars <= 1_000_000:
+        lines.append("🔄 1 перевод")
+    else:
+        chunks = max(1, int((total_ars + 999_999) // 1_000_000))
+        lines.append(f"🔄 ~{chunks} переводов (по ≤1,000,000)")
     return "\n".join(lines)
 
 
@@ -167,17 +170,62 @@ async def on_exchange_message(update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def on_office_message(update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сообщение в чате «Офис» — может быть reply на бот-запрос CVU."""
+    """Сообщение в чате «Офис»:
+    1) reply на бот-запрос CVU (try_resolve_pending_limit);
+    2) reply на preview-сообщение с реквизитами → переразбираем и обновляем pending.
+    """
     msg = update.effective_message
     if msg is None or not msg.text:
         return
     if not msg.reply_to_message:
         return
     reply_to_id = msg.reply_to_message.message_id
-    # Проверяем — это reply на наш запрос «дайте CVU для остатка»?
+
+    # 1) Попытка резолвнуть pending CVU (вывод остатка после "лимит карты")
     if try_resolve_pending_limit(reply_to_id, msg.text):
         try:
             await msg.reply_text("✅ CVU принят, продолжаю вывод остатка...")
+        except Exception:
+            pass
+        return
+
+    # 2) Это reply на preview-сообщение с реквизитами? → редактирование
+    if reply_to_id in pending_confirmations:
+        new_parsed = parse_message(msg.text)
+        if new_parsed is None or not new_parsed.items:
+            try:
+                await msg.reply_text(
+                    "⚠ Не удалось распарсить новые реквизиты. "
+                    "Пришли формат как обычно (CVU + сумма)."
+                )
+            except Exception:
+                pass
+            return
+
+        # Отменяем auto-confirm — после правки оператор должен явно подтвердить
+        t = _auto_confirm_tasks.pop(reply_to_id, None)
+        if t and not t.done():
+            t.cancel()
+
+        pending_confirmations[reply_to_id] = new_parsed
+        sender = "оператор (правка)"
+        new_text = _build_preview_text(new_parsed, sender)
+        try:
+            await context.bot.edit_message_text(
+                chat_id=CHAT_OFFICE,
+                message_id=reply_to_id,
+                text=new_text + "\n\n✏️ Отредактировано — нажмите ✅ для запуска.",
+                reply_markup=_confirm_keyboard(),
+            )
+        except Exception as e:
+            logger.warning("edit preview failed: %s", e)
+            try:
+                await msg.reply_text("⚠ Не смог отредактировать preview, попробуй ещё раз.")
+            except Exception:
+                pass
+            return
+        try:
+            await msg.reply_text("✅ Реквизиты обновлены, нажми ✅ для запуска.")
         except Exception:
             pass
 
@@ -187,7 +235,13 @@ async def on_callback_query(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cq = update.callback_query
     if cq is None or not cq.data:
         return
-    await cq.answer()
+    # cq.answer() имеет таймаут 15 сек на стороне Telegram.
+    # При медленном SOCKS-прокси ack может прийти позже — Telegram возвращает
+    # BadRequest "Query is too old". Это НЕ должно блокировать обработку.
+    try:
+        await cq.answer()
+    except Exception as e:
+        logger.warning("callback_query.answer() failed (продолжаем): %s", e)
     data = cq.data
     msg = cq.message
     if msg is None:

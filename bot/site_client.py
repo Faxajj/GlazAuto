@@ -209,18 +209,29 @@ class SiteClient:
             return []
         balances = data.get("balances") or {}
         result: List[dict] = []
+        skipped_null = 0
+        skipped_error = 0
+        skipped_zero = 0
+        accepted_stale = 0
         for acc_id in pp_ids:
             entry = balances.get(str(acc_id))
             if not entry:
+                skipped_null += 1
                 continue
+            # Принимаем stale-данные (cached_age > N сек) — лучше чем ничего.
+            # Отказываемся только при явной ошибке банка (token expired, proxy dead).
             if entry.get("_is_error"):
+                skipped_error += 1
                 continue
             try:
                 bal = float(entry.get("balance") or 0)
             except (TypeError, ValueError):
                 bal = 0.0
             if bal <= 0:
+                skipped_zero += 1
                 continue
+            if entry.get("_is_stale"):
+                accepted_stale += 1
             result.append({
                 "id":                     int(acc_id),
                 "label":                  labels.get(acc_id, ""),
@@ -229,8 +240,20 @@ class SiteClient:
                 "account_withdraw_limit": int(entry.get("account_withdraw_limit") or 15),
                 "bank_type":              "personalpay",
                 "cvu_number":             entry.get("cvu_number") or "",
+                "_is_stale":              bool(entry.get("_is_stale")),
+                "_cache_age_sec":         int(entry.get("_cache_age_sec") or 0),
             })
         result.sort(key=lambda a: a["balance"], reverse=True)
+        if not result:
+            logger.warning(
+                "get_pp_accounts: пусто (всего PP=%d, null=%d, error=%d, zero=%d)",
+                len(pp_ids), skipped_null, skipped_error, skipped_zero,
+            )
+        elif accepted_stale:
+            logger.info(
+                "get_pp_accounts: %d карт (из них %d со stale-балансом)",
+                len(result), accepted_stale,
+            )
         return result
 
     async def withdraw(self, account_id: int, destination: str, amount: float) -> dict:
