@@ -144,9 +144,11 @@ def _request_with_proxy_fallback(method: str, c: dict, url: str, **kwargs):
     чтобы СЛЕДУЮЩИЕ вызовы в той же сессии (балансы, активности) не пробовали
     мёртвый прокси заново. Запись в БД делает main.py через _balance_cache invalidation.
     """
+    # Если caller передал свой timeout — уважаем его, иначе HTTP_TIMEOUT.
+    timeout = kwargs.pop("timeout", HTTP_TIMEOUT)
     session = _session(c)
     try:
-        return session.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+        return session.request(method, url, timeout=timeout, **kwargs)
     except req_exc.ProxyError as primary_err:
         configured = c.get("proxy") or c.get("http_proxy") or c.get("https_proxy")
         # Pool failover — пробуем healthy proxy из БД
@@ -159,7 +161,7 @@ def _request_with_proxy_fallback(method: str, c: dict, url: str, **kwargs):
                 pool_creds["proxy"] = pool_creds["http_proxy"] = pool_creds["https_proxy"] = pool_url
                 session_pool = _session(pool_creds)
                 try:
-                    response = session_pool.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+                    response = session_pool.request(method, url, timeout=timeout, **kwargs)
                     # Sticky: помечаем что прокси сменился — main.py при сохранении кэша
                     # увидит несовпадение и обновит credentials в БД
                     c["_failover_to_proxy"] = pool_url
@@ -174,7 +176,7 @@ def _request_with_proxy_fallback(method: str, c: dict, url: str, **kwargs):
             direct = dict(c)
             direct["proxy"] = direct["http_proxy"] = direct["https_proxy"] = ""
             session_direct = _session(direct)
-            return session_direct.request(method, url, timeout=HTTP_TIMEOUT, **kwargs)
+            return session_direct.request(method, url, timeout=timeout, **kwargs)
         raise primary_err
 
 def _get_token_direct(c: dict) -> tuple:
@@ -539,10 +541,13 @@ def get_activities_list(credentials: dict, offset: int = 0, limit: int = 15) -> 
         "x-fraud-paygilant-session-id": paygilant,
     }
     params = {"page[offset]": offset, "page[limit]": limit}
+    # Activities через прокси под нагрузкой может уходить >10 сек —
+    # явно поднимаем timeout до 30 сек чтобы не падать в TimeoutError.
     r = _request_with_proxy_fallback(
         "GET", c, f"{c['base_url']}/platform/transactional-activity/v1/activities-list",
         headers=headers,
         params=params,
+        timeout=30,
     )
     r.raise_for_status()
     return r.json()
