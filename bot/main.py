@@ -48,6 +48,10 @@ pending_confirmations: Dict[int, ParseResult] = {}
 # Auto-confirm timers по message_id
 _auto_confirm_tasks: Dict[int, asyncio.Task] = {}
 
+# Callback dedup: при медленном answerCallbackQuery Telegram повторяет update.
+# Игнорируем повторные клики на тот же message_id.
+_callback_in_progress: set = set()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -235,6 +239,26 @@ async def on_callback_query(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cq = update.callback_query
     if cq is None or not cq.data:
         return
+    msg = cq.message
+    if msg is None:
+        return
+    # ── Дедуп ───────────────────────────────────────────────────────────────
+    # Telegram повторяет callback update если answerCallbackQuery приходит
+    # с задержкой > 15 сек (медленный SOCKS-прокси). Без дедупа handler
+    # выполнится дважды и второй раз увидит pending=None → "сессия истекла".
+    if msg.message_id in _callback_in_progress:
+        try:
+            await cq.answer("Уже обрабатываю...")
+        except Exception:
+            pass
+        return
+    _callback_in_progress.add(msg.message_id)
+    # Подстраховка — даже если handler упал/ушёл в timeout, через 60 сек
+    # message_id освободится в dedup-сете (повторный клик возможен снова).
+    asyncio.get_event_loop().call_later(
+        60, lambda mid=msg.message_id: _callback_in_progress.discard(mid),
+    )
+
     # cq.answer() имеет таймаут 15 сек на стороне Telegram.
     # При медленном SOCKS-прокси ack может прийти позже — Telegram возвращает
     # BadRequest "Query is too old". Это НЕ должно блокировать обработку.
@@ -243,9 +267,6 @@ async def on_callback_query(update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception as e:
         logger.warning("callback_query.answer() failed (продолжаем): %s", e)
     data = cq.data
-    msg = cq.message
-    if msg is None:
-        return
     parsed = pending_confirmations.pop(msg.message_id, None)
     # Отменяем auto-confirm task если был
     t = _auto_confirm_tasks.pop(msg.message_id, None)

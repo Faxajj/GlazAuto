@@ -38,6 +38,32 @@ async def _get_account_lock(account_id: int) -> asyncio.Lock:
         return lock
 
 
+# In-flight: сколько ARS уже зарезервировано/в процессе для каждой карты.
+# Защита от ситуации "8 параллельных CVU выбрали одну карту по stale-балансу".
+_inflight_per_account: Dict[int, float] = {}
+_inflight_lock = asyncio.Lock()
+
+
+async def _reserve(account_id: int, amount: float) -> None:
+    async with _inflight_lock:
+        _inflight_per_account[account_id] = (
+            _inflight_per_account.get(account_id, 0.0) + amount
+        )
+
+
+async def _release(account_id: int, amount: float) -> None:
+    async with _inflight_lock:
+        cur = _inflight_per_account.get(account_id, 0.0) - amount
+        if cur <= 0:
+            _inflight_per_account.pop(account_id, None)
+        else:
+            _inflight_per_account[account_id] = cur
+
+
+def _get_inflight(account_id: int) -> float:
+    return _inflight_per_account.get(account_id, 0.0)
+
+
 # Pending-CVU operator response: message_id → asyncio.Future
 pending_limit_responses: Dict[int, asyncio.Future] = {}
 
@@ -75,18 +101,22 @@ async def pick_best_card(client: SiteClient, amount: float,
     for a in accs:
         if a["id"] in exclude_ids:
             continue
-        if a["balance"] < amount:
+        # Учитываем уже зарезервированные суммы in-flight на этой карте.
+        # Без этого 8 параллельных задач выбрали бы одну карту по stale-кешу.
+        effective = float(a["balance"]) - _get_inflight(a["id"])
+        if effective < amount:
             continue
         # Лимит per-card применяется только к НЕ-internal направлениям
         if not is_internal:
             if a["account_withdraw_count"] >= DAILY_WITHDRAW_LIMIT:
                 continue
-        candidates.append(a)
+        candidates.append((effective, a))
 
     if not candidates:
         return None
-    candidates.sort(key=lambda x: x["balance"], reverse=True)
-    return candidates[0]
+    # Сортировка по эффективному балансу (после вычета in-flight)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +163,9 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
             used_card_ids.clear()       # на следующем круге включаем все обратно
             continue
 
+        # ── Резервируем сумму на этой карте ──────────────────────────────────
+        await _reserve(card["id"], chunk_amount)
+
         # ── Выполняем вывод ─────────────────────────────────────────────────
         lock = await _get_account_lock(card["id"])
         async with lock:
@@ -140,15 +173,68 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
         if res.get("ok"):
             tid = res.get("tid")
+
+            # ── Polling реального статуса транзакции ────────────────────────
+            # `ok=True` означает только "транзакция создана сайтом".
+            # Банк может асинхронно вернуть rejected (rechazada) — нужен poll.
+            final_status = "unknown"
+            if tid:
+                # 6 попыток × 5 сек = 30 сек ожидания финального статуса
+                for _ in range(6):
+                    await asyncio.sleep(5)
+                    try:
+                        st = await client.get_transaction_status(card["id"], tid)
+                    except Exception:
+                        st = "unknown"
+                    if st in ("rejected", "approved"):
+                        final_status = st
+                        break
+                    # pending / unknown — продолжаем ждать
+                else:
+                    # Не дождались — оставляем pending, на сайте reconciliation worker доразберётся
+                    final_status = "pending"
+            else:
+                # Нет tid — нет способа проверить, считаем approved оптимистично
+                final_status = "approved"
+
+            # ── REJECTED ────────────────────────────────────────────────────
+            if final_status == "rejected":
+                await _release(card["id"], chunk_amount)
+                # Записываем в state как rejected (не списывает remaining)
+                record_withdrawal(
+                    shift_id=shift_id, cvu=cvu, name=name,
+                    amount=chunk_amount, account_id=card["id"],
+                    account_label=card.get("label") or "",
+                    transaction_id=tid, status="rejected",
+                )
+                used_card_ids.add(card["id"])     # больше не выбираем эту карту
+                try:
+                    await bot.send_message(
+                        chat_id=CHAT_OFFICE,
+                        text=(f"❌ Банк отклонил перевод\n"
+                              f"💸 {name} ({cvu})\n"
+                              f"💵 Сумма: {_fmt_ars_int(chunk_amount)} ARS\n"
+                              f"📱 Карта: {card.get('label') or '?'}\n"
+                              f"🔁 Пробую другую карту..."),
+                    )
+                except Exception:
+                    pass
+                # remaining НЕ уменьшаем — переходим на следующий круг while
+                continue
+
+            # ── APPROVED (или PENDING — оптимистично считаем успехом) ───────
             chunks_done += 1
             remaining -= chunk_amount
+            # Не освобождаем in-flight: эта сумма реально списана с карты,
+            # последующие выборы должны её учитывать (баланс в кеше всё ещё stale).
 
             # Запись в state
             record_withdrawal(
                 shift_id=shift_id, cvu=cvu, name=name,
                 amount=chunk_amount, account_id=card["id"],
                 account_label=card.get("label") or "",
-                transaction_id=tid, status="success",
+                transaction_id=tid,
+                status="success" if final_status == "approved" else "pending",
             )
 
             # Pending CVU обновляем (или удаляем если закрыт)
@@ -158,11 +244,13 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                 remove_pending_cvu(cvu)
 
             # Сообщение об успехе
+            status_emoji = "✅" if final_status == "approved" else "⏳"
+            status_text  = "Отправлено" if final_status == "approved" else "В обработке"
             try:
                 await bot.send_message(
                     chat_id=CHAT_OFFICE,
                     text=(f"💸 {name} ({cvu})\n"
-                          f"✅ Отправлено: {_fmt_ars_int(chunk_amount)} ARS\n"
+                          f"{status_emoji} {status_text}: {_fmt_ars_int(chunk_amount)} ARS\n"
                           f"📱 Карта: {card.get('label') or '?'}\n"
                           f"💰 Осталось: {_fmt_ars_int(remaining)} ARS"),
                 )
@@ -223,6 +311,8 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
             continue
 
         # ── Ошибка вывода ───────────────────────────────────────────────────
+        # Сайт не создал транзакцию — освобождаем резервирование сразу.
+        await _release(card["id"], chunk_amount)
         err = res.get("error") or "unknown"
         err_low = err.lower()
 

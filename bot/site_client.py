@@ -295,6 +295,36 @@ class SiteClient:
     def get_receipt_url(self, account_id: int, transaction_id: str) -> str:
         return f"{SITE_URL}/account/{account_id}/receipt?transaction_id={transaction_id}"
 
+    async def get_transaction_status(self, account_id: int,
+                                     transaction_id: str) -> str:
+        """Возвращает реальный статус: 'approved' / 'rejected' / 'pending' / 'unknown'.
+        Парсит receipt-страницу: ищет маркеры "rechazada/rejected" vs "approved/aprobada".
+        Это критично — `tid` от withdraw означает только "транзакция создана",
+        окончательный статус приходит асинхронно от банка.
+        """
+        if not transaction_id:
+            return "unknown"
+        try:
+            r = await self._get(
+                f"/account/{account_id}/receipt?transaction_id={transaction_id}"
+            )
+            html = (await r.text()) or ""
+        except Exception as e:
+            logger.warning("get_transaction_status: fetch error: %s", e)
+            return "unknown"
+        low = html.lower()
+        # Сначала проверяем rejected (более специфично)
+        if ("rechazad" in low or "rejected" in low or
+                "denegad" in low or "failed" in low):
+            return "rejected"
+        if ("approved" in low or "aprobad" in low or
+                "completad" in low or "exitos" in low or "success" in low):
+            return "approved"
+        if ("pending" in low or "pendiente" in low or
+                "procesando" in low or "in_progress" in low):
+            return "pending"
+        return "unknown"
+
     async def get_bybit_rate(self) -> Optional[float]:
         """sell_avg в ARS/USDT (курс продавцов на P2P)."""
         try:
