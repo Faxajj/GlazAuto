@@ -84,6 +84,32 @@ class SiteClient:
             await self._do_login()
 
     async def _do_login(self) -> None:
+        """Логин с retry: при 400 (CSRF flake) пересоздаём сессию + повторяем."""
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                await self._do_login_once()
+                return
+            except RuntimeError as e:
+                last_err = e
+                msg = str(e)
+                logger.warning("site_client: login attempt %d failed: %s",
+                               attempt + 1, msg[:200])
+                # Полный сброс session + cookies — для нового CSRF
+                if self._session and not self._session.closed:
+                    try:
+                        await self._session.close()
+                    except Exception:
+                        pass
+                self._session = None
+                self.csrf_token = ""
+                self.session_token = ""
+                if attempt < 2:
+                    await asyncio.sleep(2)
+        # все попытки провалились
+        raise last_err or RuntimeError("site login: all retries failed")
+
+    async def _do_login_once(self) -> None:
         session = await self._ensure_session()
         # Шаг 1: GET /login → получаем csrf_token cookie
         async with session.get(

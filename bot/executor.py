@@ -239,6 +239,29 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                       client: SiteClient,
                       auto_chunk: float = WITHDRAW_CHUNK,
                       batch_id: str = "default") -> None:
+    """Wrapper — ловит любой неперехваченный exception и сообщает в Office,
+    чтобы оператор видел что execute_cvu упал, а не молча проглатывал."""
+    try:
+        await _execute_cvu_inner(item, bot, shift_id, client, auto_chunk, batch_id)
+    except Exception as e:
+        logger.exception("execute_cvu failed for %s (%s): %s",
+                         item.name or "?", item.cvu, e)
+        try:
+            await bot.send_message(
+                chat_id=CHAT_OFFICE,
+                text=(f"⚠ Ошибка обработки реквизита\n"
+                      f"💸 {item.name or '?'} ({item.cvu})\n"
+                      f"💵 Сумма: {_fmt_ars_int(item.amount)} ARS\n"
+                      f"🐞 {type(e).__name__}: {str(e)[:200]}"),
+            )
+        except Exception:
+            pass
+
+
+async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
+                             client: SiteClient,
+                             auto_chunk: float = WITHDRAW_CHUNK,
+                             batch_id: str = "default") -> None:
     """Выполняет вывод для одного CVU: дробит на чанки, выбирает карты,
     шлёт чеки в Офис, обрабатывает лимиты."""
     remaining = float(item.amount)
@@ -402,17 +425,24 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
             except Exception as e:
                 logger.warning("send chunk message failed: %s", e)
 
-            # Скриншот чека
-            if tid:
+            # ── Скриншот чека ────────────────────────────────────────────────
+            if not tid:
+                # tid не получили вообще — НЕ шлём бесполезную ссылку с None.
+                # Просто логируем; оператор увидит что чека нет и поймёт.
+                logger.warning(
+                    "skip receipt: tid is None для name=%s amt=%s acc=%s",
+                    name, int(chunk_amount), card["id"],
+                )
+            else:
                 png = None
-                # Primary: серверный рендер (на сайте сам playwright + свои cookies)
+                # Primary: серверный рендер (на сайте свой playwright + cookies)
                 try:
                     png = await client.render_receipt_image(card["id"], tid)
                     logger.info("server-side receipt for tid=%s: %s",
                                 tid, f"{len(png)}b" if png else "FAILED")
                 except Exception as e:
                     logger.warning("render_receipt_image threw: %s", e)
-                # Fallback: bot-side playwright если серверный не сработал
+                # Fallback: bot-side playwright
                 if not png:
                     try:
                         png = await capture_receipt(card["id"], tid,
@@ -422,14 +452,9 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                                     tid, f"{len(png)}b" if png else "FAILED")
                     except Exception as e:
                         logger.warning("capture_receipt threw: %s", e)
-            else:
-                png = None
-                logger.warning(
-                    "skip receipt: tid пустой для name=%s amt=%s acc=%s",
-                    name, int(chunk_amount), card["id"],
-                )
 
                 if png:
+                    # Картинка — основной формат
                     try:
                         from io import BytesIO
                         await bot.send_photo(
@@ -440,16 +465,14 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                     except Exception as e:
                         logger.warning("send receipt photo failed: %s", e)
                 else:
-                    # Fallback: playwright не работает / chromium не установлен —
-                    # шлём текстовую ссылку на чек, оператор откроет на сайте.
+                    # Скриншот не получился, но tid есть — даём ссылку.
                     receipt_url = client.get_receipt_url(card["id"], tid)
-                    logger.info("no receipt screenshot for tid=%s — sending link", tid)
+                    logger.warning("receipt screenshot failed for tid=%s — sending link", tid)
                     try:
                         await bot.send_message(
                             chat_id=CHAT_OFFICE,
                             text=(f"📄 Чек: {name} → {_fmt_ars_int(chunk_amount)} ARS\n"
-                                  f"🔗 {receipt_url}\n"
-                                  f"(скриншот недоступен — playwright/chromium не установлен)"),
+                                  f"🔗 {receipt_url}"),
                             disable_web_page_preview=True,
                         )
                     except Exception as e:
