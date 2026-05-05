@@ -3142,6 +3142,33 @@ async def withdraw(
             return RedirectResponse(url=f"/?account_id={account_id}&error={error_param}",
                                     status_code=302)
 
+        # ── Doble-check на REJECTED в payload (defense in depth) ─────────────
+        # Driver уже должен был поймать rejected, но если PP добавил новые
+        # статусы — ловим их здесь. Откатываем резервы и помечаем REJECTED.
+        def _payload_says_rejected(d) -> Optional[str]:
+            if not isinstance(d, dict):
+                return None
+            import json as _json
+            blob = _json.dumps(d, ensure_ascii=False).lower()
+            for marker in ("rechazad", "rejected", "denied", "denegad"):
+                if marker in blob:
+                    return marker
+            return None
+        rej_marker = _payload_says_rejected(result)
+        if rej_marker:
+            release_withdraw_count(dest, account_id)
+            if group_key is not None:
+                release_account_withdraw_count(account_id, group_key)
+            update_withdraw_attempt_status(idem_key, "REJECTED",
+                                           error_message=f"bank_rejected:{rej_marker}")
+            audit("withdraw.rejected", request=request, user=_current_user(request),
+                  target_type="account", target_id=account_id,
+                  details={"destination": dest, "amount": amt, "marker": rej_marker})
+            return RedirectResponse(
+                url=f"/?account_id={account_id}&error=rejected_by_bank",
+                status_code=302,
+            )
+
         # ── Успех: извлекаем bank_tx_id и фиксируем SUCCESS в idempotency-таблице ──
         tid = None
         if bank_type in ("personalpay", "astropay") and isinstance(result, dict):
@@ -3157,6 +3184,51 @@ async def withdraw(
                     raw = str(raw).strip()
                     if "-" not in raw and len(raw) == 32 and all(c in "0123456789ABCDEFabcdef" for c in raw):
                         tid = raw
+
+        # ── Fallback: если PP не вернул tid в create_withdraw response —
+        # достаём через activities-list (последние 5 операций, ищем по amount).
+        # Это нужно чтобы бот мог открыть receipt-страницу и сделать чек.
+        if not tid and bank_type == "personalpay":
+            try:
+                acts_data = await asyncio.to_thread(
+                    pp_activities_list, acc["credentials"], 0, 5
+                )
+                # PP API: data.activities[] или прямо list
+                acts = []
+                if isinstance(acts_data, dict):
+                    acts = acts_data.get("activities") or acts_data.get("data") or []
+                elif isinstance(acts_data, list):
+                    acts = acts_data
+                amt_round = round(float(amt or 0), 2)
+                for act in acts[:5]:
+                    if not isinstance(act, dict):
+                        continue
+                    attrs = act.get("attributes") if isinstance(act.get("attributes"), dict) else {}
+                    raw_amt = attrs.get("amount") or act.get("amount")
+                    if isinstance(raw_amt, dict):
+                        raw_amt = raw_amt.get("value")
+                    try:
+                        if abs(round(float(raw_amt or 0), 2) - amt_round) > 0.01:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    cand = (
+                        act.get("transactionId") or attrs.get("transactionId")
+                        or _find_32char_hex_id(act)
+                    )
+                    if cand:
+                        cand = str(cand).strip()
+                        if "-" not in cand and len(cand) == 32 and all(
+                            c in "0123456789ABCDEFabcdef" for c in cand
+                        ):
+                            tid = cand
+                            break
+            except Exception as e:
+                # Не критично — просто в логи
+                import logging as _lg
+                _lg.getLogger(__name__).warning(
+                    "tid fallback via activities-list failed: %s", e
+                )
 
         update_withdraw_attempt_status(idem_key, "SUCCESS", bank_tx_id=tid)
         audit("withdraw.success", request=request, user=_current_user(request),
