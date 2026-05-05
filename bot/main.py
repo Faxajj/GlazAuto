@@ -290,9 +290,10 @@ def main() -> None:
         .post_shutdown(_on_shutdown)
     )
 
-    # Прокси для Telegram API (если api.telegram.org заблокирован у хостера)
+    # Прокси для Telegram API (если api.telegram.org заблокирован у хостера).
+    # Используем явные HTTPXRequest объекты — совместимо с python-telegram-bot
+    # 20.x и 21.x. Параметр называется `proxy_url` в 20.7.
     if TELEGRAM_PROXY:
-        # Маскируем пароль в логе
         masked = TELEGRAM_PROXY
         try:
             from urllib.parse import urlparse, urlunparse
@@ -304,7 +305,20 @@ def main() -> None:
         except Exception:
             pass
         logger.info("anton-bot: используем прокси для Telegram API: %s", masked)
-        builder = builder.proxy(TELEGRAM_PROXY).get_updates_proxy(TELEGRAM_PROXY)
+
+        from telegram.request import HTTPXRequest
+        # Один HTTPXRequest для обычных вызовов, второй для long-polling getUpdates
+        # (у getUpdates долгий таймаут — нужны отдельные параметры)
+        try:
+            req         = HTTPXRequest(connection_pool_size=8, proxy_url=TELEGRAM_PROXY)
+            updates_req = HTTPXRequest(connection_pool_size=8, proxy_url=TELEGRAM_PROXY,
+                                       read_timeout=40, connect_timeout=20)
+        except TypeError:
+            # На случай 21.x — там параметр называется `proxy`
+            req         = HTTPXRequest(connection_pool_size=8, proxy=TELEGRAM_PROXY)
+            updates_req = HTTPXRequest(connection_pool_size=8, proxy=TELEGRAM_PROXY,
+                                       read_timeout=40, connect_timeout=20)
+        builder = builder.request(req).get_updates_request(updates_req)
 
     app = builder.build()
 
