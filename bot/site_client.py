@@ -295,6 +295,34 @@ class SiteClient:
     def get_receipt_url(self, account_id: int, transaction_id: str) -> str:
         return f"{SITE_URL}/account/{account_id}/receipt?transaction_id={transaction_id}"
 
+    async def render_receipt_image(self, account_id: int,
+                                   transaction_id: str) -> Optional[bytes]:
+        """Просит сайт отрендерить чек в PNG через серверный playwright.
+        Это надёжнее bot-side playwright (cookies/CSRF не нужны)."""
+        if not transaction_id:
+            return None
+        try:
+            r = await self._get(
+                f"/api/receipt-image?account_id={account_id}"
+                f"&transaction_id={transaction_id}"
+            )
+            if r.status != 200:
+                logger.warning("render_receipt_image: http %d", r.status)
+                return None
+            ct = (r.headers.get("Content-Type") or "").lower()
+            if "image/png" not in ct:
+                # сервер вернул JSON с ошибкой
+                try:
+                    err = (await r.json(content_type=None)).get("error", "unknown")
+                except Exception:
+                    err = "unknown"
+                logger.warning("render_receipt_image: server error: %s", err)
+                return None
+            return await r.read()
+        except Exception as e:
+            logger.warning("render_receipt_image: %s", e)
+            return None
+
     async def find_recent_tid(self, account_id: int, amount: float,
                               destination: str = "",
                               max_age_sec: int = 120) -> Optional[str]:

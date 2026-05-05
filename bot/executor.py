@@ -313,12 +313,19 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
             # Скриншот чека
             if tid:
                 png = None
+                # Primary: серверный рендер (на сайте сам playwright + свои cookies)
                 try:
-                    png = await capture_receipt(card["id"], tid,
-                                                client.session_token,
-                                                client.csrf_token)
+                    png = await client.render_receipt_image(card["id"], tid)
                 except Exception as e:
-                    logger.warning("capture_receipt threw: %s", e)
+                    logger.warning("render_receipt_image threw: %s", e)
+                # Fallback: bot-side playwright если серверный не сработал
+                if not png:
+                    try:
+                        png = await capture_receipt(card["id"], tid,
+                                                    client.session_token,
+                                                    client.csrf_token)
+                    except Exception as e:
+                        logger.warning("capture_receipt threw: %s", e)
 
                 if png:
                     try:
