@@ -43,6 +43,11 @@ async def _get_account_lock(account_id: int) -> asyncio.Lock:
 _inflight_per_account: Dict[int, float] = {}
 _inflight_lock = asyncio.Lock()
 
+# Локальный счётчик "только что использованных слотов" для лимита 15/день.
+# Кеш account_withdraw_count на сайте обновляется не мгновенно — бот может
+# успеть отправить лишние выводы за этот лаг. Считаем сами.
+_local_used_count: Dict[int, int] = {}
+
 
 async def _reserve(account_id: int, amount: float) -> None:
     async with _inflight_lock:
@@ -74,6 +79,30 @@ async def _release_after_delay(account_id: int, amount: float,
 
 def _get_inflight(account_id: int) -> float:
     return _inflight_per_account.get(account_id, 0.0)
+
+
+def _get_local_used(account_id: int) -> int:
+    return _local_used_count.get(account_id, 0)
+
+
+async def _inc_local_used(account_id: int) -> None:
+    async with _inflight_lock:
+        _local_used_count[account_id] = _local_used_count.get(account_id, 0) + 1
+
+
+async def _dec_local_used_after(account_id: int, delay_sec: float = 60) -> None:
+    """Освобождает локальный счётчик через delay_sec — за это время кеш
+    лимитов на сайте обновится."""
+    try:
+        await asyncio.sleep(delay_sec)
+    except asyncio.CancelledError:
+        return
+    async with _inflight_lock:
+        cur = _local_used_count.get(account_id, 0) - 1
+        if cur <= 0:
+            _local_used_count.pop(account_id, None)
+        else:
+            _local_used_count[account_id] = cur
 
 
 # Pending-CVU operator response: message_id → asyncio.Future
@@ -118,9 +147,12 @@ async def pick_best_card(client: SiteClient, amount: float,
         effective = float(a["balance"]) - _get_inflight(a["id"])
         if effective < amount:
             continue
-        # Лимит per-card применяется только к НЕ-internal направлениям
+        # Лимит per-card применяется только к НЕ-internal направлениям.
+        # К cached значению ДОБАВЛЯЕМ локальный счётчик "только что использованных" —
+        # без этого бот не видит свежие инкременты и превышает 15/день.
         if not is_internal:
-            if a["account_withdraw_count"] >= DAILY_WITHDRAW_LIMIT:
+            effective_count = int(a["account_withdraw_count"]) + _get_local_used(a["id"])
+            if effective_count >= DAILY_WITHDRAW_LIMIT:
                 continue
         candidates.append((effective, a))
 
@@ -135,9 +167,78 @@ async def pick_best_card(client: SiteClient, amount: float,
 # Single-CVU executor
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Общий "waiting"-state на батч process_items (shared между всеми execute_cvu)
+# Ключ — id message preview (т.е. id-батча), значение — dict с msg_id и items-pending
+_batch_waiting_state: Dict[str, dict] = {}
+_batch_waiting_lock = asyncio.Lock()
+
+
+async def _update_batch_waiting(batch_id: str, bot, item_key: str,
+                                 status: Optional[dict]) -> None:
+    """Обновляет общий waiting-message для батча.
+    status=None → удалить item из ожидания (карта найдена/закрыто).
+    status={'name':..., 'cvu':..., 'remaining':..., 'need':...} → добавить/обновить.
+    """
+    async with _batch_waiting_lock:
+        st = _batch_waiting_state.get(batch_id)
+        if st is None:
+            st = {"msg_id": None, "items": {}}
+            _batch_waiting_state[batch_id] = st
+
+        if status is None:
+            st["items"].pop(item_key, None)
+        else:
+            st["items"][item_key] = status
+
+        # Формируем текст
+        if not st["items"]:
+            # Никто не ждёт — удаляем сообщение
+            if st["msg_id"]:
+                try:
+                    await bot.delete_message(chat_id=CHAT_OFFICE,
+                                             message_id=st["msg_id"])
+                except Exception:
+                    pass
+                st["msg_id"] = None
+            return
+
+        import time as _t
+        lines = [
+            f"⏳ Ожидание свободных карт ({len(st['items'])} реквизит(ов))",
+            "",
+        ]
+        for it in st["items"].values():
+            cvu_short = (it["cvu"] or "")[:22]
+            lines.append(
+                f"• {it.get('name') or '?'} ({cvu_short}) — "
+                f"{_fmt_ars_int(it['remaining'])} ARS "
+                f"(нужно ≥ {_fmt_ars_int(it['need'])})"
+            )
+        lines.append("")
+        lines.append(f"⏱ обновлено: {_t.strftime('%H:%M:%S')}")
+        text = "\n".join(lines)
+
+        if st["msg_id"] is None:
+            try:
+                m = await bot.send_message(chat_id=CHAT_OFFICE, text=text)
+                st["msg_id"] = m.message_id
+            except Exception as e:
+                logger.warning("waiting send failed: %s", e)
+        else:
+            try:
+                await bot.edit_message_text(
+                    chat_id=CHAT_OFFICE,
+                    message_id=st["msg_id"],
+                    text=text,
+                )
+            except Exception:
+                pass    # игнорируем "message not modified"
+
+
 async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                       client: SiteClient,
-                      auto_chunk: float = WITHDRAW_CHUNK) -> None:
+                      auto_chunk: float = WITHDRAW_CHUNK,
+                      batch_id: str = "default") -> None:
     """Выполняет вывод для одного CVU: дробит на чанки, выбирает карты,
     шлёт чеки в Офис, обрабатывает лимиты."""
     remaining = float(item.amount)
@@ -149,7 +250,7 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
     chunks_done = 0
     used_card_ids: set = set()    # для исключения той же карты при limit-fallback
-    no_card_msg_id: Optional[int] = None    # антиспам — одно "ожидающее" сообщение
+    item_key = f"{cvu}:{id(item)}"    # уникальный ключ в shared waiting-state
 
     while remaining > 0:
         chunk_amount = min(auto_chunk, remaining)
@@ -162,40 +263,17 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
         # ── Нет подходящей карты ─────────────────────────────────────────────
         if card is None:
-            import time as _t
-            wait_text = (
-                f"⏳ Жду пополнения карт\n"
-                f"Реквизит: {name} ({cvu})\n"
-                f"Остаток: {_fmt_ars_int(remaining)} ARS (нужно ≥ {_fmt_ars_int(chunk_amount)})\n"
-                f"⏱ обновлено: {_t.strftime('%H:%M:%S')}"
-            )
-            # Первый раз — отправляем; дальше — РЕДАКТИРУЕМ то же сообщение
-            if no_card_msg_id is None:
-                try:
-                    m = await bot.send_message(chat_id=CHAT_OFFICE, text=wait_text)
-                    no_card_msg_id = m.message_id
-                except Exception:
-                    pass
-            else:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=CHAT_OFFICE,
-                        message_id=no_card_msg_id,
-                        text=wait_text,
-                    )
-                except Exception:
-                    pass    # если Telegram ругается на "message not modified" — игнор
+            # Регистрируем в общем shared waiting-message (одно на весь батч)
+            await _update_batch_waiting(batch_id, bot, item_key, {
+                "name": name, "cvu": cvu,
+                "remaining": remaining, "need": chunk_amount,
+            })
             await asyncio.sleep(60)    # ждём минуту, пробуем снова
             used_card_ids.clear()       # на следующем круге включаем все обратно
             continue
 
-        # Карта появилась — стираем "ожидающее" сообщение
-        if no_card_msg_id is not None:
-            try:
-                await bot.delete_message(chat_id=CHAT_OFFICE, message_id=no_card_msg_id)
-            except Exception:
-                pass
-            no_card_msg_id = None
+        # Карта появилась — снимаем себя с ожидания в shared message
+        await _update_batch_waiting(batch_id, bot, item_key, None)
 
         # ── Резервируем сумму на этой карте ──────────────────────────────────
         await _reserve(card["id"], chunk_amount)
@@ -207,6 +285,8 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
         if res.get("ok"):
             tid = res.get("tid")
+            logger.info("withdraw OK acc=%s amt=%s tid=%s (initial)",
+                        card["id"], int(chunk_amount), tid or "<NONE>")
 
             # Если сайт не вернул tid в Location — пытаемся найти его через
             # /api/account/{id}/recent-attempts (свежий SUCCESS с тем же amount).
@@ -220,6 +300,11 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                     )
                     if tid:
                         logger.info("recovered tid=%s via recent-attempts", tid)
+                    else:
+                        logger.warning(
+                            "tid=NONE и recent-attempts не нашёл — чек не получится "
+                            "(сайт не сохранил bank_tx_id для этой транзакции)"
+                        )
                 except Exception as e:
                     logger.warning("find_recent_tid failed: %s", e)
 
@@ -281,6 +366,13 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
             # in-flight накапливается и блокирует все последующие выводы.
             asyncio.create_task(_release_after_delay(card["id"], chunk_amount, 45))
 
+            # Лимит-счётчик: инкремент сейчас, освобождение через 60 сек
+            # (когда кеш лимитов на сайте обновится). Это защита от
+            # превышения 15/день из-за stale account_withdraw_count.
+            if not _is_internal_pp_dest(cvu):
+                await _inc_local_used(card["id"])
+                asyncio.create_task(_dec_local_used_after(card["id"], 60))
+
             # Запись в state
             record_withdrawal(
                 shift_id=shift_id, cvu=cvu, name=name,
@@ -316,6 +408,8 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                 # Primary: серверный рендер (на сайте сам playwright + свои cookies)
                 try:
                     png = await client.render_receipt_image(card["id"], tid)
+                    logger.info("server-side receipt for tid=%s: %s",
+                                tid, f"{len(png)}b" if png else "FAILED")
                 except Exception as e:
                     logger.warning("render_receipt_image threw: %s", e)
                 # Fallback: bot-side playwright если серверный не сработал
@@ -324,8 +418,16 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                         png = await capture_receipt(card["id"], tid,
                                                     client.session_token,
                                                     client.csrf_token)
+                        logger.info("bot-side receipt for tid=%s: %s",
+                                    tid, f"{len(png)}b" if png else "FAILED")
                     except Exception as e:
                         logger.warning("capture_receipt threw: %s", e)
+            else:
+                png = None
+                logger.warning(
+                    "skip receipt: tid пустой для name=%s amt=%s acc=%s",
+                    name, int(chunk_amount), card["id"],
+                )
 
                 if png:
                     try:
@@ -355,6 +457,8 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
             # Закрыт полностью?
             if remaining <= 0:
+                # На всякий случай снимаем с waiting (если был)
+                await _update_batch_waiting(batch_id, bot, item_key, None)
                 try:
                     await bot.send_message(
                         chat_id=CHAT_OFFICE,
@@ -465,8 +569,22 @@ async def process_items(items: List[ParsedItem], bot, shift_id: int,
     в "Обмены" с просьбой следующих реквизитов."""
     if not items:
         return
-    tasks = [execute_cvu(item, bot, shift_id, client) for item in items]
-    await asyncio.gather(*tasks, return_exceptions=True)
+    import time as _t
+    batch_id = f"batch-{int(_t.time()*1000)}"
+    tasks = [execute_cvu(item, bot, shift_id, client, batch_id=batch_id)
+             for item in items]
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        # Чистим shared waiting-state батча (на всякий случай)
+        async with _batch_waiting_lock:
+            st = _batch_waiting_state.pop(batch_id, None)
+            if st and st.get("msg_id"):
+                try:
+                    await bot.delete_message(chat_id=CHAT_OFFICE,
+                                             message_id=st["msg_id"])
+                except Exception:
+                    pass
 
     # После закрытия батча — просим следующие реквизиты в "Обмены"
     try:
