@@ -2371,6 +2371,20 @@ async def api_accounts_list():
     })
 
 
+@app.get("/api/account/{account_id}/recent-attempts")
+async def api_account_recent_attempts(account_id: int, limit: int = 10):
+    """Последние N попыток вывода на карте (для бота — найти tid после withdraw,
+    если сайт не вернул его в Location-redirect).
+    Возвращает: [{amount, bank_tx_id, status, created_at, destination}, ...]
+    """
+    from app.database import get_recent_withdraw_attempts
+    try:
+        rows = get_recent_withdraw_attempts(account_id, limit)
+        return JSONResponse({"attempts": rows})
+    except Exception as e:
+        return JSONResponse({"attempts": [], "error": str(e)[:200]}, status_code=500)
+
+
 @app.get("/api/balances")
 async def api_balances_batch(ids: str = ""):
     """Batched-эндпоинт: возвращает балансы N аккаунтов за один HTTP-запрос.

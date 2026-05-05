@@ -759,6 +759,23 @@ def try_reserve_account_withdraw_count(account_id: int, group_key: str) -> Optio
         return _legacy_increment_account(account_id)
 
 
+def get_recent_withdraw_attempts(account_id: int, limit: int = 10) -> list:
+    """Последние N попыток вывода для бота — найти tid после withdraw,
+    если сайт не вернул его в Location-redirect."""
+    try:
+        with _get_conn() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT amount, bank_tx_id, status, destination, created_at "
+                "FROM withdraw_attempts WHERE account_id=? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(account_id), max(1, min(int(limit), 50))),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.OperationalError:
+        return []
+
+
 def release_account_withdraw_count(account_id: int, group_key: str) -> None:
     """Откатывает резерв слота в per-card лимите."""
     if group_key not in GROUP_KEYS:
