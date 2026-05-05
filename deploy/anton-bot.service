@@ -1,0 +1,24 @@
+[Unit]
+Description=Anton Telegram Bot (auto-withdraw via GlazAuto)
+After=network.target banks.service
+Requires=banks.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/app
+ExecStart=/var/www/app/venv/bin/python -m bot.main
+Restart=always
+RestartSec=10
+Environment=PYTHONPATH=/var/www/app
+# Логи bot/logs/anton.log + дополнительно в journalctl
+StandardOutput=journal
+StandardError=journal
+
+# Не позволяем боту убить сайт при OOM
+OOMScoreAdjust=200
+# Лимиты ресурсов
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
