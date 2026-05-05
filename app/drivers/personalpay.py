@@ -500,7 +500,33 @@ def create_withdraw(
         except Exception:
             body = {"raw": r.text}
         raise RuntimeError(f"{r.status_code} {body}")
-    return r.json()
+    data = r.json()
+
+    # ── Проверка реального статуса транзакции ───────────────────────────────
+    # PP может вернуть HTTP 200 с body содержащим state="REJECTED"/"FAILED"
+    # — это НЕ успех. Без этой проверки сайт ошибочно фиксирует SUCCESS.
+    def _extract_state(d) -> str:
+        if not isinstance(d, dict):
+            return ""
+        s = (d.get("state") or d.get("status") or "")
+        if not s and isinstance(d.get("transference"), dict):
+            t = d["transference"]
+            s = t.get("state") or t.get("status") or ""
+            if not s and isinstance(t.get("stateDetail"), dict):
+                sd = t["stateDetail"]
+                s = sd.get("state") or sd.get("code") or sd.get("description") or ""
+        if not s and isinstance(d.get("stateDetail"), dict):
+            sd = d["stateDetail"]
+            s = sd.get("state") or sd.get("code") or sd.get("description") or ""
+        return str(s).strip()
+
+    state = _extract_state(data).lower()
+    if state and any(x in state for x in
+                     ("rechaz", "reject", "denied", "denegad", "fail", "error")):
+        # Поднимаем — main.py поймает и пометит REJECTED + откатит резервы
+        raise RuntimeError(f"rechazada: {state} | body={data}")
+
+    return data
 
 
 def get_activities_list(credentials: dict, offset: int = 0, limit: int = 15) -> dict:
