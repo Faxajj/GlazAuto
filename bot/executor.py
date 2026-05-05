@@ -137,6 +137,7 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
     chunks_done = 0
     used_card_ids: set = set()    # для исключения той же карты при limit-fallback
+    no_card_msg_id: Optional[int] = None    # антиспам — одно "ожидающее" сообщение
 
     while remaining > 0:
         chunk_amount = min(auto_chunk, remaining)
@@ -149,19 +150,40 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
         # ── Нет подходящей карты ─────────────────────────────────────────────
         if card is None:
-            try:
-                await bot.send_message(
-                    chat_id=CHAT_OFFICE,
-                    text=(f"❌ Нет карты с балансом ≥ {_fmt_ars_int(chunk_amount)} ARS\n"
-                          f"Реквизит: {name} ({cvu})\n"
-                          f"Остаток: {_fmt_ars_int(remaining)} ARS\n"
-                          f"Жду пополнения карт..."),
-                )
-            except Exception:
-                pass
+            import time as _t
+            wait_text = (
+                f"⏳ Жду пополнения карт\n"
+                f"Реквизит: {name} ({cvu})\n"
+                f"Остаток: {_fmt_ars_int(remaining)} ARS (нужно ≥ {_fmt_ars_int(chunk_amount)})\n"
+                f"⏱ обновлено: {_t.strftime('%H:%M:%S')}"
+            )
+            # Первый раз — отправляем; дальше — РЕДАКТИРУЕМ то же сообщение
+            if no_card_msg_id is None:
+                try:
+                    m = await bot.send_message(chat_id=CHAT_OFFICE, text=wait_text)
+                    no_card_msg_id = m.message_id
+                except Exception:
+                    pass
+            else:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=CHAT_OFFICE,
+                        message_id=no_card_msg_id,
+                        text=wait_text,
+                    )
+                except Exception:
+                    pass    # если Telegram ругается на "message not modified" — игнор
             await asyncio.sleep(60)    # ждём минуту, пробуем снова
             used_card_ids.clear()       # на следующем круге включаем все обратно
             continue
+
+        # Карта появилась — стираем "ожидающее" сообщение
+        if no_card_msg_id is not None:
+            try:
+                await bot.delete_message(chat_id=CHAT_OFFICE, message_id=no_card_msg_id)
+            except Exception:
+                pass
+            no_card_msg_id = None
 
         # ── Резервируем сумму на этой карте ──────────────────────────────────
         await _reserve(card["id"], chunk_amount)
@@ -173,6 +195,21 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
 
         if res.get("ok"):
             tid = res.get("tid")
+
+            # Если сайт не вернул tid в Location — пытаемся найти его через
+            # /api/account/{id}/recent-attempts (свежий SUCCESS с тем же amount).
+            if not tid:
+                try:
+                    tid = await client.find_recent_tid(
+                        account_id=card["id"],
+                        amount=chunk_amount,
+                        destination=cvu,
+                        max_age_sec=120,
+                    )
+                    if tid:
+                        logger.info("recovered tid=%s via recent-attempts", tid)
+                except Exception as e:
+                    logger.warning("find_recent_tid failed: %s", e)
 
             # ── Polling реального статуса транзакции ────────────────────────
             # `ok=True` означает только "транзакция создана сайтом".

@@ -295,6 +295,38 @@ class SiteClient:
     def get_receipt_url(self, account_id: int, transaction_id: str) -> str:
         return f"{SITE_URL}/account/{account_id}/receipt?transaction_id={transaction_id}"
 
+    async def find_recent_tid(self, account_id: int, amount: float,
+                              destination: str = "",
+                              max_age_sec: int = 120) -> Optional[str]:
+        """Ищет недавний bank_tx_id (tid) для уже выполненного withdraw.
+        Используется когда withdraw вернул ok=True но без tid в Location.
+        Матчит по amount + destination + свежесть (<= max_age_sec)."""
+        try:
+            r = await self._get(f"/api/account/{account_id}/recent-attempts?limit=10")
+            data = await r.json(content_type=None)
+        except Exception as e:
+            logger.warning("find_recent_tid: fetch failed: %s", e)
+            return None
+        attempts = data.get("attempts") or []
+        import time as _t
+        now = int(_t.time())
+        amt_round = round(float(amount), 2)
+        for a in attempts:
+            try:
+                if abs(round(float(a.get("amount") or 0), 2) - amt_round) > 0.01:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if destination and (a.get("destination") or "").strip() != destination.strip():
+                continue
+            ts = int(a.get("created_at") or 0)
+            if ts and now - ts > max_age_sec:
+                continue
+            tid = (a.get("bank_tx_id") or "").strip()
+            if tid:
+                return tid
+        return None
+
     async def get_transaction_status(self, account_id: int,
                                      transaction_id: str) -> str:
         """Возвращает реальный статус: 'approved' / 'rejected' / 'pending' / 'unknown'.
