@@ -25,6 +25,7 @@ from bot.config import (
     CHAT_EXCHANGE,
     CHAT_OFFICE,
     LOG_DIR,
+    TELEGRAM_PROXY,
 )
 from bot.executor import (
     pending_limit_responses,
@@ -282,13 +283,30 @@ def main() -> None:
     setup_logging()
     logger.info("anton-bot: запуск")
 
-    app = (
+    builder = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(_on_startup)
         .post_shutdown(_on_shutdown)
-        .build()
     )
+
+    # Прокси для Telegram API (если api.telegram.org заблокирован у хостера)
+    if TELEGRAM_PROXY:
+        # Маскируем пароль в логе
+        masked = TELEGRAM_PROXY
+        try:
+            from urllib.parse import urlparse, urlunparse
+            u = urlparse(TELEGRAM_PROXY)
+            if u.password:
+                masked = urlunparse(u._replace(
+                    netloc=f"{u.username}:***@{u.hostname}:{u.port}"
+                ))
+        except Exception:
+            pass
+        logger.info("anton-bot: используем прокси для Telegram API: %s", masked)
+        builder = builder.proxy(TELEGRAM_PROXY).get_updates_proxy(TELEGRAM_PROXY)
+
+    app = builder.build()
 
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Chat(CHAT_EXCHANGE), on_exchange_message,

@@ -44,6 +44,15 @@ LOG_DIR  = os.getenv("BOT_LOG_DIR")  or "bot/logs"
 HTTP_TIMEOUT_SEC = 60   # запросы к сайту (включая медленные withdraw через прокси)
 LOGIN_TIMEOUT_SEC = 15
 
+# ── Прокси для Telegram API ────────────────────────────────────────────────
+# Если api.telegram.org заблокирован на хостинге (RU/BY) — задай прокси
+# в env-переменной ANTON_TG_PROXY. Формат:
+#   socks5://user:pass@host:port      (рекомендуется socks5h:// для DNS через прокси)
+#   socks5h://user:pass@host:port
+#   http://user:pass@host:port
+# Можно использовать тот же прокси что для PP/AP.
+TELEGRAM_PROXY = (os.getenv("ANTON_TG_PROXY") or "").strip() or None
+
 # ── PP-internal префиксы (без лимита по бизнес-правилам сайта) ─────────────
 PP_INTERNAL_PREFIX = "00000765"
 AP_INTERNAL_PREFIX = "00001775"
