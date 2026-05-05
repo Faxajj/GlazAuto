@@ -291,13 +291,18 @@ def main() -> None:
     )
 
     # Прокси для Telegram API (если api.telegram.org заблокирован у хостера).
-    # Используем явные HTTPXRequest объекты — совместимо с python-telegram-bot
-    # 20.x и 21.x. Параметр называется `proxy_url` в 20.7.
     if TELEGRAM_PROXY:
-        masked = TELEGRAM_PROXY
+        # httpx 0.25 (необходимая для python-telegram-bot 20.7) не поддерживает
+        # схему socks5h:// (с DNS-resolution через прокси). Нормализуем в socks5://
+        # — для нашего use-case (api.telegram.org с фиксированным IP) разницы нет.
+        proxy_url = TELEGRAM_PROXY
+        if proxy_url.startswith("socks5h://"):
+            proxy_url = "socks5://" + proxy_url[len("socks5h://"):]
+
+        masked = proxy_url
         try:
             from urllib.parse import urlparse, urlunparse
-            u = urlparse(TELEGRAM_PROXY)
+            u = urlparse(proxy_url)
             if u.password:
                 masked = urlunparse(u._replace(
                     netloc=f"{u.username}:***@{u.hostname}:{u.port}"
@@ -307,16 +312,17 @@ def main() -> None:
         logger.info("anton-bot: используем прокси для Telegram API: %s", masked)
 
         from telegram.request import HTTPXRequest
-        # Один HTTPXRequest для обычных вызовов, второй для long-polling getUpdates
-        # (у getUpdates долгий таймаут — нужны отдельные параметры)
+        # python-telegram-bot 20.7 — параметр называется `proxy` (новое имя),
+        # `proxy_url` deprecated. Внутри передаётся как proxies= в httpx 0.25.
+        # Один HTTPXRequest для обычных вызовов, второй для long-polling getUpdates.
         try:
-            req         = HTTPXRequest(connection_pool_size=8, proxy_url=TELEGRAM_PROXY)
-            updates_req = HTTPXRequest(connection_pool_size=8, proxy_url=TELEGRAM_PROXY,
+            req         = HTTPXRequest(connection_pool_size=8, proxy=proxy_url)
+            updates_req = HTTPXRequest(connection_pool_size=8, proxy=proxy_url,
                                        read_timeout=40, connect_timeout=20)
         except TypeError:
-            # На случай 21.x — там параметр называется `proxy`
-            req         = HTTPXRequest(connection_pool_size=8, proxy=TELEGRAM_PROXY)
-            updates_req = HTTPXRequest(connection_pool_size=8, proxy=TELEGRAM_PROXY,
+            # Fallback для 20.x где proxy ещё не существует
+            req         = HTTPXRequest(connection_pool_size=8, proxy_url=proxy_url)
+            updates_req = HTTPXRequest(connection_pool_size=8, proxy_url=proxy_url,
                                        read_timeout=40, connect_timeout=20)
         builder = builder.request(req).get_updates_request(updates_req)
 
