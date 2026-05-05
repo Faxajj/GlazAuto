@@ -2371,6 +2371,69 @@ async def api_accounts_list():
     })
 
 
+@app.get("/api/receipt-image")
+async def api_receipt_image(account_id: int, transaction_id: str):
+    """Серверный рендеринг чека в PNG через playwright. Используется ботом,
+    чтобы не таскать cookies/CSRF через aiohttp + playwright snake.
+    Сайт сам себе авторизован и рендерит свой же шаблон receipt.html."""
+    if not transaction_id:
+        return JSONResponse({"error": "transaction_id required"}, status_code=400)
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        return JSONResponse({"error": "playwright not installed"}, status_code=500)
+
+    # Внутренний URL — без http-через-прокси, прямой localhost
+    url = f"http://127.0.0.1:8000/account/{account_id}/receipt?transaction_id={transaction_id}"
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            try:
+                context = await browser.new_context(
+                    viewport={"width": 560, "height": 900},
+                    device_scale_factor=2,
+                )
+                # Получаем session_token из текущего запроса — добавим в cookies
+                # для чтения receipt-страницы (которая требует логина)
+                # Берём из первого активного оператора
+                from app.database import _get_conn as _gc
+                tok = ""
+                try:
+                    with _gc() as conn:
+                        row = conn.execute(
+                            "SELECT token FROM sessions ORDER BY exp DESC LIMIT 1"
+                        ).fetchone()
+                        if row:
+                            tok = row[0] or row["token"] if hasattr(row, "keys") else row[0]
+                except Exception:
+                    pass
+                if tok:
+                    await context.add_cookies([{
+                        "name": "session_token", "value": tok,
+                        "domain": "127.0.0.1", "path": "/",
+                        "httpOnly": True, "secure": False,
+                    }])
+                page = await context.new_page()
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=20000)
+                except Exception:
+                    await page.goto(url, wait_until="load", timeout=20000)
+                el = None
+                try:
+                    el = await page.wait_for_selector(".pp-receipt", timeout=8000)
+                except Exception:
+                    pass
+                if el:
+                    png = await el.screenshot(type="png", omit_background=False)
+                else:
+                    png = await page.screenshot(type="png", full_page=False)
+            finally:
+                await browser.close()
+        return Response(content=png, media_type="image/png")
+    except Exception as e:
+        return JSONResponse({"error": str(e)[:300]}, status_code=500)
+
+
 @app.get("/api/account/{account_id}/recent-attempts")
 async def api_account_recent_attempts(account_id: int, limit: int = 10):
     """Последние N попыток вывода на карте (для бота — найти tid после withdraw,
