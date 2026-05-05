@@ -18,7 +18,7 @@ from urllib.parse import quote
 import httpx
 
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -2372,18 +2372,23 @@ async def api_accounts_list():
 
 
 @app.get("/api/receipt-image")
-async def api_receipt_image(account_id: int, transaction_id: str):
-    """Серверный рендеринг чека в PNG через playwright. Используется ботом,
-    чтобы не таскать cookies/CSRF через aiohttp + playwright snake.
-    Сайт сам себе авторизован и рендерит свой же шаблон receipt.html."""
+async def api_receipt_image(account_id: int, transaction_id: str, request: Request):
+    """Серверный рендеринг чека в PNG через playwright.
+    Бот зовёт этот эндпоинт со своими cookies (он залогинен) — мы прокидываем
+    session_token в playwright-context и рендерим свой же шаблон receipt.html.
+    Возвращает PNG bytes."""
     if not transaction_id:
         return JSONResponse({"error": "transaction_id required"}, status_code=400)
+    # Аутентификация: проверяем что у запроса есть валидная сессия
+    if not _current_user(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         return JSONResponse({"error": "playwright not installed"}, status_code=500)
 
-    # Внутренний URL — без http-через-прокси, прямой localhost
+    session_token = request.cookies.get("session_token", "")
+    csrf_token    = request.cookies.get("csrf_token", "")
     url = f"http://127.0.0.1:8000/account/{account_id}/receipt?transaction_id={transaction_id}"
     try:
         async with async_playwright() as pw:
@@ -2393,26 +2398,21 @@ async def api_receipt_image(account_id: int, transaction_id: str):
                     viewport={"width": 560, "height": 900},
                     device_scale_factor=2,
                 )
-                # Получаем session_token из текущего запроса — добавим в cookies
-                # для чтения receipt-страницы (которая требует логина)
-                # Берём из первого активного оператора
-                from app.database import _get_conn as _gc
-                tok = ""
-                try:
-                    with _gc() as conn:
-                        row = conn.execute(
-                            "SELECT token FROM sessions ORDER BY exp DESC LIMIT 1"
-                        ).fetchone()
-                        if row:
-                            tok = row[0] or row["token"] if hasattr(row, "keys") else row[0]
-                except Exception:
-                    pass
-                if tok:
-                    await context.add_cookies([{
-                        "name": "session_token", "value": tok,
+                cookies = []
+                if session_token:
+                    cookies.append({
+                        "name": "session_token", "value": session_token,
                         "domain": "127.0.0.1", "path": "/",
                         "httpOnly": True, "secure": False,
-                    }])
+                    })
+                if csrf_token:
+                    cookies.append({
+                        "name": "csrf_token", "value": csrf_token,
+                        "domain": "127.0.0.1", "path": "/",
+                        "httpOnly": False, "secure": False,
+                    })
+                if cookies:
+                    await context.add_cookies(cookies)
                 page = await context.new_page()
                 try:
                     await page.goto(url, wait_until="networkidle", timeout=20000)
