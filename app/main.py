@@ -3188,6 +3188,7 @@ async def withdraw(
         # ── Fallback: если PP не вернул tid в create_withdraw response —
         # достаём через activities-list (последние 5 операций, ищем по amount).
         # Это нужно чтобы бот мог открыть receipt-страницу и сделать чек.
+        # Прямой вызов: timeout=30 (поднят в driver) — устойчив к медленным прокси.
         if not tid and bank_type == "personalpay":
             try:
                 acts_data = await asyncio.to_thread(
