@@ -2351,6 +2351,26 @@ async def dashboard(request: Request):
 # API: баланс + история (JSON, для lazy-loading)
 # ---------------------------------------------------------------------------
 
+@app.get("/api/accounts")
+async def api_accounts_list():
+    """JSON-список всех аккаунтов: id, label, bank_type, window.
+    Используется ботом и автоматизацией — без чувствительных credentials."""
+    accs = list_accounts()
+    return JSONResponse({
+        "accounts": [
+            {
+                "id":         int(a["id"]),
+                "label":      a.get("label") or "",
+                "bank_type":  a.get("bank_type") or "",
+                "window":     a.get("window") or "glazars",
+                "created_at": a.get("created_at") or "",
+            }
+            for a in accs
+        ],
+        "ts": int(time.time()),
+    })
+
+
 @app.get("/api/balances")
 async def api_balances_batch(ids: str = ""):
     """Batched-эндпоинт: возвращает балансы N аккаунтов за один HTTP-запрос.
@@ -2378,17 +2398,26 @@ async def api_balances_batch(ids: str = ""):
     cached_batch = db_get_balance_cache_batch(id_list)
     for acc_id in id_list:
         cached = cached_batch.get(acc_id)
-        if cached and (now - cached["ts"]) < _BALANCE_STALE:
+        if cached:
+            age = now - cached["ts"]
             data = dict(cached["data"])
             data["account_withdraw_count"] = get_account_withdraw_count(acc_id)
             data["account_withdraw_limit"] = DAILY_WITHDRAW_LIMIT
-            data["_cache_age_sec"] = int(now - cached["ts"])
+            data["_cache_age_sec"] = int(age)
             data["_is_error"] = bool(cached.get("is_error"))
+            data["_is_stale"] = age >= _BALANCE_STALE
             if cached.get("last_refresh_error"):
                 data["_last_refresh_error"] = cached["last_refresh_error"][:200]
+            # Если кэш устарел или это error-state → запускаем bg refresh
+            # (но всё равно отдаём данные — пусть клиент сам решает)
+            if (age >= _BALANCE_STALE or data["_is_error"]) and acc_id not in _bg_refreshing_bal:
+                acc = get_account(acc_id)
+                if acc and acc.get("bank_type"):
+                    _bg_refreshing_bal.add(acc_id)
+                    asyncio.create_task(_bg_refresh_balance(acc_id))
             result[str(acc_id)] = data
         else:
-            # Кэша нет → запускаем фоновое прогревание для ЛЮБОГО bank_type
+            # Кэша вообще нет → запускаем bg refresh, возвращаем null
             if acc_id not in _bg_refreshing_bal:
                 acc = get_account(acc_id)
                 if acc and acc.get("bank_type"):
