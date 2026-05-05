@@ -10,5 +10,9 @@ cryptography  # for at-rest encryption of credentials (opt-in via BANKS_MASTER_K
 python-telegram-bot==20.7
 apscheduler==3.10.4
 playwright       # headless Chromium для скриншотов чеков
-aiohttp
+aiohttp          # запросы бота к сайту (на localhost:8000)
 pytz
+# httpx ЗАКРЕПЛЁН на 0.25.x — python-telegram-bot 20.7 несовместим с httpx 0.26+
+# (в новых версиях httpx убрал параметр proxies=)
+httpx[socks]>=0.25.2,<0.26
+socksio          # явная зависимость для SOCKS5 в httpx
