@@ -11,6 +11,8 @@ ExecStart=/var/www/app/venv/bin/python -m bot.main
 Restart=always
 RestartSec=10
 Environment=PYTHONPATH=/var/www/app
+# Опциональные переменные (прокси для TG API, override токена) читаем из файла:
+EnvironmentFile=-/etc/anton-bot.env
 # Логи bot/logs/anton.log + дополнительно в journalctl
 StandardOutput=journal
 StandardError=journal
