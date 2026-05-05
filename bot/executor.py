@@ -60,6 +60,18 @@ async def _release(account_id: int, amount: float) -> None:
             _inflight_per_account[account_id] = cur
 
 
+async def _release_after_delay(account_id: int, amount: float,
+                               delay_sec: float = 45) -> None:
+    """Освобождает in-flight через delay_sec — за это время кеш баланса
+    на сайте обновится и реальное списание уже отразится. Без этого
+    in-flight копится бесконечно и блокирует последующие выводы."""
+    try:
+        await asyncio.sleep(delay_sec)
+    except asyncio.CancelledError:
+        pass
+    await _release(account_id, amount)
+
+
 def _get_inflight(account_id: int) -> float:
     return _inflight_per_account.get(account_id, 0.0)
 
@@ -262,8 +274,12 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
             # ── APPROVED (или PENDING — оптимистично считаем успехом) ───────
             chunks_done += 1
             remaining -= chunk_amount
-            # Не освобождаем in-flight: эта сумма реально списана с карты,
-            # последующие выборы должны её учитывать (баланс в кеше всё ещё stale).
+            # In-flight освобождаем через 45 сек — за это время кеш баланса
+            # на сайте обновится и реальное списание учтётся. Если освободить
+            # сразу — другая задача увидит stale-баланс с непросевшей суммой
+            # и попытается списать ещё раз. Если не освобождать вообще —
+            # in-flight накапливается и блокирует все последующие выводы.
+            asyncio.create_task(_release_after_delay(card["id"], chunk_amount, 45))
 
             # Запись в state
             record_withdrawal(
