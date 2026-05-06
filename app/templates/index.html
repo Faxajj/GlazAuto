@@ -319,10 +319,13 @@
 
   {# Фильтры типа + поиск #}
   <div id="tx-controls" style="display:none;flex-wrap:wrap;gap:0.5rem;margin-bottom:0.75rem;align-items:center">
-    <div style="display:flex;gap:0.4rem" id="tx-filters">
-      <button class="tx-filter-btn active" data-filter="all">Все</button>
+    <div style="display:flex;gap:0.4rem;align-items:center" id="tx-filters">
+      <button class="tx-filter-btn" data-filter="all">Все</button>
       <button class="tx-filter-btn" data-filter="incoming">Приходы</button>
-      <button class="tx-filter-btn" data-filter="outgoing">Выводы</button>
+      <button class="tx-filter-btn active" data-filter="outgoing">Выводы</button>
+      <span id="tx-window-badge" style="font-size:0.75rem;color:#64748b;margin-left:0.5rem">
+        📅 смена (07:30 МСК)
+      </span>
     </div>
     <input id="tx-search" type="text" placeholder="🔍 Поиск по имени / фамилии"
            style="flex:1;min-width:160px;padding:0.4rem 0.75rem;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:0.875rem" />
@@ -699,7 +702,8 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
   var txBtn24h   = document.getElementById('tx-btn-24h');
 
   // Состояние
-  var _txState = { type:'all', page:1, limit:20, search:'', only24h:false };
+  // По умолчанию: только выводы за текущее смен-окно (07:30 МСК → 07:30 МСК)
+  var _txState = { type:'outgoing', page:1, limit:20, search:'', only24h:true };
   var _txSearchTimer = null;
 
   // ── Граница окна 07:30 МСК (= 04:30 UTC) ────────────────────────────
@@ -862,9 +866,27 @@ if(_TX_BANKS.indexOf(BANK_TYPE) !== -1){
       btn.classList.add('active');
       _txState.type = btn.getAttribute('data-filter');
       _txState.page = 1;
+      // Авто-режим окна:
+      //   "Выводы" → фильтр по смене 07:30 МСК (актуально для отчёта)
+      //   "Все" / "Приходы" → без фильтра окна (вся история)
+      _txState.only24h = (_txState.type === 'outgoing');
+      var badge = document.getElementById('tx-window-badge');
+      if(badge) badge.style.display = _txState.only24h ? 'inline' : 'none';
+      // Также синхронизируем кнопку "За 24 ч" если она есть
+      if(typeof txBtn24h !== 'undefined' && txBtn24h){
+        txBtn24h.textContent = _txState.only24h ? '⏱ Все даты' : '⏱ За 24 ч';
+        txBtn24h.style.background = _txState.only24h ? '#0ea5e9' : '';
+        txBtn24h.style.color = _txState.only24h ? '#fff' : '';
+      }
       loadActivities();
     });
   });
+
+  // Начальная синхронизация бейджа окна с дефолт-стейтом (only24h:true → видим)
+  (function(){
+    var _b = document.getElementById('tx-window-badge');
+    if(_b) _b.style.display = _txState.only24h ? 'inline' : 'none';
+  })();
 
   // ── Поиск (с дебаунсом 400мс)
   if(txSearch){
