@@ -406,7 +406,10 @@
     var hist = loadLocalHistory();
     var lastTs = hist.length ? hist[hist.length-1].ts : 0;
     if(ts - lastTs < 55) return;
-    hist.push({ ts: ts, b: d.buy_avg, s: d.sell_avg });
+    // Сохраняем цену 3-го продавца; fallback на среднюю
+    var _bp = (d.buy_rate  != null) ? d.buy_rate  : d.buy_avg;
+    var _sp = (d.sell_rate != null) ? d.sell_rate : d.sell_avg;
+    hist.push({ ts: ts, b: _bp, s: _sp });
     if(hist.length > 1440) hist = hist.slice(hist.length - 1440);
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(hist)); } catch(e){}
   }
@@ -440,8 +443,11 @@
         // Обновляем текущую цену в виджете хедера тоже
         var buyEl  = document.getElementById('rate-buy');
         var sellEl = document.getElementById('rate-sell');
-        if(buyEl  && d.buy_avg)  buyEl.textContent  = fmtPrice(d.buy_avg);
-        if(sellEl && d.sell_avg) sellEl.textContent = fmtPrice(d.sell_avg);
+        // Виджет показывает цену 3-го продавца; fallback на среднюю
+        var _bp2 = (d.buy_rate  != null) ? d.buy_rate  : d.buy_avg;
+        var _sp2 = (d.sell_rate != null) ? d.sell_rate : d.sell_avg;
+        if(buyEl  && _bp2) buyEl.textContent  = fmtPrice(_bp2);
+        if(sellEl && _sp2) sellEl.textContent = fmtPrice(_sp2);
       })
       .catch(function(){ _loading = false; render(); });
   }

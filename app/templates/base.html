@@ -5,7 +5,7 @@
   <title>{% block title %}Banks Dashboard{% endblock %}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   {{ csrf_meta(request) }}
-  <link rel="stylesheet" href="/static/style.css?v=18" />
+  <link rel="stylesheet" href="/static/style.css?v=19" />
 </head>
 <body>
   <a href="#main-content" class="skip-link">Перейти к содержимому</a>
@@ -113,8 +113,26 @@
             // null = кэша нет, сервер прогревает; оставляем skeleton/прежнее значение
             return;
           }
+          // Error-state: bg_refresh упал, баланс получить не удалось
+          if(data._is_error || (data.error && (data.balance === null || data.balance === undefined))){
+            // Если есть последнее значение в sessionStorage — показываем его + ⚠
+            var lastBal = '';
+            try { lastBal = sessionStorage.getItem('bal_sb_' + el.getAttribute('data-account-id')) || ''; } catch(e){}
+            if(lastBal){
+              el.innerHTML = lastBal + ' <span style="color:#f87171" title="' + (data.error || 'ошибка загрузки').replace(/"/g,'') + '">⚠</span>';
+            } else {
+              el.innerHTML = '<span style="color:#f87171">⚠</span>';
+            }
+            el.classList.add('sidebar-balance-error');
+            el.title = data.error || 'Ошибка загрузки баланса (проверь прокси/токен)';
+            return;
+          }
           var text = fmt(data.balance) + ' ARS';
-          el.textContent = text;
+          el.innerHTML = text;
+          // Last-refresh-warning: успех есть, но последний refresh упал
+          if(data._last_refresh_error){
+            el.innerHTML = text + ' <span style="color:#f59e0b" title="Последнее обновление: ' + data._last_refresh_error.replace(/"/g,'').slice(0,100) + '">⚠</span>';
+          }
           el.classList.remove('sidebar-balance-error');
           // Возраст кэша: подсветим если данные >5 мин старые
           if(data._cache_age_sec && data._cache_age_sec > 300){
@@ -634,8 +652,9 @@
             if(ageEl) ageEl.textContent = '⚠';
             return;
           }
-          var buy  = d.buy_avg;
-          var sell = d.sell_avg;
+          // Показываем цену 3-го продавца; fallback на среднюю если поле отсутствует
+          var buy  = (d.buy_rate  != null) ? d.buy_rate  : d.buy_avg;
+          var sell = (d.sell_rate != null) ? d.sell_rate : d.sell_avg;
           var ts   = d.ts || Math.floor(Date.now()/1000);
 
           if(buyEl)  buyEl.textContent  = fmtRate(buy);
