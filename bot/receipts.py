@@ -52,12 +52,23 @@ async def capture_receipt(
                 viewport={"width": 560, "height": 900},   # фиксированная ширина для чёткости чека
                 device_scale_factor=2,                    # retina-качество
             )
-            await context.add_cookies([
+            # Добавляем cookies на основной domain. Если SITE_URL=localhost —
+            # дополнительно дублируем на 127.0.0.1, т.к. сервер сайта может
+            # привязывать сессии к 127.0.0.1 (где gunicorn слушает).
+            cookie_entries = [
                 {"name": "session_token", "value": session_token,
                  "domain": domain, "path": "/", "httpOnly": True, "secure": False},
                 {"name": "csrf_token", "value": csrf_token,
                  "domain": domain, "path": "/", "httpOnly": False, "secure": False},
-            ])
+            ]
+            if domain == "localhost":
+                cookie_entries += [
+                    {"name": "session_token", "value": session_token,
+                     "domain": "127.0.0.1", "path": "/", "httpOnly": True, "secure": False},
+                    {"name": "csrf_token", "value": csrf_token,
+                     "domain": "127.0.0.1", "path": "/", "httpOnly": False, "secure": False},
+                ]
+            await context.add_cookies(cookie_entries)
             page = await context.new_page()
             try:
                 await page.goto(url, wait_until="networkidle", timeout=30000)
