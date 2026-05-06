@@ -1174,10 +1174,9 @@ def _rate_window_start_ts() -> int:
 
 
 def cleanup_rate_history() -> int:
-    """Удаляет точки курса, накопленные до начала текущего 24-часового окна.
-    Возвращает количество удалённых строк.
-    Вызывается автоматически из save_rate_point и раз в день в 07:30 МСК."""
-    cutoff_ts = _rate_window_start_ts()
+    """Удаляет точки курса старше 7 дней.
+    Ранее удаляло за текущие сутки — теперь храним неделю для графика."""
+    cutoff_ts = int(time.time()) - 7 * 24 * 3600
     with _get_conn() as conn:
         cur = conn.execute(
             "DELETE FROM rate_history WHERE ts < ?", (cutoff_ts,)
@@ -1188,7 +1187,7 @@ def cleanup_rate_history() -> int:
 
 def save_rate_point(buy_avg: float, sell_avg: float, ts: int) -> None:
     """Сохраняет точку курса. Не дублирует если прошло менее 55 секунд.
-    При каждом сохранении удаляет данные до начала текущего 24-часового окна (07:30 МСК)."""
+    Чистка: удаляет данные старше 7 дней (для недельного графика)."""
     with _get_conn() as conn:
         last = conn.execute(
             "SELECT ts FROM rate_history ORDER BY ts DESC LIMIT 1"
@@ -1199,8 +1198,8 @@ def save_rate_point(buy_avg: float, sell_avg: float, ts: int) -> None:
             "INSERT INTO rate_history (ts, buy_avg, sell_avg) VALUES (?, ?, ?)",
             (ts, buy_avg, sell_avg),
         )
-        # Чистим всё до начала текущего 24-часового окна (07:30 МСК)
-        cutoff_ts = _rate_window_start_ts()
+        # Чистим всё что старше 7 дней
+        cutoff_ts = int(time.time()) - 7 * 24 * 3600
         conn.execute(
             "DELETE FROM rate_history WHERE ts < ?",
             (cutoff_ts,),
@@ -1209,7 +1208,8 @@ def save_rate_point(buy_avg: float, sell_avg: float, ts: int) -> None:
 
 
 def get_rate_history(hours: int = 24) -> list:
-    """Возвращает историю курса за последние N часов."""
+    """Возвращает историю курса за последние N часов (макс 168 = 7 дней)."""
+    hours = min(hours, 168)
     since = int(time.time()) - hours * 3600
     with _get_conn() as conn:
         rows = conn.execute(

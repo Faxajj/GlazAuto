@@ -1515,15 +1515,17 @@ async def _rate_collector_loop():
             # ── Сбор курса ────────────────────────────────────────────────
             data = await _fetch_bybit_p2p()
             if data and not data.get("error"):
+                # В историю пишем цену 3-го продавца (если есть), иначе — среднюю
                 save_rate_point(
-                    buy_avg  = data.get("buy_avg")  or 0,
-                    sell_avg = data.get("sell_avg") or 0,
+                    buy_avg  = data.get("buy_rate")  or data.get("buy_avg")  or 0,
+                    sell_avg = data.get("sell_rate") or data.get("sell_avg") or 0,
                     ts       = data.get("ts") or int(time.time()),
                 )
                 global _rate_cache
                 _rate_cache = {"ts": time.time(), "data": data}
-                logger.info("rate collected: buy=%.2f sell=%.2f",
-                            data.get("buy_avg", 0), data.get("sell_avg", 0))
+                logger.info("rate collected: buy=%.2f sell=%.2f (3rd: %s/%s)",
+                            data.get("buy_avg", 0), data.get("sell_avg", 0),
+                            data.get("buy_rate"), data.get("sell_rate"))
         except Exception as e:
             logger.warning("rate collector error: %s", e)
         await asyncio.sleep(600)  # 10 минут
@@ -4106,9 +4108,22 @@ async def _fetch_bybit_p2p() -> dict:
     buy_best  = min(buy_prices)  if buy_prices  else None
     sell_best = max(sell_prices) if sell_prices else None
 
+    # Цена 3-го продавца (индекс 2) — стабильный рыночный ориентир без аномалий
+    # первых двух мерчантов. Fallback: последний если меньше 3.
+    def _third_price(prices: list) -> Optional[float]:
+        if not prices:
+            return None
+        idx = min(2, len(prices) - 1)
+        return round(prices[idx], 2)
+
+    buy_rate  = _third_price(buy_prices)
+    sell_rate = _third_price(sell_prices)
+
     return {
-        "buy_avg":    buy_avg,
+        "buy_avg":    buy_avg,           # среднее (legacy, бот использует sell_avg)
         "sell_avg":   sell_avg,
+        "buy_rate":   buy_rate,          # 3-й продавец BUY — для виджета/графика
+        "sell_rate":  sell_rate,         # 3-й продавец SELL — для виджета/графика
         "buy_best":   buy_best,
         "sell_best":  sell_best,
         "buy_count":  len(buy_prices),
@@ -4200,8 +4215,8 @@ async def api_bybit_rate():
 
 @app.get("/api/rate-history")
 async def api_rate_history(hours: int = 24):
-    """История курса из БД за последние N часов (макс 48)."""
-    hours = min(max(hours, 1), 48)
+    """История курса из БД за последние N часов (макс 168 = 7 дней)."""
+    hours = min(max(hours, 1), 168)
     hist = get_rate_history(hours)
     return JSONResponse({"history": hist, "count": len(hist)})
 
