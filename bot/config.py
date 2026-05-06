@@ -29,7 +29,7 @@ EXCHANGE_OPERATORS_TAGS = ["@xxxyi822", "@beliy_t", "@luckydush"]
 
 # ── Бизнес-параметры ────────────────────────────────────────────────────────
 WITHDRAW_CHUNK = 1_000_000          # ARS — макс сумма одного перевода
-WITHDRAW_PAUSE = 30                 # сек — пауза между чанками
+WITHDRAW_PAUSE = 65                 # сек — пауза между чанками (>60 чтобы выйти из idempotency window сайта)
 DAILY_WITHDRAW_LIMIT = 15           # лимит выводов на карту/день
 SHIFT_TIMES_MSK = [(7, 30), (19, 30)]   # время смен (МСК)
 
