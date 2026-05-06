@@ -218,6 +218,20 @@ class SiteClient:
 
     async def get_pp_accounts(self) -> List[dict]:
         """PP-карты с балансом > 0, отсортированы по балансу desc.
+        Если первый запрос вернул пустой список (кеш балансов на сайте ещё
+        не прогрет после рестарта) — ждём 15 сек и повторяем."""
+        result = await self._get_pp_accounts_once()
+        if not result:
+            logger.info(
+                "get_pp_accounts: пусто на первой попытке, "
+                "ждём прогрева кеша балансов 15 сек..."
+            )
+            await asyncio.sleep(15)
+            result = await self._get_pp_accounts_once()
+        return result
+
+    async def _get_pp_accounts_once(self) -> List[dict]:
+        """PP-карты с балансом > 0, отсортированы по балансу desc.
         Возвращает: [{id, label, balance, account_withdraw_count, bank_type}, ...]
         Не блокирует на банк-вызовах — читает только из shared cache.
         """
@@ -348,6 +362,48 @@ class SiteClient:
         except Exception as e:
             logger.warning("render_receipt_image: %s", e)
             return None
+
+    async def find_tid_from_activities(self, account_id: int, amount: float,
+                                        max_age_sec: int = 90) -> Optional[str]:
+        """Ищет receipt_id в последних исходящих транзакциях карты.
+        Используется когда withdraw вернул ok=True но tid=None.
+
+        Сайт: GET /account/{id}/activities?type=outgoing&limit=5
+        Ответ: {"activities": [{"id", "receipt_id", "amount", "is_outgoing", ...}]}
+
+        receipt_id — это transactionId от PP, именно он нужен для чека.
+        """
+        await asyncio.sleep(4)   # PP пишет транзакцию асинхронно — ждём
+        try:
+            r = await self._get(
+                f"/account/{account_id}/activities?type=outgoing&limit=5"
+            )
+            data = await r.json(content_type=None)
+        except Exception as e:
+            logger.warning("find_tid_from_activities: fetch failed: %s", e)
+            return None
+
+        activities = data.get("activities") or []
+        amt_round = round(float(amount), 2)
+        for act in activities:
+            if not isinstance(act, dict):
+                continue
+            if not act.get("is_outgoing"):
+                continue
+            try:
+                act_amt = abs(round(float(act.get("amount") or 0), 2))
+            except (TypeError, ValueError):
+                continue
+            # Допуск 1 ARS — PP может округлить копейки
+            if abs(act_amt - amt_round) > 1.0:
+                continue
+            # receipt_id — это правильный PP transactionId для чека (приоритет)
+            tid = act.get("receipt_id") or act.get("id") or ""
+            if tid:
+                tid = str(tid).strip()
+                if tid:
+                    return tid
+        return None
 
     async def find_recent_tid(self, account_id: int, amount: float,
                               destination: str = "",

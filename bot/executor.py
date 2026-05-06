@@ -48,6 +48,11 @@ _inflight_lock = asyncio.Lock()
 # успеть отправить лишние выводы за этот лаг. Считаем сами.
 _local_used_count: Dict[int, int] = {}
 
+# Idempotency window: после withdraw на карте — она забанена на ~65 сек.
+# Иначе сайт вернёт `retry_after_minute` и пауза станет 130 сек вместо 65.
+# Ключ: account_id, значение: unix-time когда карта снова свободна.
+_account_idempotency_until: Dict[int, float] = {}
+
 
 async def _reserve(account_id: int, amount: float) -> None:
     async with _inflight_lock:
@@ -139,8 +144,13 @@ async def pick_best_card(client: SiteClient, amount: float,
 
     is_internal = _is_internal_pp_dest(destination)
     candidates = []
+    import time as _t
+    now_ts = _t.time()
     for a in accs:
         if a["id"] in exclude_ids:
+            continue
+        # Idempotency window: карта недоступна ещё N сек после прошлого withdraw
+        if _account_idempotency_until.get(a["id"], 0) > now_ts:
             continue
         # Учитываем уже зарезервированные суммы in-flight на этой карте.
         # Без этого 8 параллельных задач выбрали бы одну карту по stale-кешу.
@@ -238,11 +248,13 @@ async def _update_batch_waiting(batch_id: str, bot, item_key: str,
 async def execute_cvu(item: ParsedItem, bot, shift_id: int,
                       client: SiteClient,
                       auto_chunk: float = WITHDRAW_CHUNK,
-                      batch_id: str = "default") -> None:
-    """Wrapper — ловит любой неперехваченный exception и сообщает в Office,
-    чтобы оператор видел что execute_cvu упал, а не молча проглатывал."""
+                      batch_id: str = "default") -> float:
+    """Wrapper — ловит любой неперехваченный exception и сообщает в Office.
+    Возвращает фактически отправленную сумму (для корректного "Закрыто N на X ARS")."""
     try:
-        await _execute_cvu_inner(item, bot, shift_id, client, auto_chunk, batch_id)
+        sent = await _execute_cvu_inner(item, bot, shift_id, client,
+                                        auto_chunk, batch_id)
+        return float(sent or 0.0)
     except Exception as e:
         logger.exception("execute_cvu failed for %s (%s): %s",
                          item.name or "?", item.cvu, e)
@@ -256,15 +268,31 @@ async def execute_cvu(item: ParsedItem, bot, shift_id: int,
             )
         except Exception:
             pass
+        return 0.0
 
 
 async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
                              client: SiteClient,
                              auto_chunk: float = WITHDRAW_CHUNK,
-                             batch_id: str = "default") -> None:
+                             batch_id: str = "default") -> float:
     """Выполняет вывод для одного CVU: дробит на чанки, выбирает карты,
-    шлёт чеки в Офис, обрабатывает лимиты."""
+    шлёт чеки в Офис, обрабатывает лимиты.
+    Возвращает фактически отправленную сумму."""
+    # ── Проверка: сумма распарсилась? ────────────────────────────────────────
+    if not item.amount or float(item.amount) <= 0:
+        logger.warning("skip CVU %s: amount=0 или None", item.cvu)
+        try:
+            await bot.send_message(
+                chat_id=CHAT_OFFICE,
+                text=(f"⚠️ Пропускаю {item.name or '?'} ({item.cvu}) — "
+                      f"сумма не распознана или равна 0"),
+            )
+        except Exception:
+            pass
+        return 0.0
+
     remaining = float(item.amount)
+    sent_total = 0.0    # фактически отправлено (approved/pending) для отчёта
     name      = item.name or "?"
     cvu       = item.cvu
 
@@ -306,6 +334,11 @@ async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
         async with lock:
             res = await client.withdraw(card["id"], cvu, chunk_amount)
 
+        # Карта только что использовалась — баним её для других задач до 65 сек,
+        # чтобы не получать `retry_after_minute` от сайта.
+        import time as _t2
+        _account_idempotency_until[card["id"]] = _t2.time() + WITHDRAW_PAUSE
+
         if res.get("ok"):
             tid = res.get("tid")
             logger.info("withdraw OK acc=%s amt=%s tid=%s (initial)",
@@ -323,13 +356,27 @@ async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
                     )
                     if tid:
                         logger.info("recovered tid=%s via recent-attempts", tid)
-                    else:
-                        logger.warning(
-                            "tid=NONE и recent-attempts не нашёл — чек не получится "
-                            "(сайт не сохранил bank_tx_id для этой транзакции)"
-                        )
                 except Exception as e:
                     logger.warning("find_recent_tid failed: %s", e)
+
+            # Второй фолбэк: PP пишет транзакцию в activities с задержкой ~3 сек.
+            # Спросим /account/{id}/activities и найдём по amount + свежести.
+            if not tid:
+                try:
+                    tid = await client.find_tid_from_activities(
+                        account_id=card["id"],
+                        amount=chunk_amount,
+                        max_age_sec=90,
+                    )
+                    if tid:
+                        logger.info("recovered tid=%s via activities", tid)
+                    else:
+                        logger.warning(
+                            "tid=NONE и ни recent-attempts ни activities не нашли — "
+                            "чек не получится"
+                        )
+                except Exception as e:
+                    logger.warning("find_tid_from_activities failed: %s", e)
 
             # ── Polling реального статуса транзакции ────────────────────────
             # `ok=True` означает только "транзакция создана сайтом".
@@ -382,6 +429,7 @@ async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
             # ── APPROVED (или PENDING — оптимистично считаем успехом) ───────
             chunks_done += 1
             remaining -= chunk_amount
+            sent_total += chunk_amount    # для финального отчёта в Обмены
             # In-flight освобождаем через 45 сек — за это время кеш баланса
             # на сайте обновится и реальное списание учтётся. Если освободить
             # сразу — другая задача увидит stale-баланс с непросевшей суммой
@@ -411,16 +459,19 @@ async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
             else:
                 remove_pending_cvu(cvu)
 
-            # Сообщение об успехе
+            # Сообщение об успехе. Строку "Осталось" показываем только если
+            # ещё есть что выводить — иначе чуть ниже идёт "✅ Закрыт" с итогом.
             status_emoji = "✅" if final_status == "approved" else "⏳"
             status_text  = "Отправлено" if final_status == "approved" else "В обработке"
+            remaining_line = (f"\n💰 Осталось: {_fmt_ars_int(remaining)} ARS"
+                              if remaining > 0 else "")
             try:
                 await bot.send_message(
                     chat_id=CHAT_OFFICE,
                     text=(f"💸 {name} ({cvu})\n"
                           f"{status_emoji} {status_text}: {_fmt_ars_int(chunk_amount)} ARS\n"
-                          f"📱 Карта: {card.get('label') or '?'}\n"
-                          f"💰 Осталось: {_fmt_ars_int(remaining)} ARS"),
+                          f"📱 Карта: {card.get('label') or '?'}"
+                          f"{remaining_line}"),
                 )
             except Exception as e:
                 logger.warning("send chunk message failed: %s", e)
@@ -486,15 +537,16 @@ async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
                     await bot.send_message(
                         chat_id=CHAT_OFFICE,
                         text=(f"✅ Закрыт: {name} ({cvu})\n"
-                              f"Итого: {_fmt_ars_int(item.amount)} ARS "
+                              f"Итого: {_fmt_ars_int(sent_total)} ARS "
                               f"({chunks_done} переводов)"),
                     )
                 except Exception:
                     pass
-                break
+                return sent_total
 
-            # Пауза между чанками — защита от 60-сек idempotency window
-            await asyncio.sleep(WITHDRAW_PAUSE)
+            # Idempotency window уже взведён выше — другие задачи не выберут
+            # эту же карту следующие WITHDRAW_PAUSE сек. Сразу идём на следующий
+            # чанк — pick_best_card сам найдёт ДРУГУЮ карту.
             continue
 
         # ── Ошибка вывода ───────────────────────────────────────────────────
@@ -549,22 +601,21 @@ async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
             await asyncio.sleep(70)
             continue
 
-        # Bank-rejected — логируем + переходим к следующему чанку с другой картой
+        # Bank-rejected — логируем + пробуем ДРУГУЮ карту, остаток НЕ уменьшаем.
+        # Деньги не ушли → reqвизит ещё надо закрыть.
         if "rejected" in err_low or "rechazad" in err_low:
+            used_card_ids.add(card["id"])
             try:
                 await bot.send_message(
                     chat_id=CHAT_OFFICE,
                     text=(f"❌ Банк отклонил вывод {_fmt_ars_int(chunk_amount)} ARS\n"
                           f"Реквизит: {name} ({cvu})\n"
                           f"Причина: {err}\n"
-                          f"Пропускаю этот чанк."),
+                          f"🔁 Пробую другую карту..."),
                 )
             except Exception:
                 pass
-            remaining -= chunk_amount
-            if remaining <= 0:
-                remove_pending_cvu(cvu)
-                break
+            # remaining НЕ уменьшаем — деньги не ушли
             continue
 
         # Любая другая ошибка — логируем, ждём, ретраим с другой картой
@@ -578,6 +629,9 @@ async def _execute_cvu_inner(item: ParsedItem, bot, shift_id: int,
         except Exception:
             pass
         await asyncio.sleep(15)
+
+    # Цикл while завершился (через break или иначе) — возвращаем фактический sent
+    return sent_total
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -596,8 +650,9 @@ async def process_items(items: List[ParsedItem], bot, shift_id: int,
     batch_id = f"batch-{int(_t.time()*1000)}"
     tasks = [execute_cvu(item, bot, shift_id, client, batch_id=batch_id)
              for item in items]
+    results = []
     try:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         # Чистим shared waiting-state батча (на всякий случай)
         async with _batch_waiting_lock:
@@ -609,16 +664,34 @@ async def process_items(items: List[ParsedItem], bot, shift_id: int,
                 except Exception:
                     pass
 
-    # После закрытия батча — просим следующие реквизиты в "Обмены"
+    # ── Считаем РЕАЛЬНО отправленную сумму (не запрошенную) ─────────────────
+    sent_total = 0.0
+    closed_count = 0
+    requested_total = sum(float(it.amount) for it in items)
+    for item, res in zip(items, results):
+        if isinstance(res, (int, float)):
+            sent_total += float(res)
+            if float(res) >= float(item.amount) - 0.01:
+                closed_count += 1
+        # Exception/None → 0, не учитываем
+
+    # После закрытия батча — отчёт + просим следующие реквизиты в "Обмены"
     try:
         tags = " ".join(EXCHANGE_OPERATORS_TAGS)
-        total_ars = sum(float(it.amount) for it in items)
-        n = len(items)
-        await bot.send_message(
-            chat_id=CHAT_EXCHANGE,
-            text=(f"✅ Закрыто {n} реквизит(ов) на {_fmt_ars_int(total_ars)} ARS.\n"
-                  f"{tags} — давайте следующие реквизиты 🙏"),
-        )
+        if closed_count == len(items) and sent_total >= requested_total - 0.01:
+            # Идеальный кейс — все закрыты полностью
+            text = (f"✅ Закрыто {len(items)} реквизит(ов) на "
+                    f"{_fmt_ars_int(sent_total)} ARS.\n"
+                    f"{tags} — давайте следующие реквизиты 🙏")
+        else:
+            # Частично — даём честную статистику
+            text = (f"⚠️ Батч завершён частично:\n"
+                    f"• Реквизитов: {len(items)}, закрыто полностью: {closed_count}\n"
+                    f"• Запрошено: {_fmt_ars_int(requested_total)} ARS\n"
+                    f"• Отправлено: {_fmt_ars_int(sent_total)} ARS\n"
+                    f"• Не дошло: {_fmt_ars_int(requested_total - sent_total)} ARS\n"
+                    f"{tags} — проверьте остатки и пришлите новые реквизиты 🙏")
+        await bot.send_message(chat_id=CHAT_EXCHANGE, text=text)
     except Exception as e:
         logger.warning("process_items: failed to ping for next requisites: %s", e)
 
